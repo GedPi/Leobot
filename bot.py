@@ -87,16 +87,20 @@ def _parse_prefix(prefix: str) -> tuple[str, Optional[str], Optional[str]]:
 
 ROLE_ORDER = {"guest": 0, "user": 1, "contributor": 2, "admin": 3}
 
+
 def _role_rank(role: str) -> int:
     return ROLE_ORDER.get((role or "guest").lower(), 0)
 
+
 def _can_see(user_role: str, cmd_min_role: str) -> bool:
     return _role_rank(user_role) >= _role_rank(cmd_min_role)
+
 
 @dataclass
 class CommandArgs:
     tokens: list[str]
     rest: str
+
 
 @dataclass
 class CommandNode:
@@ -119,7 +123,7 @@ class CommandNode:
 
     @property
     def path_tokens(self) -> list[str]:
-        toks = []
+        toks: list[str] = []
         cur: CommandNode | None = self
         while cur is not None and cur.parent is not None:
             toks.append(cur.name)
@@ -130,10 +134,11 @@ class CommandNode:
     def path(self) -> str:
         return " ".join(self.path_tokens).strip()
 
+
 class CommandRouter:
     def __init__(self, bot: "IRCBot"):
         self.bot = bot
-        self.root = CommandNode(name="")  # synthetic
+        self.root = CommandNode(name="")  # synthetic root node
         # index: normalized command path -> node
         self._index: dict[str, CommandNode] = {}
 
@@ -177,6 +182,7 @@ class CommandRouter:
         key = self._norm(node.path)
         if key:
             self._index[key] = node
+
         # index aliases as root-level single-token aliases
         for a in node.aliases:
             if " " not in a:
@@ -201,17 +207,20 @@ class CommandRouter:
         toks, _cmdline = parsed
 
         node = self.root
-        consumed = []
+        consumed: list[str] = []
+
         for t in toks:
             nt = self._norm(t)
             nxt = node.children.get(nt)
+
             if nxt is None:
-                # root alias support
+                # root alias support for single-token aliases (e.g. !commands -> help)
                 if node is self.root and nt in self._index and self._index[nt].parent is self.root:
                     node = self._index[nt]
                     consumed = node.path_tokens[:]
                     continue
                 break
+
             node = nxt
             consumed.append(nt)
 
@@ -222,56 +231,42 @@ class CommandRouter:
         rest = " ".join(rest_tokens).strip() if rest_tokens else ""
         return node, CommandArgs(tokens=rest_tokens, rest=rest)
 
-        async def dispatch(self, bot: "IRCBot", ev: "Event") -> bool:
+    def _role_for(self, bot: "IRCBot", ev: "Event") -> str:
+        role = "guest"
+        if getattr(bot, "acl", None) is not None:
+            try:
+                role = bot.acl.role_for_event(ev)
+            except Exception:
+                role = "guest"
+        return (role or "guest").lower()
+
+    async def dispatch(self, bot: "IRCBot", ev: "Event") -> bool:
         """
         Strict router (migration-safe):
-        - Only intercept commands that have a router handler.
-        - Commands registered only as metadata (handler=None) fall through to services.
+          - Only intercept commands that have a router handler.
+          - Commands registered only as metadata (handler=None) fall through to services.
         """
         prefix = bot.cfg.get("command_prefix", "!")
         node, args = self.match(ev.text or "", prefix=prefix)
         if not node or not args:
             return False
-            
+
         # Migration-safe strictness: only router-owned commands are intercepted.
         if node.handler is None:
             return False
 
         # Enforce permissions here (help already hides, but execution must enforce too).
         role = self._role_for(bot, ev)
-            if not _can_see(role, node.min_role):
-                await bot.privmsg(ev.target, f"{ev.nick}: not allowed (requires {node.min_role}).")
+        if not _can_see(role, node.min_role):
+            await bot.privmsg(ev.target, f"{ev.nick}: not allowed (requires {node.min_role}).")
             return True
 
-        # Mutating commands: require daily auth for admin/contributor
-        if node.mutating and role in ("admin", "contributor"):
-            if getattr(bot, "acl", None) is not None:
-                try:
-                    ident = bot.acl.__class__.__dict__.get("_identity_key")  # not used; avoid.
-                except Exception:
-                    ident = None
-                # Use ACL service helpers if present
-                try:
-                    # ACLService defines _identity_key() at module level, not method; so just use its API
-                    # We can rely on precheck normally, but do a belt-and-braces check here:
-                    from services.acl import _identity_key  # type: ignore
-                    ident_key = _identity_key(ev)
-                    if not bot.acl.is_authed_today(ident_key):
-                        await bot.acl.require_auth(bot, ev, role)
-                        return True
-                except Exception:
-                    # If anything goes wrong, fail safe and request auth
-                    try:
-                        await bot.acl.require_auth(bot, ev, role)
-                        return True
-                    except Exception:
-                        pass
-
+        # Mutating enforcement is already handled by ACL precheck in IRCBot.dispatch().
         await node.handler(bot, ev, args)
         return True
 
     def iter_nodes(self) -> list[CommandNode]:
-        out = []
+        out: list[CommandNode] = []
         stack = [self.root]
         while stack:
             n = stack.pop()
@@ -284,19 +279,10 @@ class CommandRouter:
     def registered_commands(self) -> list[CommandNode]:
         return [n for n in self.iter_nodes() if n.registered]
 
-    # ---------- Help rendering ----------
-
-    def _role_for(self, bot: "IRCBot", ev: "Event") -> str:
-        role = "guest"
-        if getattr(bot, "acl", None) is not None:
-            try:
-                role = bot.acl.role_for_event(ev)
-            except Exception:
-                role = "guest"
-        return (role or "guest").lower()
-
     def _visible_commands(self, role: str) -> list[CommandNode]:
         return [n for n in self.registered_commands() if _can_see(role, n.min_role)]
+
+    # ---------- Help rendering ----------
 
     async def cmd_help(self, bot: "IRCBot", ev: "Event", args: CommandArgs) -> None:
         role = self._role_for(bot, ev)
@@ -318,7 +304,10 @@ class CommandRouter:
             if sum(len(v) for v in grouped.values()) > 12:
                 out_target = ev.nick
 
-            await bot.privmsg(out_target, f"{ev.nick}: commands (role: {role}). Use {prefix}help <command> for details. Also: {prefix}help categories")
+            await bot.privmsg(
+                out_target,
+                f"{ev.nick}: commands (role: {role}). Use {prefix}help <command> for details. Also: {prefix}help categories",
+            )
             for cat in sorted(grouped.keys(), key=lambda s: s.lower()):
                 cmds = " ".join(f"{prefix}{c}" for c in sorted(grouped[cat], key=lambda s: s.lower()))
                 await bot.privmsg(out_target, f"{cat}: {cmds}")
@@ -336,8 +325,10 @@ class CommandRouter:
         if node is None:
             # fallback: walk tree
             toks = query.split()
-            cur = self.root
+            cur: CommandNode | None = self.root
             for t in toks:
+                if cur is None:
+                    break
                 nxt = cur.children.get(t)
                 if nxt is None:
                     cur = None
@@ -358,7 +349,7 @@ class CommandRouter:
         await bot.privmsg(ev.target, hdr)
 
         # visible subcommands
-        subs = []
+        subs: list[CommandNode] = []
         for ch in node.children.values():
             if not ch.registered:
                 continue
@@ -370,9 +361,12 @@ class CommandRouter:
             await bot.privmsg(ev.target, "Subcommands:")
             for s in subs_sorted[:20]:
                 s_help = s.help or "(no help text yet)"
-                await bot.privmsg(ev.target, f"  {prefix}{s.path} — {s_help} (min role: {s.min_role}{', mutating' if s.mutating else ''})")
+                await bot.privmsg(
+                    ev.target,
+                    f"  {prefix}{s.path} — {s_help} (min role: {s.min_role}{', mutating' if s.mutating else ''})",
+                )
             if len(subs_sorted) > 20:
-                await bot.privmsg(ev.target, f"  (+{len(subs_sorted)-20} more)")
+                await bot.privmsg(ev.target, f"  (+{len(subs_sorted) - 20} more)")
         return
 
     async def cmd_help_categories(self, bot: "IRCBot", ev: "Event", args: CommandArgs) -> None:
@@ -632,7 +626,7 @@ class IRCBot:
                 self.log.exception("ACL precheck error")
                 # fail open
 
-        # Router dispatch (handles built-in commands; services may still handle legacy commands)
+        # Router dispatch (strict router is migration-safe by only intercepting commands with handlers)
         if hook == "on_privmsg" and getattr(self, "router", None) is not None:
             try:
                 handled = await self.router.dispatch(self, ev)
