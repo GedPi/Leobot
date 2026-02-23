@@ -1,0 +1,7 @@
+# Leobot currently uses only the Python standard library.
+# Keep this file so installs are consistent if/when we add third-party deps later.
+
+# Example future deps (NOT currently required):
+# requests
+# aiohttp
+# ruff
