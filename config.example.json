@@ -1,0 +1,80 @@
+{
+  "server": "irc.example.net",
+  "port": 6697,
+  "use_tls": true,
+  "verify_tls": true,
+
+  "nick": "Leobot",
+  "user": "leobot",
+  "realname": "Leobot IRC Bot",
+
+  "password": null,
+  "nickserv_password": null,
+
+  "channels": ["#yourchannel"],
+  "command_prefix": "!",
+
+  "reconnect_min_seconds": 2,
+  "reconnect_max_seconds": 60,
+
+  "services": [
+    "services.acl",
+    "services.help",
+    "services.chatdb",
+    "services.lastseen",
+    "services.stats",
+    "services.greet",
+    "services.eightball",
+    "services.news",
+    "services.weather",
+    "services.wiki",
+    "services.sysmon",
+    "services.maintenance"
+  ],
+
+  "acl": {
+    "admins": [
+      {
+        "mask": "Ged!*@*",
+        "pass_sha256": "PUT_SHA256_OF_YOUR_DAILY_PASSWORD_HERE"
+      }
+    ],
+    "contributors": [],
+    "users": ["*"]
+  },
+
+  "chatdb": {
+    "path": "/var/lib/leobot/chat.db"
+  },
+
+  "news": {
+    "default_limit": 5,
+    "max_limit": 10,
+    "cache_ttl_seconds": 3600,
+    "cooldown_seconds": 120,
+    "line_delay_seconds": 1.2,
+    "selection_timeout_seconds": 60,
+    "sources": [
+      {
+        "id": "bbc",
+        "name": "BBC",
+        "categories": {
+          "top": "https://feeds.bbci.co.uk/news/rss.xml",
+          "world": "https://feeds.bbci.co.uk/news/world/rss.xml",
+          "tech": "https://feeds.bbci.co.uk/news/technology/rss.xml"
+        }
+      }
+    ]
+  },
+
+  "weather": {
+    "cache_ttl_seconds": 1800,
+    "cooldown_seconds": 5
+  },
+
+  "wiki": {
+    "lang": "en",
+    "cache_ttl_seconds": 3600,
+    "cooldown_seconds": 5
+  }
+}
