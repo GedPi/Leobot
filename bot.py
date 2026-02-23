@@ -222,13 +222,51 @@ class CommandRouter:
         rest = " ".join(rest_tokens).strip() if rest_tokens else ""
         return node, CommandArgs(tokens=rest_tokens, rest=rest)
 
-    async def dispatch(self, bot: "IRCBot", ev: "Event") -> bool:
+        async def dispatch(self, bot: "IRCBot", ev: "Event") -> bool:
+        """
+        Strict router (migration-safe):
+        - Only intercept commands that have a router handler.
+        - Commands registered only as metadata (handler=None) fall through to services.
+        """
         prefix = bot.cfg.get("command_prefix", "!")
         node, args = self.match(ev.text or "", prefix=prefix)
         if not node or not args:
             return False
+            
+        # Migration-safe strictness: only router-owned commands are intercepted.
         if node.handler is None:
             return False
+
+        # Enforce permissions here (help already hides, but execution must enforce too).
+        role = self._role_for(bot, ev)
+            if not _can_see(role, node.min_role):
+                await bot.privmsg(ev.target, f"{ev.nick}: not allowed (requires {node.min_role}).")
+            return True
+
+        # Mutating commands: require daily auth for admin/contributor
+        if node.mutating and role in ("admin", "contributor"):
+            if getattr(bot, "acl", None) is not None:
+                try:
+                    ident = bot.acl.__class__.__dict__.get("_identity_key")  # not used; avoid.
+                except Exception:
+                    ident = None
+                # Use ACL service helpers if present
+                try:
+                    # ACLService defines _identity_key() at module level, not method; so just use its API
+                    # We can rely on precheck normally, but do a belt-and-braces check here:
+                    from services.acl import _identity_key  # type: ignore
+                    ident_key = _identity_key(ev)
+                    if not bot.acl.is_authed_today(ident_key):
+                        await bot.acl.require_auth(bot, ev, role)
+                        return True
+                except Exception:
+                    # If anything goes wrong, fail safe and request auth
+                    try:
+                        await bot.acl.require_auth(bot, ev, role)
+                        return True
+                    except Exception:
+                        pass
+
         await node.handler(bot, ev, args)
         return True
 
