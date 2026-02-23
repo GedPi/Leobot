@@ -1,28 +1,31 @@
 # Leobot (Leonidas IRC Bot)
 
-A modular Python IRC bot with a service/plugin architecture.
+Python IRC bot with a modular service/plugin architecture.
 
-- Runtime config: `/etc/leobot/config.json`
+## Layout on server (current)
+- Runtime code: `/opt/leobot`
+- Virtualenv: `/opt/leobot/venv`
+- Config: `/etc/leobot/config.json`
 - Logs: `/var/log/leobot/bot.log`
-- State (SQLite, watchlists, health JSON, etc.): `/var/lib/leobot/`
+- State: `/var/lib/leobot/` (SQLite DB, watchlists, greetings, health snapshots, etc.)
 
-## Features
+The systemd unit runs as user `leobot` and allows writes only to `/var/log/leobot` and `/var/lib/leobot`.
 
-- Service/plugin loader (`services.*`)
-- Command registration + help routing
-- ACL with roles + optional daily auth for mutating commands
-- SQLite-backed chat logging / stats / lastseen
-- RSS/Atom news headlines (interactive source selection)
-- Open-Meteo weather (no API key)
-- Wikipedia lookup + watchlist tooling
-- Sysmon reads host health snapshot (`/var/lib/leobot/health.json`)
+## Development workflow (recommended)
+- Dev + git: `~/Leobot` (owned by your user)
+- Deploy target: `/opt/leobot` (owned by `leobot`)
 
-## Repo layout
+### Deploy (mirror dev tree to runtime)
+```bash
+cd ~/Leobot
 
-```text
-.
-├── bot.py
-├── services/
-├── config.example.json
-├── requirements.txt
-└── ...
+sudo rsync -a --delete \
+  --exclude '.git/' \
+  --exclude 'venv/' \
+  --exclude '__pycache__/' \
+  --exclude 'config.json' \
+  ./ /opt/leobot/
+
+sudo chown -R leobot:leobot /opt/leobot
+sudo systemctl restart leobot.service
+sudo systemctl --no-pager --full status leobot.service

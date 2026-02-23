@@ -1,0 +1,29 @@
+[Unit]
+Description=Python IRC Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=leobot
+Group=leobot
+WorkingDirectory=/opt/leobot
+ExecStart=/opt/leobot/venv/bin/python /opt/leobot/bot.py
+Restart=always
+RestartSec=3
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/leobot /var/lib/leobot
+ReadOnlyPaths=/etc/leobot /opt/leobot
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
