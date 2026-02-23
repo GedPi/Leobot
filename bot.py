@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from services.chatdb import ChatDB, DBConfig
+
 
 CONFIG_PATH = Path("/etc/leobot/config.json")
 LOG_PATH = Path("/var/log/leobot/bot.log")
@@ -385,7 +387,19 @@ class IRCBot:
         self.log = logging.getLogger("leobot")
         self.commands: dict[str, dict] = {}
         self.services: list[object] = []
+        self.service_map: dict[str, object] = {}
+        self.core_services: set[str] = {"acl", "help", "control"}
         self.router = CommandRouter(self)
+
+        # Control-plane DB (single source of truth)
+        db_path = None
+        try:
+            db_path = (cfg.get("chatdb") or {}).get("db_path")
+        except Exception:
+            db_path = None
+        if not db_path:
+            db_path = "/var/lib/leobot/db/leobot.db"
+        self.db = ChatDB(DBConfig(str(db_path)))
 
         # Built-in router commands
         self.router.register(
@@ -406,12 +420,130 @@ class IRCBot:
             handler=self.router.cmd_help_categories,
         )
 
+        # Control-plane commands (always available; not toggleable)
+        self.router.register(
+            "services",
+            min_role="user",
+            mutating=False,
+            help="List service enablement for the current channel. Usage: !services",
+            category="General",
+            handler=self.cmd_services,
+        )
+        self.router.register(
+            "service status",
+            min_role="user",
+            mutating=False,
+            help="Show service status for a channel. Usage: !service status [#channel]",
+            category="General",
+            handler=self.cmd_service_status,
+        )
+        self.router.register(
+            "service enable",
+            min_role="admin",
+            mutating=True,
+            help="Enable a service in a channel. Usage: !service enable <service> [#channel]",
+            category="General",
+            handler=self.cmd_service_enable,
+        )
+        self.router.register(
+            "service disable",
+            min_role="admin",
+            mutating=True,
+            help="Disable a service in a channel. Usage: !service disable <service> [#channel]",
+            category="General",
+            handler=self.cmd_service_disable,
+        )
+
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
         self.stop_event = asyncio.Event()
 
         # ACL service will set this in its setup()
         self.acl = None
+
+    # -----------------------------
+    # Control-plane: service toggles
+    # -----------------------------
+
+    def _norm_service(self, s: str) -> str:
+        return (s or "").strip().lower()
+
+    async def cmd_services(self, bot: "IRCBot", ev: "Event", args: CommandArgs) -> None:
+        if not ev.channel:
+            await self.privmsg(ev.target, f"{ev.nick}: use this in a channel.")
+            return
+        await self.db.ensure_channel(ev.channel)
+        # ensure all known services exist in catalog
+        for svc in sorted(self.service_map.keys()):
+            await self.db.ensure_service(svc)
+
+        rows = await self.db.list_service_status_for_channel(ev.channel)
+        rows = [(s, True if s in self.core_services else en) for (s, en) in rows]
+        if not rows:
+            await self.privmsg(ev.target, f"{ev.nick}: no services registered.")
+            return
+        on = [s for s, en in rows if en]
+        off = [s for s, en in rows if not en]
+        await self.privmsg(ev.target, f"{ev.nick}: services in {ev.channel} — ON: {', '.join(on) if on else '(none)'} | OFF: {', '.join(off) if off else '(none)'}")
+
+    async def cmd_service_status(self, bot: "IRCBot", ev: "Event", args: CommandArgs) -> None:
+        channel = ev.channel
+        if args.tokens:
+            if args.tokens[0].startswith("#"):
+                channel = args.tokens[0]
+        if not channel:
+            await self.privmsg(ev.target, f"{ev.nick}: provide a channel, e.g. !service status #chan")
+            return
+        await self.db.ensure_channel(channel)
+        for svc in sorted(self.service_map.keys()):
+            await self.db.ensure_service(svc)
+        rows = await self.db.list_service_status_for_channel(channel)
+        rows = [(s, True if s in self.core_services else en) for (s, en) in rows]
+        on = [s for s, en in rows if en]
+        off = [s for s, en in rows if not en]
+        await self.privmsg(ev.target, f"{ev.nick}: {channel} — ON: {', '.join(on) if on else '(none)'} | OFF: {', '.join(off) if off else '(none)'}")
+
+    async def _set_service(self, ev: "Event", service: str, channel: str | None, enabled: bool) -> None:
+        svc = self._norm_service(service)
+        if svc in self.core_services:
+            await self.privmsg(ev.target, f"{ev.nick}: '{svc}' is core and cannot be toggled.")
+            return
+        if svc not in self.service_map:
+            await self.privmsg(ev.target, f"{ev.nick}: unknown service '{svc}'.")
+            return
+        ch = channel or ev.channel
+        if not ch:
+            await self.privmsg(ev.target, f"{ev.nick}: provide a channel, e.g. !service {'enable' if enabled else 'disable'} {svc} #chan")
+            return
+        await self.db.set_service_channel_enabled(svc, ch, enabled, updated_by=ev.nick)
+
+        # optional lifecycle hook
+        inst = self.service_map.get(svc)
+        hook_name = "on_service_enabled" if enabled else "on_service_disabled"
+        fn = getattr(inst, hook_name, None)
+        if callable(fn):
+            try:
+                await fn(self, ch)
+            except Exception:
+                self.log.exception("Service %s %s hook failed", svc, hook_name)
+
+        await self.privmsg(ev.target, f"{ev.nick}: {svc} {'ENABLED' if enabled else 'DISABLED'} in {ch}.")
+
+    async def cmd_service_enable(self, bot: "IRCBot", ev: "Event", args: CommandArgs) -> None:
+        if not args.tokens:
+            await self.privmsg(ev.target, f"{ev.nick}: usage: !service enable <service> [#channel]")
+            return
+        service = args.tokens[0]
+        channel = args.tokens[1] if len(args.tokens) > 1 and args.tokens[1].startswith("#") else None
+        await self._set_service(ev, service, channel, True)
+
+    async def cmd_service_disable(self, bot: "IRCBot", ev: "Event", args: CommandArgs) -> None:
+        if not args.tokens:
+            await self.privmsg(ev.target, f"{ev.nick}: usage: !service disable <service> [#channel]")
+            return
+        service = args.tokens[0]
+        channel = args.tokens[1] if len(args.tokens) > 1 and args.tokens[1].startswith("#") else None
+        await self._set_service(ev, service, channel, False)
 
     def register_command(
         self,
@@ -470,6 +602,7 @@ class IRCBot:
 
     def load_services(self) -> None:
         self.services = []
+        self.service_map = {}
         for modname in self.cfg.get("services", []):
             self.log.info("Loading service: %s", modname)
             mod = importlib.import_module(modname)
@@ -478,6 +611,11 @@ class IRCBot:
             svc = mod.setup(self)
             if svc is not None:
                 self.services.append(svc)
+                key = (modname.split(".")[-1] or modname).strip().lower()
+                setattr(svc, "_service_name", key)
+                self.service_map[key] = svc
+
+        # Catalog rows will be ensured from the async run() context.
 
     async def connect(self) -> None:
         server = self.cfg["server"]
@@ -503,6 +641,12 @@ class IRCBot:
     async def run(self) -> None:
         # Load services before connecting so they can register commands
         self.load_services()
+
+        # Ensure control-plane catalog entries exist
+        for ch in self.cfg.get("channels", []):
+            await self.db.ensure_channel(ch)
+        for svc in self.service_map.keys():
+            await self.db.ensure_service(svc)
         await self.connect()
 
         assert self.reader is not None
@@ -550,6 +694,14 @@ class IRCBot:
                 await self.privmsg("NickServ", f"IDENTIFY {self.cfg['nickserv_password']}")
             # notify services
             for svc in self.services:
+                svc_name = getattr(svc, "_service_name", None)
+                if svc_name and svc_name not in self.core_services:
+                    try:
+                        if not await self.db.is_service_enabled_any(str(svc_name)):
+                            continue
+                    except Exception:
+                        # fail open on DB issues
+                        pass
                 fn = getattr(svc, "on_ready", None)
                 if callable(fn):
                     try:
@@ -637,6 +789,15 @@ class IRCBot:
                 # fail open
 
         for svc in self.services:
+            svc_name = getattr(svc, "_service_name", None)
+            # Option 2: if disabled, it's disabled — suppress ALL hooks for that service in that channel.
+            if ev.channel and svc_name and str(svc_name) not in self.core_services:
+                try:
+                    if not await self.db.is_service_enabled(str(svc_name), ev.channel):
+                        continue
+                except Exception:
+                    # fail open on DB issues
+                    pass
             fn = getattr(svc, hook, None)
             if callable(fn):
                 try:

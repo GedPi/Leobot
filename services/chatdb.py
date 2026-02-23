@@ -10,6 +10,55 @@ SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 
+-- ---- Control-plane (migrations) ----
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  version INTEGER NOT NULL UNIQUE,
+  applied_utc TEXT NOT NULL
+);
+
+-- ---- Control-plane (settings/events) ----
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_utc TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_utc TEXT NOT NULL,
+  level TEXT NOT NULL,
+  source TEXT NOT NULL,
+  channel TEXT,
+  nick TEXT,
+  message TEXT NOT NULL,
+  data_json TEXT DEFAULT ''
+);
+
+-- ---- Control-plane (services/channels) ----
+CREATE TABLE IF NOT EXISTS channels (
+  channel TEXT PRIMARY KEY,
+  created_utc TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS services (
+  service TEXT PRIMARY KEY,
+  description TEXT DEFAULT '',
+  enabled_by_default INTEGER NOT NULL DEFAULT 0,
+  created_utc TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS service_channel (
+  service TEXT NOT NULL,
+  channel TEXT NOT NULL,
+  enabled INTEGER NOT NULL,
+  updated_utc TEXT NOT NULL,
+  updated_by TEXT DEFAULT '',
+  PRIMARY KEY (service, channel),
+  FOREIGN KEY (service) REFERENCES services(service) ON DELETE CASCADE,
+  FOREIGN KEY (channel) REFERENCES channels(channel) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts INTEGER NOT NULL,
@@ -114,6 +163,88 @@ class ChatDB:
             if self._conn is not None:
                 self._conn.close()
                 self._conn = None
+
+    # -----------------------------
+    # Control-plane helpers
+    # -----------------------------
+
+    @staticmethod
+    def _utc_now() -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    async def ensure_channel(self, channel: str) -> None:
+        ch = (channel or "").strip()
+        if not ch:
+            return
+        await self.execute(
+            "INSERT OR IGNORE INTO channels(channel, created_utc) VALUES(?, ?)",
+            (ch, self._utc_now()),
+        )
+
+    async def ensure_service(self, service: str, description: str = "", enabled_by_default: int = 0) -> None:
+        s = (service or "").strip().lower()
+        if not s:
+            return
+        await self.execute(
+            "INSERT OR IGNORE INTO services(service, description, enabled_by_default, created_utc) VALUES(?, ?, ?, ?)",
+            (s, (description or "").strip(), int(bool(enabled_by_default)), self._utc_now()),
+        )
+
+    async def set_service_channel_enabled(self, service: str, channel: str, enabled: bool, updated_by: str = "") -> None:
+        s = (service or "").strip().lower()
+        ch = (channel or "").strip()
+        if not s or not ch:
+            return
+        await self.ensure_service(s)
+        await self.ensure_channel(ch)
+        await self.execute(
+            "INSERT INTO service_channel(service, channel, enabled, updated_utc, updated_by) "
+            "VALUES(?, ?, ?, ?, ?) "
+            "ON CONFLICT(service, channel) DO UPDATE SET enabled=excluded.enabled, updated_utc=excluded.updated_utc, updated_by=excluded.updated_by",
+            (s, ch, int(bool(enabled)), self._utc_now(), (updated_by or "")[:128]),
+        )
+
+    async def is_service_enabled(self, service: str, channel: str) -> bool:
+        """Default-off policy: if no row exists for (service, channel), treat as disabled."""
+        s = (service or "").strip().lower()
+        ch = (channel or "").strip()
+        if not s or not ch:
+            return True
+
+        row = await self.fetchone(
+            "SELECT enabled FROM service_channel WHERE service=? AND channel=?",
+            (s, ch),
+        )
+        if row is None:
+            return False
+        return bool(row[0])
+
+    async def is_service_enabled_any(self, service: str) -> bool:
+        s = (service or "").strip().lower()
+        if not s:
+            return True
+        row = await self.fetchone(
+            "SELECT 1 FROM service_channel WHERE service=? AND enabled=1 LIMIT 1",
+            (s,),
+        )
+        return row is not None
+
+    async def list_services(self) -> list[str]:
+        rows = await self.fetchall("SELECT service FROM services ORDER BY service")
+        return [r[0] for r in rows]
+
+    async def list_service_status_for_channel(self, channel: str) -> list[tuple[str, bool]]:
+        ch = (channel or "").strip()
+        if not ch:
+            return []
+        rows = await self.fetchall(
+            "SELECT s.service, COALESCE(sc.enabled, 0) "
+            "FROM services s "
+            "LEFT JOIN service_channel sc ON sc.service=s.service AND sc.channel=? "
+            "ORDER BY s.service",
+            (ch,),
+        )
+        return [(r[0], bool(r[1])) for r in rows]
 
 
 def utc_day(ts: int | None = None) -> str:
