@@ -5,7 +5,7 @@ import json
 import logging
 import signal
 import ssl
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -81,12 +81,298 @@ def _parse_prefix(prefix: str) -> tuple[str, Optional[str], Optional[str]]:
     return prefix, None, None
 
 
+# ----------------------------
+# Command router
+# ----------------------------
+
+ROLE_ORDER = {"guest": 0, "user": 1, "contributor": 2, "admin": 3}
+
+def _role_rank(role: str) -> int:
+    return ROLE_ORDER.get((role or "guest").lower(), 0)
+
+def _can_see(user_role: str, cmd_min_role: str) -> bool:
+    return _role_rank(user_role) >= _role_rank(cmd_min_role)
+
+@dataclass
+class CommandArgs:
+    tokens: list[str]
+    rest: str
+
+@dataclass
+class CommandNode:
+    name: str
+    parent: "CommandNode | None" = None
+    children: dict[str, "CommandNode"] = field(default_factory=dict)
+
+    # metadata
+    help: str = ""
+    category: str = "General"
+    min_role: str = "guest"
+    mutating: bool = False
+    aliases: list[str] = field(default_factory=list)
+
+    # whether this node was explicitly registered (vs created as a parent placeholder)
+    registered: bool = False
+
+    # handler: async (bot, ev, args) -> None
+    handler: object | None = None
+
+    @property
+    def path_tokens(self) -> list[str]:
+        toks = []
+        cur: CommandNode | None = self
+        while cur is not None and cur.parent is not None:
+            toks.append(cur.name)
+            cur = cur.parent
+        return list(reversed(toks))
+
+    @property
+    def path(self) -> str:
+        return " ".join(self.path_tokens).strip()
+
+class CommandRouter:
+    def __init__(self, bot: "IRCBot"):
+        self.bot = bot
+        self.root = CommandNode(name="")  # synthetic
+        # index: normalized command path -> node
+        self._index: dict[str, CommandNode] = {}
+
+    def _norm(self, s: str) -> str:
+        return (s or "").strip().lower().lstrip("!")
+
+    def register(
+        self,
+        cmd: str,
+        *,
+        min_role: str = "user",
+        mutating: bool = False,
+        help: str = "",
+        category: str = "General",
+        aliases: list[str] | None = None,
+        handler=None,
+    ) -> CommandNode:
+        path = self._norm(cmd)
+        if not path:
+            return self.root
+
+        toks = path.split()
+        node = self.root
+        for t in toks:
+            t = self._norm(t)
+            if not t:
+                continue
+            node = node.children.setdefault(t, CommandNode(name=t, parent=node))
+
+        node.registered = True
+        node.min_role = (min_role or "guest").lower()
+        node.mutating = bool(mutating)
+        node.help = (help or "").strip()
+        node.category = (category or "General").strip() or "General"
+        if aliases:
+            node.aliases = [self._norm(a) for a in aliases if self._norm(a)]
+        if handler is not None:
+            node.handler = handler
+
+        # index canonical path
+        key = self._norm(node.path)
+        if key:
+            self._index[key] = node
+        # index aliases as root-level single-token aliases
+        for a in node.aliases:
+            if " " not in a:
+                self._index[a] = node
+
+        return node
+
+    def _parse(self, text: str, prefix: str) -> tuple[list[str], str] | None:
+        raw = (text or "").strip()
+        if not raw.startswith(prefix):
+            return None
+        cmdline = raw[len(prefix):].strip()
+        if not cmdline:
+            return None
+        toks = cmdline.split()
+        return toks, cmdline
+
+    def match(self, text: str, *, prefix: str) -> tuple[CommandNode | None, CommandArgs | None]:
+        parsed = self._parse(text, prefix)
+        if parsed is None:
+            return None, None
+        toks, _cmdline = parsed
+
+        node = self.root
+        consumed = []
+        for t in toks:
+            nt = self._norm(t)
+            nxt = node.children.get(nt)
+            if nxt is None:
+                # root alias support
+                if node is self.root and nt in self._index and self._index[nt].parent is self.root:
+                    node = self._index[nt]
+                    consumed = node.path_tokens[:]
+                    continue
+                break
+            node = nxt
+            consumed.append(nt)
+
+        if node is self.root:
+            return None, None
+
+        rest_tokens = toks[len(consumed):]
+        rest = " ".join(rest_tokens).strip() if rest_tokens else ""
+        return node, CommandArgs(tokens=rest_tokens, rest=rest)
+
+    async def dispatch(self, bot: "IRCBot", ev: "Event") -> bool:
+        prefix = bot.cfg.get("command_prefix", "!")
+        node, args = self.match(ev.text or "", prefix=prefix)
+        if not node or not args:
+            return False
+        if node.handler is None:
+            return False
+        await node.handler(bot, ev, args)
+        return True
+
+    def iter_nodes(self) -> list[CommandNode]:
+        out = []
+        stack = [self.root]
+        while stack:
+            n = stack.pop()
+            for ch in n.children.values():
+                stack.append(ch)
+            if n is not self.root:
+                out.append(n)
+        return out
+
+    def registered_commands(self) -> list[CommandNode]:
+        return [n for n in self.iter_nodes() if n.registered]
+
+    # ---------- Help rendering ----------
+
+    def _role_for(self, bot: "IRCBot", ev: "Event") -> str:
+        role = "guest"
+        if getattr(bot, "acl", None) is not None:
+            try:
+                role = bot.acl.role_for_event(ev)
+            except Exception:
+                role = "guest"
+        return (role or "guest").lower()
+
+    def _visible_commands(self, role: str) -> list[CommandNode]:
+        return [n for n in self.registered_commands() if _can_see(role, n.min_role)]
+
+    async def cmd_help(self, bot: "IRCBot", ev: "Event", args: CommandArgs) -> None:
+        role = self._role_for(bot, ev)
+        prefix = bot.cfg.get("command_prefix", "!")
+
+        # !help -> list commands grouped by category
+        if not args.tokens:
+            nodes = self._visible_commands(role)
+            if not nodes:
+                await bot.privmsg(ev.target, f"{ev.nick}: no commands available for your role.")
+                return
+
+            grouped: dict[str, list[str]] = {}
+            for n in nodes:
+                cat = n.category or "General"
+                grouped.setdefault(cat, []).append(n.path)
+
+            out_target = ev.target
+            if sum(len(v) for v in grouped.values()) > 12:
+                out_target = ev.nick
+
+            await bot.privmsg(out_target, f"{ev.nick}: commands (role: {role}). Use {prefix}help <command> for details. Also: {prefix}help categories")
+            for cat in sorted(grouped.keys(), key=lambda s: s.lower()):
+                cmds = " ".join(f"{prefix}{c}" for c in sorted(grouped[cat], key=lambda s: s.lower()))
+                await bot.privmsg(out_target, f"{cat}: {cmds}")
+            return
+
+        # !help categories
+        if len(args.tokens) == 1 and args.tokens[0].lower() == "categories":
+            await self.cmd_help_categories(bot, ev, args)
+            return
+
+        # !help <command path...>
+        query = " ".join([self._norm(t) for t in args.tokens]).strip()
+
+        node = self._index.get(query)
+        if node is None:
+            # fallback: walk tree
+            toks = query.split()
+            cur = self.root
+            for t in toks:
+                nxt = cur.children.get(t)
+                if nxt is None:
+                    cur = None
+                    break
+                cur = nxt
+            node = cur if cur is not None and cur is not self.root else None
+
+        if node is None or not node.registered:
+            await bot.privmsg(ev.target, f"{ev.nick}: unknown command '{args.tokens[0]}'. Try {prefix}help")
+            return
+
+        if not _can_see(role, node.min_role):
+            await bot.privmsg(ev.target, f"{ev.nick}: you don't have access to '{prefix}{node.path}'.")
+            return
+
+        help_text = node.help or "(no help text yet)"
+        hdr = f"{prefix}{node.path} — {help_text} (min role: {node.min_role}{', mutating' if node.mutating else ''})"
+        await bot.privmsg(ev.target, hdr)
+
+        # visible subcommands
+        subs = []
+        for ch in node.children.values():
+            if not ch.registered:
+                continue
+            if _can_see(role, ch.min_role):
+                subs.append(ch)
+
+        if subs:
+            subs_sorted = sorted(subs, key=lambda n: n.name.lower())
+            await bot.privmsg(ev.target, "Subcommands:")
+            for s in subs_sorted[:20]:
+                s_help = s.help or "(no help text yet)"
+                await bot.privmsg(ev.target, f"  {prefix}{s.path} — {s_help} (min role: {s.min_role}{', mutating' if s.mutating else ''})")
+            if len(subs_sorted) > 20:
+                await bot.privmsg(ev.target, f"  (+{len(subs_sorted)-20} more)")
+        return
+
+    async def cmd_help_categories(self, bot: "IRCBot", ev: "Event", args: CommandArgs) -> None:
+        role = self._role_for(bot, ev)
+        nodes = self._visible_commands(role)
+        cats = sorted({(n.category or "General") for n in nodes}, key=lambda s: s.lower())
+        if not cats:
+            await bot.privmsg(ev.target, f"{ev.nick}: no categories available.")
+            return
+        await bot.privmsg(ev.target, f"{ev.nick}: categories: " + ", ".join(cats))
+
+
 class IRCBot:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.log = logging.getLogger("leobot")
         self.commands: dict[str, dict] = {}
         self.services: list[object] = []
+        self.router = CommandRouter(self)
+
+        # Built-in router commands
+        self.router.register(
+            "help",
+            min_role="guest",
+            mutating=False,
+            help="Show available commands. Usage: !help [command] | !help categories",
+            category="General",
+            aliases=["commands"],
+            handler=self.router.cmd_help,
+        )
+        self.router.register(
+            "help categories",
+            min_role="guest",
+            mutating=False,
+            help="List command categories.",
+            category="General",
+            handler=self.router.cmd_help_categories,
+        )
 
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
@@ -113,6 +399,13 @@ class IRCBot:
             "help": (help or "").strip(),
             "category": (category or "General").strip(),
         }
+
+        # Keep router metadata in sync (handler remains service-owned unless explicitly set)
+        try:
+            if getattr(self, "router", None) is not None:
+                self.router.register(c, min_role=min_role, mutating=mutating, help=help, category=category)
+        except Exception:
+            self.log.exception("Router register failed for %s", c)
 
     async def send_raw(self, line: str) -> None:
         assert self.writer is not None
@@ -299,6 +592,16 @@ class IRCBot:
                     return
             except Exception:
                 self.log.exception("ACL precheck error")
+                # fail open
+
+        # Router dispatch (handles built-in commands; services may still handle legacy commands)
+        if hook == "on_privmsg" and getattr(self, "router", None) is not None:
+            try:
+                handled = await self.router.dispatch(self, ev)
+                if handled:
+                    return
+            except Exception:
+                self.log.exception("Router dispatch error")
                 # fail open
 
         for svc in self.services:
