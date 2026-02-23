@@ -244,3 +244,8 @@ tmp/
 Thumbs.db
 .vscode/
 .idea/
+config.json
+*.db
+*.sqlite
+*.sqlite3
+*.log
