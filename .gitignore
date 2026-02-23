@@ -205,3 +205,42 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# --- Leonidas IRC Bot (repo-local runtime / local ops) ---
+
+# Local config copies (never commit secrets)
+config.json
+config.*.json
+*.secrets.*
+*.secret.*
+*.key
+*.pem
+*.p12
+*.crt
+
+# Bot runtime artefacts if you ever run from inside the repo
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.sqlite-journal
+*.sqlite3-journal
+*.wal
+*.shm
+
+# Logs / dumps / temporary outputs
+*.log
+*.out
+*.err
+
+# Local state directories (if you choose to keep runtime state in-repo)
+data/
+state/
+run/
+tmp/
+
+# Common local tooling
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
