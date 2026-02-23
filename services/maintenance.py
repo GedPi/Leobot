@@ -99,10 +99,62 @@ class MaintenanceService:
 
 def setup(bot):
     if hasattr(bot, "register_command"):
-        bot.register_command("prune", min_role="admin", mutating=True, help="Prune stored chat data. Usage: !prune <messages|events> <Nd|Nh|Nw|all>", category="Maintenance")
-        bot.register_command("prune vacuum", min_role="admin", mutating=True, help="Reclaim DB space after pruning. Usage: !prune vacuum", category="Maintenance")
+        bot.register_command(
+            "prune",
+            min_role="admin",
+            mutating=True,
+            help="Prune stored chat data. Usage: !prune <messages|stats> <Nd|Nh|Nw|all> | !prune vacuum",
+            category="Maintenance",
+        )
+        bot.register_command(
+            "prune messages",
+            min_role="admin",
+            mutating=True,
+            help="Delete stored raw message logs. Usage: !prune messages <Nd|Nh|Nw|all>",
+            category="Maintenance",
+        )
+        bot.register_command(
+            "prune stats",
+            min_role="admin",
+            mutating=True,
+            help="Delete aggregated stats. Usage: !prune stats <Nd|Nh|Nw|all>",
+            category="Maintenance",
+        )
+        bot.register_command(
+            "prune vacuum",
+            min_role="admin",
+            mutating=True,
+            help="Reclaim SQLite space after pruning. Usage: !prune vacuum",
+            category="Maintenance",
+        )
     if getattr(bot, "acl", None) is not None and hasattr(bot.acl, "register"):
-        bot.acl.register("prune", min_role="admin", mutating=True, help="Prune stored chat data. Usage: !prune <messages|events> <Nd|Nh|Nw|all>", category="Maintenance")
-        bot.acl.register("prune vacuum", min_role="admin", mutating=True, help="Reclaim DB space after pruning. Usage: !prune vacuum", category="Maintenance")
+        bot.acl.register(
+            "prune",
+            min_role="admin",
+            mutating=True,
+            help="Prune stored chat data. Usage: !prune <messages|stats> <Nd|Nh|Nw|all> | !prune vacuum",
+            category="Maintenance",
+        )
+        bot.acl.register(
+            "prune messages",
+            min_role="admin",
+            mutating=True,
+            help="Delete stored raw message logs. Usage: !prune messages <Nd|Nh|Nw|all>",
+            category="Maintenance",
+        )
+        bot.acl.register(
+            "prune stats",
+            min_role="admin",
+            mutating=True,
+            help="Delete aggregated stats. Usage: !prune stats <Nd|Nh|Nw|all>",
+            category="Maintenance",
+        )
+        bot.acl.register(
+            "prune vacuum",
+            min_role="admin",
+            mutating=True,
+            help="Reclaim SQLite space after pruning. Usage: !prune vacuum",
+            category="Maintenance",
+        )
 
     return MaintenanceService(bot, str((bot.cfg.get('chatdb', {}) if isinstance(bot.cfg, dict) else {}).get('db_path', '/var/lib/leobot/db/leobot.db')))

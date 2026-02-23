@@ -80,6 +80,11 @@ class WikiService:
         self._cache_set(key, data, ttl)
         return data
 
+    async def _random_summary(self, lang: str) -> dict:
+        # Random pages are, by definition, not cache-friendly across long TTLs.
+        url = f"https://{lang}.wikipedia.org/api/rest_v1/page/random/summary"
+        return await _get_json(url, timeout=10)
+
     async def _opensearch(self, lang: str, query: str, limit: int = 5) -> list[str]:
         ttl = int(self.cfg.get("cache_ttl_seconds", 3600))
         key = ("opensearch", lang, query, limit)
@@ -123,6 +128,27 @@ class WikiService:
             query = cmdline[len("wiki"):].strip()
             if not query:
                 await bot.privmsg(ev.target, f"{ev.nick}: usage: !wiki <term>")
+                return
+
+            # !wiki random
+            if query.strip().lower() in ("random", "rand"):
+                try:
+                    data = await self._random_summary(lang)
+                except Exception:
+                    await bot.privmsg(ev.target, f"{ev.nick}: Wikipedia lookup failed.")
+                    return
+
+                actual_title = (data.get("title") or "Random").strip() or "Random"
+                extract = (data.get("extract") or "").strip()
+                url = (((data.get("content_urls") or {}).get("desktop") or {}).get("page")) or ""
+
+                if extract:
+                    max_chars = int(self.cfg.get("max_summary_chars", 320))
+                    if len(extract) > max_chars:
+                        extract = extract[: max_chars - 1].rstrip() + "…"
+                    await bot.privmsg(ev.target, f"WIKI: {actual_title} — {extract}" + (f" ({url})" if url else ""))
+                else:
+                    await bot.privmsg(ev.target, f"WIKI: {actual_title}" + (f" ({url})" if url else ""))
                 return
 
             title = _norm_title(query)
@@ -261,9 +287,21 @@ class WikiService:
 def setup(bot):
     if hasattr(bot, "register_command"):
         bot.register_command("wiki", min_role="user", mutating=False, help="Wikipedia lookup. Usage: !wiki <query> | !wiki random", category="Info")
-        bot.register_command("wiki random", min_role="user", mutating=False, help="Random Wikipedia article.", category="Info")
+        bot.register_command("wiki random", min_role="user", mutating=False, help="Random Wikipedia article. Usage: !wiki random", category="Info")
+        bot.register_command("wikicheck", min_role="user", mutating=False, help="Check if a Wikipedia page exists. Usage: !wikicheck <query>", category="Info")
+        bot.register_command("wikimon", min_role="contributor", mutating=True, help="Manage a Wikipedia watchlist used by the external collector. Usage: !wikimon [list]|add|del|lang", category="Info")
+        bot.register_command("wikimon list", min_role="contributor", mutating=False, help="List watched pages. Usage: !wikimon list", category="Info")
+        bot.register_command("wikimon add", min_role="contributor", mutating=True, help="Add a page to the watchlist. Usage: !wikimon add <title>", category="Info")
+        bot.register_command("wikimon del", min_role="contributor", mutating=True, help="Remove a page from the watchlist. Usage: !wikimon del <title>", category="Info")
+        bot.register_command("wikimon lang", min_role="contributor", mutating=True, help="Set the watchlist language. Usage: !wikimon lang <en|de|fr|...>", category="Info")
     if getattr(bot, "acl", None) is not None and hasattr(bot.acl, "register"):
         bot.acl.register("wiki", min_role="user", mutating=False, help="Wikipedia lookup. Usage: !wiki <query> | !wiki random", category="Info")
-        bot.acl.register("wiki random", min_role="user", mutating=False, help="Random Wikipedia article.", category="Info")
+        bot.acl.register("wiki random", min_role="user", mutating=False, help="Random Wikipedia article. Usage: !wiki random", category="Info")
+        bot.acl.register("wikicheck", min_role="user", mutating=False, help="Check if a Wikipedia page exists. Usage: !wikicheck <query>", category="Info")
+        bot.acl.register("wikimon", min_role="contributor", mutating=True, help="Manage a Wikipedia watchlist used by the external collector. Usage: !wikimon [list]|add|del|lang", category="Info")
+        bot.acl.register("wikimon list", min_role="contributor", mutating=False, help="List watched pages. Usage: !wikimon list", category="Info")
+        bot.acl.register("wikimon add", min_role="contributor", mutating=True, help="Add a page to the watchlist. Usage: !wikimon add <title>", category="Info")
+        bot.acl.register("wikimon del", min_role="contributor", mutating=True, help="Remove a page from the watchlist. Usage: !wikimon del <title>", category="Info")
+        bot.acl.register("wikimon lang", min_role="contributor", mutating=True, help="Set the watchlist language. Usage: !wikimon lang <en|de|fr|...>", category="Info")
 
     return WikiService(bot.cfg.get('wiki', {}) if isinstance(bot.cfg, dict) else {})

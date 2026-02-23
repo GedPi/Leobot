@@ -183,10 +183,24 @@ class ACLService:
         if not cmdline:
             return True
 
-        cmd = cmdline.split()[0].lower().lstrip("!")
+        parts = [p.lower().lstrip("!") for p in cmdline.split() if p.strip()]
+        if not parts:
+            return True
+
+        # Longest-prefix match against registered policies.
+        # This is required so that policies like "wikimon list" or "weather warn del" work correctly.
+        cmd = parts[0]
+        best = None
+        for i in range(len(parts), 0, -1):
+            cand = " ".join(parts[:i])
+            if cand in self.policies:
+                best = cand
+                break
+        if best is not None:
+            cmd = best
 
         # Always allow auth/whoami to reach us
-        if cmd in ("auth", "whoami"):
+        if parts[0] in ("auth", "whoami"):
             return True
 
         policy = self.policies.get(cmd)

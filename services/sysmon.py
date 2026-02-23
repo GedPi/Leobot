@@ -222,16 +222,33 @@ async def time_sleep(sec: float) -> None:
 
 def setup(bot):
     if hasattr(bot, "register_command"):
-        bot.register_command("sys", min_role="user", mutating=False, help="Server health summary. Usage: !sys [summary|updates|services|errors|events]", category="System")
-        bot.register_command("sys services", min_role="user", mutating=False, help="Show watched services + failing ones.", category="System")
-        bot.register_command("sys updates", min_role="user", mutating=False, help="Show pending updates.", category="System")
-        bot.register_command("sys errors", min_role="user", mutating=False, help="Show recent detected issues.", category="System")
-        bot.register_command("sys events", min_role="user", mutating=False, help="Show recent state-change events.", category="System")
+        bot.register_command("sys", min_role="user", mutating=False, help="Server health summary from health.json. Usage: !sys", category="System")
+        # Supported top-level commands in this service
+        bot.register_command("uptime", min_role="user", mutating=False, help="Show system uptime. Usage: !uptime", category="System")
+        bot.register_command("disk", min_role="user", mutating=False, help="Show disk usage. Usage: !disk", category="System")
+        bot.register_command("updates", min_role="user", mutating=False, help="Show pending package updates. Usage: !updates", category="System")
+        bot.register_command("failed", min_role="user", mutating=False, help="Show failed systemd units. Usage: !failed", category="System")
+        bot.register_command("errors", min_role="user", mutating=False, help="Show recent detected journal errors summary. Usage: !errors", category="System")
+        bot.register_command("services", min_role="user", mutating=False, help="Show watched services and failing ones. Usage: !services", category="System")
+        bot.register_command("events", min_role="user", mutating=False, help="Tail recent events log. Usage: !events [N]", category="System")
+
+        # Also register as !sys <sub> for the help tree (the handler still accepts the top-level forms).
+        bot.register_command("sys services", min_role="user", mutating=False, help="Alias for !services", category="System")
+        bot.register_command("sys updates", min_role="user", mutating=False, help="Alias for !updates", category="System")
+        bot.register_command("sys errors", min_role="user", mutating=False, help="Alias for !errors", category="System")
+        bot.register_command("sys events", min_role="user", mutating=False, help="Alias for !events [N]", category="System")
     if getattr(bot, "acl", None) is not None and hasattr(bot.acl, "register"):
-        bot.acl.register("sys", min_role="user", mutating=False, help="Server health summary. Usage: !sys [summary|updates|services|errors|events]", category="System")
-        bot.acl.register("sys services", min_role="user", mutating=False, help="Show watched services + failing ones.", category="System")
-        bot.acl.register("sys updates", min_role="user", mutating=False, help="Show pending updates.", category="System")
-        bot.acl.register("sys errors", min_role="user", mutating=False, help="Show recent detected issues.", category="System")
-        bot.acl.register("sys events", min_role="user", mutating=False, help="Show recent state-change events.", category="System")
+        bot.acl.register("sys", min_role="user", mutating=False, help="Server health summary from health.json. Usage: !sys", category="System")
+        bot.acl.register("uptime", min_role="user", mutating=False, help="Show system uptime. Usage: !uptime", category="System")
+        bot.acl.register("disk", min_role="user", mutating=False, help="Show disk usage. Usage: !disk", category="System")
+        bot.acl.register("updates", min_role="user", mutating=False, help="Show pending package updates. Usage: !updates", category="System")
+        bot.acl.register("failed", min_role="user", mutating=False, help="Show failed systemd units. Usage: !failed", category="System")
+        bot.acl.register("errors", min_role="user", mutating=False, help="Show recent detected journal errors summary. Usage: !errors", category="System")
+        bot.acl.register("services", min_role="user", mutating=False, help="Show watched services and failing ones. Usage: !services", category="System")
+        bot.acl.register("events", min_role="user", mutating=False, help="Tail recent events log. Usage: !events [N]", category="System")
+        bot.acl.register("sys services", min_role="user", mutating=False, help="Alias for !services", category="System")
+        bot.acl.register("sys updates", min_role="user", mutating=False, help="Alias for !updates", category="System")
+        bot.acl.register("sys errors", min_role="user", mutating=False, help="Alias for !errors", category="System")
+        bot.acl.register("sys events", min_role="user", mutating=False, help="Alias for !events [N]", category="System")
 
     return SysMonService()

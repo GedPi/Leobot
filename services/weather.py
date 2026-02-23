@@ -369,14 +369,40 @@ class WeatherService:
 
 def setup(bot):
     if hasattr(bot, "register_command"):
-        bot.register_command("weather", min_role="user", mutating=False, help="Weather lookup. Usage: !weather <city> [today|tomorrow|Nh|Nd]", category="Weather")
-        bot.register_command("weather warn", min_role="user", mutating=False, help="Set/list/delete watches. Usage: !weather warn <window> <city> [rain|snow]", category="Weather")
-        bot.register_command("weather warn list", min_role="user", mutating=False, help="List watches.", category="Weather")
+        bot.register_command(
+            "weather",
+            min_role="user",
+            mutating=False,
+            help="Weather lookup. Usage: !weather <city> [today|tomorrow|3d|5d] (timeframe can also be first)",
+            category="Weather",
+        )
+        bot.register_command(
+            "weather warn",
+            min_role="user",
+            mutating=False,
+            help="Manage weather watches. Usage: !weather warn <Nh> <city> [rain|snow|wind|any] | !weather warn list | !weather warn del <city>",
+            category="Weather",
+        )
+        bot.register_command("weather warn types", min_role="user", mutating=False, help="List supported watch types. Usage: !weather warn types", category="Weather")
+        bot.register_command("weather warn list", min_role="user", mutating=False, help="List watches. Usage: !weather warn list", category="Weather")
         bot.register_command("weather warn del", min_role="user", mutating=False, help="Delete a watch. Usage: !weather warn del <city>", category="Weather")
     if getattr(bot, "acl", None) is not None and hasattr(bot.acl, "register"):
-        bot.acl.register("weather", min_role="user", mutating=False, help="Weather lookup. Usage: !weather <city> [today|tomorrow|Nh|Nd]", category="Weather")
-        bot.acl.register("weather warn", min_role="user", mutating=False, help="Set/list/delete watches. Usage: !weather warn <window> <city> [rain|snow]", category="Weather")
-        bot.acl.register("weather warn list", min_role="user", mutating=False, help="List watches.", category="Weather")
+        bot.acl.register(
+            "weather",
+            min_role="user",
+            mutating=False,
+            help="Weather lookup. Usage: !weather <city> [today|tomorrow|3d|5d] (timeframe can also be first)",
+            category="Weather",
+        )
+        bot.acl.register(
+            "weather warn",
+            min_role="user",
+            mutating=False,
+            help="Manage weather watches. Usage: !weather warn <Nh> <city> [rain|snow|wind|any] | !weather warn list | !weather warn del <city>",
+            category="Weather",
+        )
+        bot.acl.register("weather warn types", min_role="user", mutating=False, help="List supported watch types. Usage: !weather warn types", category="Weather")
+        bot.acl.register("weather warn list", min_role="user", mutating=False, help="List watches. Usage: !weather warn list", category="Weather")
         bot.acl.register("weather warn del", min_role="user", mutating=False, help="Delete a watch. Usage: !weather warn del <city>", category="Weather")
 
     return WeatherService(bot.cfg.get('weather', {}) if isinstance(bot.cfg, dict) else {})

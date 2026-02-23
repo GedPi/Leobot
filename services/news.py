@@ -427,8 +427,12 @@ def setup(bot):
     if hasattr(bot, "register_command"):
         bot.register_command("news", min_role="user", mutating=False, help="News headlines via RSS. Usage: !news [N] [category] (then pick source).", category="News")
         bot.register_command("news categories", min_role="user", mutating=False, help="List available news categories.", category="News")
+        bot.register_command("headlines", min_role="user", mutating=False, help="Alias for !news", category="News")
+        bot.register_command("headlines categories", min_role="user", mutating=False, help="Alias for !news categories", category="News")
     if getattr(bot, "acl", None) is not None and hasattr(bot.acl, "register"):
         bot.acl.register("news", min_role="user", mutating=False, help="News headlines via RSS. Usage: !news [N] [category] (then pick source).", category="News")
         bot.acl.register("news categories", min_role="user", mutating=False, help="List available news categories.", category="News")
+        bot.acl.register("headlines", min_role="user", mutating=False, help="Alias for !news", category="News")
+        bot.acl.register("headlines categories", min_role="user", mutating=False, help="Alias for !news categories", category="News")
 
     return NewsService()
