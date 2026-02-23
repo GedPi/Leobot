@@ -20,7 +20,6 @@
   "services": [
     "services.acl",
     "services.help",
-    "services.chatdb",
     "services.lastseen",
     "services.stats",
     "services.greet",
@@ -32,19 +31,8 @@
     "services.maintenance"
   ],
 
-  "acl": {
-    "admins": [
-      {
-        "mask": "Ged!*@*",
-        "pass_sha256": "PUT_SHA256_OF_YOUR_DAILY_PASSWORD_HERE"
-      }
-    ],
-    "contributors": [],
-    "users": ["*"]
-  },
-
   "chatdb": {
-    "path": "/var/lib/leobot/chat.db"
+    "db_path": "/var/lib/leobot/db/leobot.db"
   },
 
   "news": {
@@ -67,14 +55,7 @@
     ]
   },
 
-  "weather": {
-    "cache_ttl_seconds": 1800,
-    "cooldown_seconds": 5
-  },
-
-  "wiki": {
-    "lang": "en",
-    "cache_ttl_seconds": 3600,
-    "cooldown_seconds": 5
+  "greet": {
+    "path": "/var/lib/leobot/greetings.json"
   }
 }
