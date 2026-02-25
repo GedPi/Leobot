@@ -187,9 +187,9 @@ CREATE TABLE IF NOT EXISTS news_last_posted (
   target TEXT NOT NULL,             -- channel or nick
   source_id TEXT NOT NULL,
   category TEXT NOT NULL,
-  limit INTEGER NOT NULL,
+  limit_n INTEGER NOT NULL,
   posted_ts INTEGER NOT NULL,
-  PRIMARY KEY(target, source_id, category, limit)
+  PRIMARY KEY(target, source_id, category, limit_n)
 );
 CREATE INDEX IF NOT EXISTS idx_news_last_posted_ts ON news_last_posted(posted_ts);
 

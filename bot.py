@@ -655,7 +655,15 @@ class IRCBot:
 
         assert self.reader is not None
         while not self.stop_event.is_set():
-            line_b = await self.reader.readline()
+            try:
+                line_b = await self.reader.readline()
+            except ssl.SSLError as e:
+                # When systemd stops the service, the TLS shutdown can race with in-flight data.
+                # Treat this as a clean stop if we're already stopping.
+                if self.stop_event.is_set() and "APPLICATION_DATA_AFTER_CLOSE_NOTIFY" in str(e):
+                    break
+                raise
+
             if not line_b:
                 raise ConnectionError("Disconnected (EOF).")
             line = line_b.decode("utf-8", errors="ignore").rstrip("\r\n")
@@ -837,7 +845,11 @@ async def main():
             await bot.run()
             backoff = int(cfg["reconnect_min_seconds"])
         except Exception as e:
-            logging.exception("Bot crashed/disconnected: %s", e)
+            # If we are shutting down, a TLS close-notify race can surface as an SSLError.
+            if bot.stop_event.is_set() and isinstance(e, ssl.SSLError) and "APPLICATION_DATA_AFTER_CLOSE_NOTIFY" in str(e):
+                logging.info("Bot stopped (TLS close-notify race): %s", e)
+            else:
+                logging.exception("Bot crashed/disconnected: %s", e)
 
         await bot.shutdown()
         await bot.close_connection()

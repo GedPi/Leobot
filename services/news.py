@@ -262,7 +262,7 @@ class NewsService:
             PendingSelection(
                 created_ts=time.time(),
                 target=ev.target,
-                limit=limit,
+                limit_n=limit,
                 category=category,
             ),
         )
@@ -316,7 +316,7 @@ class NewsService:
             target=pending.target,
             source_id=src_id,
             category=category,
-            limit=limit,
+            limit_n=limit,
         )
         now = int(time.time())
         if last is not None and (now - int(last)) < self._cooldown:
@@ -350,7 +350,7 @@ class NewsService:
             target=pending.target,
             source_id=src_id,
             category=category,
-            limit=limit,
+            limit_n=limit,
             posted_ts=now,
         )
 

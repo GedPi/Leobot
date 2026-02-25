@@ -419,11 +419,23 @@ class Store:
         await self.db.execute("DELETE FROM news_sources WHERE source_id=?", (sid,))
         return int(before[0]) > 0 if before else False
 
-    async def news_get_last_posted(self, *, target: str, source_id: str, category: str, limit: int) -> Optional[int]:
+        async def news_get_last_posted(self, *, target: str, source_id: str, category: str, limit_n: int) -> Optional[int]:
+        params = ((target or "").strip(), (source_id or "").strip().lower(), (category or "").strip().lower(), int(limit_n))
+
+        # v2 schema uses limit_n; v1 used a column named "limit" (problematic keyword).
         row = await self.db.fetchone(
-            "SELECT posted_ts FROM news_last_posted WHERE target=? AND source_id=? AND category=? AND limit=?",
-            ((target or "").strip(), (source_id or "").strip().lower(), (category or "").strip().lower(), int(limit)),
+            "SELECT posted_ts FROM news_last_posted WHERE target=? AND source_id=? AND category=? AND limit_n=?",
+            params,
         )
+        if not row:
+            try:
+                row = await self.db.fetchone(
+                    "SELECT posted_ts FROM news_last_posted WHERE target=? AND source_id=? AND category=? AND "limit"=?",
+                    params,
+                )
+            except Exception:
+                row = None
+
         if not row:
             return None
         try:
@@ -431,14 +443,23 @@ class Store:
         except Exception:
             return None
 
-    async def news_set_last_posted(self, *, target: str, source_id: str, category: str, limit: int, posted_ts: int) -> None:
-        await self.db.execute(
-            "INSERT INTO news_last_posted(target, source_id, category, limit, posted_ts) VALUES(?,?,?,?,?) "
-            "ON CONFLICT(target, source_id, category, limit) DO UPDATE SET posted_ts=excluded.posted_ts",
-            ((target or "").strip(), (source_id or "").strip().lower(), (category or "").strip().lower(), int(limit), int(posted_ts)),
-        )
+    async def news_set_last_posted(self, *, target: str, source_id: str, category: str, limit_n: int, posted_ts: int) -> None:
+        params = ((target or "").strip(), (source_id or "").strip().lower(), (category or "").strip().lower(), int(limit_n), int(posted_ts))
 
-    async def news_import_from_legacy_config(self, news_cfg: dict) -> int:
+        try:
+            await self.db.execute(
+                "INSERT INTO news_last_posted(target, source_id, category, limit_n, posted_ts) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(target, source_id, category, limit_n) DO UPDATE SET posted_ts=excluded.posted_ts",
+                params,
+            )
+        except Exception:
+            # fallback for v1 schema
+            await self.db.execute(
+                "INSERT INTO news_last_posted(target, source_id, category, "limit", posted_ts) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(target, source_id, category, "limit") DO UPDATE SET posted_ts=excluded.posted_ts",
+                params,
+            )
+async def news_import_from_legacy_config(self, news_cfg: dict) -> int:
         """Imports config.json news section into DB if there are no sources yet.
 
         Returns number of sources imported.
