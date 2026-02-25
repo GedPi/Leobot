@@ -117,7 +117,7 @@ class StatsService:
         channel = getattr(ev, "channel", None) or getattr(ev, "target", None)
         nick = getattr(ev, "nick", "") or ""
         if channel and isinstance(channel, str) and channel.startswith("#") and nick:
-            day = utc_day()
+            day = utc_day(int(time.time()))
             await self.db.execute(
                 "INSERT INTO stats_daily(day, channel, nick) VALUES(?,?,?) ON CONFLICT(day, channel, nick) DO NOTHING",
                 (day, channel, nick),
@@ -131,7 +131,7 @@ class StatsService:
         channel = getattr(ev, "channel", None) or getattr(ev, "target", None)
         nick = getattr(ev, "nick", "") or ""
         if channel and isinstance(channel, str) and channel.startswith("#") and nick:
-            day = utc_day()
+            day = utc_day(int(time.time()))
             await self.db.execute(
                 "INSERT INTO stats_daily(day, channel, nick) VALUES(?,?,?) ON CONFLICT(day, channel, nick) DO NOTHING",
                 (day, channel, nick),
@@ -146,7 +146,7 @@ class StatsService:
         nick = getattr(ev, "nick", "") or ""
         if not nick:
             return
-        day = utc_day()
+        day = utc_day(int(time.time()))
         channel = "(network)"
         await self.db.execute(
             "INSERT INTO stats_daily(day, channel, nick) VALUES(?,?,?) ON CONFLICT(day, channel, nick) DO NOTHING",
@@ -161,7 +161,7 @@ class StatsService:
         channel = getattr(ev, "channel", None) or getattr(ev, "target", None)
         old = getattr(ev, "old_nick", "") or ""
         if channel and isinstance(channel, str) and channel.startswith("#") and old:
-            day = utc_day()
+            day = utc_day(int(time.time()))
             await self.db.execute(
                 "INSERT INTO stats_daily(day, channel, nick) VALUES(?,?,?) ON CONFLICT(day, channel, nick) DO NOTHING",
                 (day, channel, old),
