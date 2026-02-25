@@ -4,6 +4,7 @@ import time
 import logging
 log = logging.getLogger("leobot.greet")
 from dataclasses import dataclass
+from services.store import Store
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
@@ -74,53 +75,48 @@ class GreetConfig:
 
 
 class GreetService:
-    def __init__(self, bot, cfg: dict):
-        self.bot = bot
-        self.path = Path((cfg.get("path") or str(GREETINGS_PATH_DEFAULT)))
-        self._mtime = 0.0
+        self.path = Path((cfg.get("path") or str(GREETINGS_PATH_DEFAULT)))  # legacy import location only
+
+        db_path = "/var/lib/leobot/db/leobot.db"
+        if isinstance(getattr(bot, "cfg", None), dict):
+            db_path = bot.cfg.get("chatdb", {}).get("db_path", db_path)
+
+        self.store = Store(db_path)
+        self._loaded = False
+
         self._cfg = GreetConfig(path=self.path, rules=[])
         self._cool_nick: dict[str, int] = {}       # nick_lower -> ts_until
         self._cool_chan: dict[str, int] = {}       # channel_lower -> ts_until
+    
+    async def _load(self, force: bool = False) -> None:
+        # DB is authoritative. Legacy JSON is imported ONCE if DB is empty.
+        if self._loaded and not force:
+            return
 
-        self._load(force=True)
-
-    def _load(self, force: bool = False) -> None:
         try:
-            st = self.path.stat()
-            if not force and st.st_mtime <= self._mtime:
-                return
-            raw = self.path.read_text(encoding="utf-8")
-            data = json.loads(raw) if raw.strip() else {}
-            self._mtime = st.st_mtime
+            imported = await self.store.greet_import_from_legacy_file(self.path)
+            rules = await self.store.greet_list_rules()
 
-            enabled = bool(data.get("enabled", True))
-            whitelist = data.get("channel_whitelist", None)
-            if whitelist is not None and not isinstance(whitelist, list):
-                whitelist = None
-
-            cd_nick = int(data.get("cooldown_seconds_per_nick", 900))
-            cd_chan = int(data.get("cooldown_seconds_per_channel", 3))
-            rules = _safe_list(data.get("rules"))
-
-            # Normalize whitelist to lowercase for comparisons
-            wl = [c.strip() for c in whitelist] if whitelist else None
+            # For now keep these operational toggles local/defaults (we can move to kv later)
+            enabled = True
+            whitelist = None
+            cd_nick = 900
+            cd_chan = 3
 
             self._cfg = GreetConfig(
                 path=self.path,
                 enabled=enabled,
-                channel_whitelist=wl,
-                cooldown_seconds_per_nick=max(0, cd_nick),
-                cooldown_seconds_per_channel=max(0, cd_chan),
+                channel_whitelist=whitelist,
+                cooldown_seconds_per_nick=max(0, int(cd_nick)),
+                cooldown_seconds_per_channel=max(0, int(cd_chan)),
                 rules=rules,
             )
-            log.info("Greetings loaded: %s rules from %s", len(rules), self.path)
-        except FileNotFoundError:
-            # No file yet is not fatal; bot still runs
-            self._cfg = GreetConfig(path=self.path, enabled=False, rules=[])
-            log.warning("Greetings file not found: %s (greeting disabled until created)", self.path)
+            self._loaded = True
+            if imported:
+                log.info("Greetings imported from legacy file into DB: %s rules", imported)
+            log.info("Greetings loaded from DB: %s rules", len(rules))
         except Exception as e:
-            # Keep the last good config; do not brick the bot
-            log.error("Failed to load greetings from %s: %s: %s", self.path, type(e).__name__, e)
+            log.error("Failed to load greetings from DB: %s: %s", type(e).__name__, e)
 
     def _channel_allowed(self, channel: str) -> bool:
         wl = self._cfg.channel_whitelist
