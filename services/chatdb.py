@@ -68,7 +68,6 @@ CREATE TABLE IF NOT EXISTS messages (
   has_link INTEGER NOT NULL DEFAULT 0,
   text TEXT NOT NULL
 );
-
 CREATE INDEX IF NOT EXISTS idx_messages_chan_ts ON messages(channel, ts);
 CREATE INDEX IF NOT EXISTS idx_messages_nick_ts ON messages(nick, ts);
 
@@ -87,12 +86,11 @@ CREATE TABLE IF NOT EXISTS nick_changes (
   old_nick TEXT NOT NULL,
   new_nick TEXT NOT NULL
 );
-
 CREATE INDEX IF NOT EXISTS idx_nickchg_old_ts ON nick_changes(old_nick, ts);
 CREATE INDEX IF NOT EXISTS idx_nickchg_new_ts ON nick_changes(new_nick, ts);
 
 CREATE TABLE IF NOT EXISTS stats_daily (
-  day TEXT NOT NULL,        -- YYYY-MM-DD (UTC)
+  day TEXT NOT NULL, -- YYYY-MM-DD (UTC)
   channel TEXT NOT NULL,
   nick TEXT NOT NULL,
   msgs INTEGER NOT NULL DEFAULT 0,
@@ -106,7 +104,6 @@ CREATE TABLE IF NOT EXISTS stats_daily (
   nickchanges INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(day, channel, nick)
 );
-
 CREATE INDEX IF NOT EXISTS idx_stats_day_chan ON stats_daily(day, channel);
 
 -- ============================================================
@@ -121,7 +118,6 @@ CREATE TABLE IF NOT EXISTS greet_rules (
   greetings_json TEXT NOT NULL,     -- ["hi bob", "yo bob", ...]
   updated_ts INTEGER NOT NULL
 );
-
 CREATE INDEX IF NOT EXISTS idx_greet_rules_enabled_pri ON greet_rules(enabled, priority);
 
 CREATE TABLE IF NOT EXISTS wiki_watch (
@@ -144,7 +140,6 @@ CREATE TABLE IF NOT EXISTS weather_watches (
   created_ts INTEGER NOT NULL,
   expires_ts INTEGER NOT NULL
 );
-
 CREATE INDEX IF NOT EXISTS idx_weather_watches_expires ON weather_watches(expires_ts);
 
 CREATE TABLE IF NOT EXISTS weather_settings (
@@ -159,9 +154,32 @@ CREATE TABLE IF NOT EXISTS acl_auth (
   authed_until_ts INTEGER NOT NULL,
   authed_ts INTEGER NOT NULL
 );
-
 CREATE INDEX IF NOT EXISTS idx_acl_auth_until ON acl_auth(authed_until_ts);
+
+-- ============================================================
+-- SysMon / Collector persistence (replaces health.json/events.log)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS sys_health_snapshots (
+  ts INTEGER PRIMARY KEY,           -- unix epoch seconds
+  payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sys_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,              -- unix epoch seconds
+  message TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sys_events_ts ON sys_events(ts);
+
+-- Generic collector state (optional; lets you migrate weather_state.json etc later)
+CREATE TABLE IF NOT EXISTS sys_state (
+  k TEXT PRIMARY KEY,
+  v_json TEXT NOT NULL,
+  updated_ts INTEGER NOT NULL
+);
 """
+
 
 @dataclass
 class DBConfig:
@@ -237,7 +255,8 @@ class ChatDB:
         if not s:
             return
         await self.execute(
-            "INSERT OR IGNORE INTO services(service, description, enabled_by_default, created_utc) VALUES(?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO services(service, description, enabled_by_default, created_utc) "
+            "VALUES(?, ?, ?, ?)",
             (s, (description or "").strip(), int(bool(enabled_by_default)), self._utc_now()),
         )
 
@@ -251,7 +270,8 @@ class ChatDB:
         await self.execute(
             "INSERT INTO service_channel(service, channel, enabled, updated_utc, updated_by) "
             "VALUES(?, ?, ?, ?, ?) "
-            "ON CONFLICT(service, channel) DO UPDATE SET enabled=excluded.enabled, updated_utc=excluded.updated_utc, updated_by=excluded.updated_by",
+            "ON CONFLICT(service, channel) DO UPDATE SET "
+            "enabled=excluded.enabled, updated_utc=excluded.updated_utc, updated_by=excluded.updated_by",
             (s, ch, int(bool(enabled)), self._utc_now(), (updated_by or "")[:128]),
         )
 
