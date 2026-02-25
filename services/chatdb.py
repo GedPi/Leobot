@@ -1,19 +1,16 @@
 import asyncio
-import re
 import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
+import re
 
-
-SCHEMA = """
+SCHEMA = r'''
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 
--- ---------------------------------------------------------------------------
--- Control plane: channels + service enablement per channel
--- ---------------------------------------------------------------------------
+-- Control-plane (services/channels)
 CREATE TABLE IF NOT EXISTS channels (
   channel TEXT PRIMARY KEY,
   created_utc TEXT NOT NULL
@@ -21,7 +18,7 @@ CREATE TABLE IF NOT EXISTS channels (
 
 CREATE TABLE IF NOT EXISTS services (
   service TEXT PRIMARY KEY,
-  description TEXT NOT NULL DEFAULT '',
+  description TEXT DEFAULT '',
   enabled_by_default INTEGER NOT NULL DEFAULT 0,
   created_utc TEXT NOT NULL
 );
@@ -31,16 +28,13 @@ CREATE TABLE IF NOT EXISTS service_channel (
   channel TEXT NOT NULL,
   enabled INTEGER NOT NULL,
   updated_utc TEXT NOT NULL,
-  updated_by TEXT NOT NULL DEFAULT '',
+  updated_by TEXT DEFAULT '',
   PRIMARY KEY (service, channel),
   FOREIGN KEY (service) REFERENCES services(service) ON DELETE CASCADE,
   FOREIGN KEY (channel) REFERENCES channels(channel) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_service_channel_channel ON service_channel(channel);
 
--- ---------------------------------------------------------------------------
 -- Chat/history
--- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts INTEGER NOT NULL,
@@ -77,9 +71,7 @@ CREATE TABLE IF NOT EXISTS stats_daily (
   PRIMARY KEY(day, channel, nick)
 );
 
--- ---------------------------------------------------------------------------
 -- greet/wiki/weather/acl
--- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS greet_rules (
   id TEXT PRIMARY KEY,
   priority INTEGER NOT NULL DEFAULT 0,
@@ -126,9 +118,7 @@ CREATE TABLE IF NOT EXISTS acl_auth (
 );
 CREATE INDEX IF NOT EXISTS idx_acl_auth_until ON acl_auth(authed_until_ts);
 
--- ---------------------------------------------------------------------------
 -- sysmon
--- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS sys_health_snapshots (
   ts INTEGER PRIMARY KEY,
   payload_json TEXT NOT NULL
@@ -147,9 +137,7 @@ CREATE TABLE IF NOT EXISTS sys_state (
   updated_ts INTEGER NOT NULL
 );
 
--- ---------------------------------------------------------------------------
 -- NEWS (safe schema: NO "limit" column name)
--- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS news_settings (
   k TEXT PRIMARY KEY,
   v TEXT NOT NULL,
@@ -182,36 +170,11 @@ CREATE TABLE IF NOT EXISTS news_last_posted (
   PRIMARY KEY (target, source_id, category, limit_n),
   FOREIGN KEY (source_id) REFERENCES news_sources(id) ON DELETE CASCADE
 );
-"""
-
+'''
 
 @dataclass
 class DBConfig:
     path: str
-
-
-_LINK_RE = re.compile(r"(https?://|www\.)\S+", re.IGNORECASE)
-
-
-def utc_day(ts: int) -> str:
-    """Unix epoch seconds -> YYYY-MM-DD in UTC."""
-    try:
-        return time.strftime("%Y-%m-%d", time.gmtime(int(ts)))
-    except Exception:
-        return "1970-01-01"
-
-
-def word_count(text: str) -> int:
-    if not text:
-        return 0
-    return len([w for w in str(text).strip().split() if w])
-
-
-def has_link(text: str) -> bool:
-    if not text:
-        return False
-    return _LINK_RE.search(str(text)) is not None
-
 
 class ChatDB:
     def __init__(self, cfg: DBConfig):
@@ -219,16 +182,13 @@ class ChatDB:
         self._conn: sqlite3.Connection | None = None
         self._lock = asyncio.Lock()
 
-    # ----------------------------
-    # connection + primitives
-    # ----------------------------
     def _connect(self) -> sqlite3.Connection:
         if self._conn is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._conn = sqlite3.connect(
                 str(self.path),
                 timeout=30,
-                isolation_level=None,  # autocommit
+                isolation_level=None,
                 check_same_thread=False,
             )
             self._conn.executescript(SCHEMA)
@@ -260,9 +220,7 @@ class ChatDB:
                 self._conn.close()
                 self._conn = None
 
-    # ----------------------------
-    # control-plane helpers
-    # ----------------------------
+    # Control-plane API (used by bot.py)
     @staticmethod
     def _utc_now() -> str:
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -307,28 +265,46 @@ class ChatDB:
             return True
         row = await self.fetchone("SELECT enabled FROM service_channel WHERE service=? AND channel=?", (s, ch))
         if row is None:
-            # if not explicitly enabled, it's off (matches your !services enable behaviour)
             return False
         return bool(row[0])
 
     async def is_service_enabled_any(self, service: str) -> bool:
-        """True if service is enabled in at least one channel."""
         s = (service or "").strip().lower()
         if not s:
-            return False
+            return True
         row = await self.fetchone("SELECT 1 FROM service_channel WHERE service=? AND enabled=1 LIMIT 1", (s,))
         return row is not None
 
-    async def list_service_status_for_channel(self, channel: str) -> tuple[list[str], list[str]]:
-        """Return (enabled, disabled) service lists for a given channel."""
+    async def list_service_status_for_channel(self, channel: str) -> list[tuple[str, bool]]:
         ch = (channel or "").strip()
         if not ch:
-            return ([], [])
-        # services that have an explicit row
+            return []
         rows = await self.fetchall(
-            "SELECT service, enabled FROM service_channel WHERE channel=? ORDER BY service",
+            "SELECT s.service, COALESCE(sc.enabled, 0) "
+            "FROM services s "
+            "LEFT JOIN service_channel sc ON sc.service=s.service AND sc.channel=? "
+            "ORDER BY s.service",
             (ch,),
         )
-        enabled = [r[0] for r in rows if int(r[1]) == 1]
-        disabled = [r[0] for r in rows if int(r[1]) == 0]
-        return (enabled, disabled)
+        return [(r[0], bool(r[1])) for r in rows]
+
+# Compatibility helpers (used by services.stats and others)
+_LINK_RE = re.compile(r"(https?://|www\\.)\\S+", re.IGNORECASE)
+
+def utc_day(ts: int | None = None) -> str:
+    if ts is None:
+        ts = int(time.time())
+    try:
+        return time.strftime("%Y-%m-%d", time.gmtime(int(ts)))
+    except Exception:
+        return "1970-01-01"
+
+def word_count(text: str) -> int:
+    if not text:
+        return 0
+    return len([w for w in re.split(r"\\s+", text.strip()) if w])
+
+def has_link(text: str) -> bool:
+    if not text:
+        return False
+    return bool(_LINK_RE.search(text))

@@ -72,7 +72,62 @@ class Store:
             (rid, int(priority), 1 if enabled else 0, _j(match or {}), _j(greetings or []), _ts()),
         )
 
-    # ---------------------------
+    
+async def greet_import_from_legacy_file(self, path) -> int:
+    """Import legacy greetings JSON into DB if DB is empty.
+    Returns number of imported rules (0 if nothing imported).
+    Accepts formats:
+      - list[rule]
+      - {"rules":[rule,...]}
+    Rule keys accepted:
+      id, priority, enabled, match, greetings
+    """
+    try:
+        count = await self.greet_rule_count()
+        if count > 0:
+            return 0
+    except Exception:
+        return 0
+
+    try:
+        from pathlib import Path as _Path
+        p = _Path(path)
+        if not p.exists():
+            return 0
+        raw = p.read_text(encoding="utf-8")
+        data = json.loads(raw) if raw.strip() else None
+        if not data:
+            return 0
+
+        rules = data.get("rules") if isinstance(data, dict) else data
+        if not isinstance(rules, list):
+            return 0
+
+        imported = 0
+        for r in rules:
+            if not isinstance(r, dict):
+                continue
+            rid = str(r.get("id") or "").strip()
+            if not rid:
+                continue
+            priority = int(r.get("priority") or 0)
+            enabled = bool(r.get("enabled", True))
+            match = r.get("match") if isinstance(r.get("match"), dict) else {}
+            greetings = r.get("greetings") if isinstance(r.get("greetings"), list) else []
+            greetings = [str(x) for x in greetings if str(x).strip()]
+            await self.greet_upsert_rule(
+                rid=rid,
+                priority=priority,
+                enabled=enabled,
+                match=match,
+                greetings=greetings,
+            )
+            imported += 1
+        return imported
+    except Exception:
+        return 0
+
+# ---------------------------
     # Wiki
     # ---------------------------
 
