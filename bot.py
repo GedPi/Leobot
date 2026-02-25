@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 from services.chatdb import ChatDB, DBConfig
+from services.store import Store
 
 
 CONFIG_PATH = Path("/etc/leobot/config.json")
@@ -400,6 +401,9 @@ class IRCBot:
         if not db_path:
             db_path = "/var/lib/leobot/db/leobot.db"
         self.db = ChatDB(DBConfig(str(db_path)))
+
+        # Standard storage facade (services should prefer this over ad-hoc DB access)
+        self.store = Store(str(db_path))
 
         # Built-in router commands
         self.router.register(

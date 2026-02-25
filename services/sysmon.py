@@ -87,6 +87,13 @@ class SysMonService:
         parts = cmdline.split()
         cmd = parts[0].lower()
 
+        # Support subcommands: !sys updates / !sys services / !sys events [N] etc
+        if cmd == "sys" and len(parts) >= 2:
+            sub = parts[1].lower()
+            if sub in ("uptime", "disk", "updates", "failed", "errors", "services", "events"):
+                cmd = sub
+                parts = [cmd] + parts[2:]
+
         if cmd not in ("sys", "uptime", "disk", "updates", "failed", "errors", "services", "events"):
             return
 

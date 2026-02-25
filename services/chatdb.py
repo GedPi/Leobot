@@ -156,6 +156,43 @@ CREATE TABLE IF NOT EXISTS acl_auth (
 );
 CREATE INDEX IF NOT EXISTS idx_acl_auth_until ON acl_auth(authed_until_ts);
 
+
+-- ============================================================
+-- News (RSS sources + settings)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS news_settings (
+  k TEXT PRIMARY KEY,
+  v TEXT NOT NULL,
+  updated_ts INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS news_sources (
+  source_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_ts INTEGER NOT NULL,
+  updated_ts INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS news_source_categories (
+  source_id TEXT NOT NULL,
+  category TEXT NOT NULL,
+  url TEXT NOT NULL,
+  PRIMARY KEY(source_id, category),
+  FOREIGN KEY (source_id) REFERENCES news_sources(source_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS news_last_posted (
+  target TEXT NOT NULL,             -- channel or nick
+  source_id TEXT NOT NULL,
+  category TEXT NOT NULL,
+  limit INTEGER NOT NULL,
+  posted_ts INTEGER NOT NULL,
+  PRIMARY KEY(target, source_id, category, limit)
+);
+CREATE INDEX IF NOT EXISTS idx_news_last_posted_ts ON news_last_posted(posted_ts);
+
 -- ============================================================
 -- SysMon / Collector persistence (replaces health.json/events.log)
 -- ============================================================

@@ -323,3 +323,157 @@ class Store:
     async def acl_prune_expired(self) -> None:
         now = _now()
         await self.db.execute("DELETE FROM acl_auth WHERE authed_until_ts < ?", (now,))
+
+    # ---------------------------
+    # News (RSS)
+    # ---------------------------
+
+    async def news_get_setting(self, k: str, default: str = "") -> str:
+        k = (k or "").strip()
+        if not k:
+            return default
+        row = await self.db.fetchone("SELECT v FROM news_settings WHERE k=?", (k,))
+        return str(row[0]) if row and row[0] is not None else default
+
+    async def news_set_setting(self, k: str, v: str) -> None:
+        k = (k or "").strip()
+        if not k:
+            return
+        await self.db.execute(
+            "INSERT INTO news_settings(k, v, updated_ts) VALUES(?,?,?) "
+            "ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_ts=excluded.updated_ts",
+            (k, str(v), _now()),
+        )
+
+    async def news_get_int(self, k: str, default: int) -> int:
+        try:
+            return int(await self.news_get_setting(k, str(default)))
+        except Exception:
+            return int(default)
+
+    async def news_get_float(self, k: str, default: float) -> float:
+        try:
+            return float(await self.news_get_setting(k, str(default)))
+        except Exception:
+            return float(default)
+
+    async def news_list_sources(self, *, include_disabled: bool = True) -> list[dict]:
+        if include_disabled:
+            rows = await self.db.fetchall(
+                "SELECT source_id, name, enabled, created_ts, updated_ts FROM news_sources ORDER BY source_id ASC"
+            )
+        else:
+            rows = await self.db.fetchall(
+                "SELECT source_id, name, enabled, created_ts, updated_ts FROM news_sources WHERE enabled=1 ORDER BY source_id ASC"
+            )
+
+        out: list[dict] = []
+        for sid, name, enabled, created, updated in rows:
+            cats = await self.db.fetchall(
+                "SELECT category, url FROM news_source_categories WHERE source_id=? ORDER BY category ASC",
+                (sid,),
+            )
+            out.append(
+                {
+                    "id": str(sid),
+                    "name": str(name),
+                    "enabled": bool(int(enabled)),
+                    "categories": {str(c): str(u) for (c, u) in cats},
+                    "created_ts": int(created),
+                    "updated_ts": int(updated),
+                }
+            )
+        return out
+
+    async def news_upsert_source(self, *, source_id: str, name: str, categories: dict, enabled: bool = True) -> None:
+        sid = (source_id or "").strip().lower()
+        if not sid:
+            return
+        now = _now()
+        await self.db.execute(
+            "INSERT INTO news_sources(source_id, name, enabled, created_ts, updated_ts) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(source_id) DO UPDATE SET name=excluded.name, enabled=excluded.enabled, updated_ts=excluded.updated_ts",
+            (sid, (name or sid).strip(), 1 if enabled else 0, now, now),
+        )
+
+        # Replace categories atomically
+        await self.db.execute("DELETE FROM news_source_categories WHERE source_id=?", (sid,))
+        rows: list[tuple] = []
+        if isinstance(categories, dict):
+            for cat, url in categories.items():
+                c = str(cat).strip().lower()
+                u = str(url).strip()
+                if c and u:
+                    rows.append((sid, c, u))
+        if rows:
+            await self.db.executemany(
+                "INSERT INTO news_source_categories(source_id, category, url) VALUES(?,?,?)",
+                rows,
+            )
+
+    async def news_delete_source(self, source_id: str) -> bool:
+        sid = (source_id or "").strip().lower()
+        if not sid:
+            return False
+        before = await self.db.fetchone("SELECT COUNT(*) FROM news_sources WHERE source_id=?", (sid,))
+        await self.db.execute("DELETE FROM news_sources WHERE source_id=?", (sid,))
+        return int(before[0]) > 0 if before else False
+
+    async def news_get_last_posted(self, *, target: str, source_id: str, category: str, limit: int) -> Optional[int]:
+        row = await self.db.fetchone(
+            "SELECT posted_ts FROM news_last_posted WHERE target=? AND source_id=? AND category=? AND limit=?",
+            ((target or "").strip(), (source_id or "").strip().lower(), (category or "").strip().lower(), int(limit)),
+        )
+        if not row:
+            return None
+        try:
+            return int(row[0])
+        except Exception:
+            return None
+
+    async def news_set_last_posted(self, *, target: str, source_id: str, category: str, limit: int, posted_ts: int) -> None:
+        await self.db.execute(
+            "INSERT INTO news_last_posted(target, source_id, category, limit, posted_ts) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(target, source_id, category, limit) DO UPDATE SET posted_ts=excluded.posted_ts",
+            ((target or "").strip(), (source_id or "").strip().lower(), (category or "").strip().lower(), int(limit), int(posted_ts)),
+        )
+
+    async def news_import_from_legacy_config(self, news_cfg: dict) -> int:
+        """Imports config.json news section into DB if there are no sources yet.
+
+        Returns number of sources imported.
+        """
+        existing = await self.db.fetchone("SELECT COUNT(*) FROM news_sources")
+        if existing and int(existing[0]) > 0:
+            return 0
+
+        if not isinstance(news_cfg, dict):
+            return 0
+
+        # settings
+        defaults = {
+            "default_limit": str(news_cfg.get("default_limit", 10)),
+            "max_limit": str(news_cfg.get("max_limit", 10)),
+            "cache_ttl_seconds": str(news_cfg.get("cache_ttl_seconds", 3600)),
+            "cooldown_seconds": str(news_cfg.get("cooldown_seconds", 120)),
+            "line_delay_seconds": str(news_cfg.get("line_delay_seconds", 1.2)),
+            "selection_timeout_seconds": str(news_cfg.get("selection_timeout_seconds", 60)),
+        }
+        for k, v in defaults.items():
+            await self.news_set_setting(k, v)
+
+        imported = 0
+        srcs = news_cfg.get("sources")
+        if isinstance(srcs, list):
+            for s in srcs:
+                if not isinstance(s, dict):
+                    continue
+                sid = str(s.get("id") or "").strip().lower()
+                name = str(s.get("name") or sid).strip()
+                cats = s.get("categories") if isinstance(s.get("categories"), dict) else {}
+                if not sid or not cats:
+                    continue
+                await self.news_upsert_source(source_id=sid, name=name, categories=cats, enabled=True)
+                imported += 1
+
+        return imported
