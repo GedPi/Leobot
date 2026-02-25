@@ -110,6 +110,58 @@ CREATE TABLE IF NOT EXISTS stats_daily (
 CREATE INDEX IF NOT EXISTS idx_stats_day_chan ON stats_daily(day, channel);
 """
 
+# --- add to SCHEMA in services/chatdb.py ---
+
+CREATE TABLE IF NOT EXISTS greet_rules (
+  id TEXT PRIMARY KEY,
+  priority INTEGER NOT NULL DEFAULT 0,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  match_json TEXT NOT NULL,         -- {"nicks":[...], "hosts":[...]}
+  greetings_json TEXT NOT NULL,     -- ["hi bob", "yo bob", ...]
+  updated_ts INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_greet_rules_enabled_pri ON greet_rules(enabled, priority);
+
+CREATE TABLE IF NOT EXISTS wiki_watch (
+  title TEXT PRIMARY KEY,
+  lang TEXT NOT NULL DEFAULT 'en',
+  created_ts INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS wiki_settings (
+  k TEXT PRIMARY KEY,
+  v TEXT NOT NULL,
+  updated_ts INTEGER NOT NULL
+);
+
+-- weather watches (for collector / warn list/del/add)
+CREATE TABLE IF NOT EXISTS weather_watches (
+  city TEXT PRIMARY KEY,
+  duration_hours INTEGER NOT NULL,
+  types_json TEXT NOT NULL,         -- ["rain"] etc
+  interval_minutes INTEGER NOT NULL,
+  created_ts INTEGER NOT NULL,
+  expires_ts INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_weather_watches_expires ON weather_watches(expires_ts);
+
+CREATE TABLE IF NOT EXISTS weather_settings (
+  k TEXT PRIMARY KEY,
+  v TEXT NOT NULL,
+  updated_ts INTEGER NOT NULL
+);
+
+-- persist ACL daily auth
+CREATE TABLE IF NOT EXISTS acl_auth (
+  identity_key TEXT PRIMARY KEY,    -- user@host lower, or nick lower fallback
+  role TEXT NOT NULL,
+  authed_until_ts INTEGER NOT NULL,
+  authed_ts INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_acl_auth_until ON acl_auth(authed_until_ts);
 
 @dataclass
 class DBConfig:
