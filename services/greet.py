@@ -2,12 +2,15 @@ import json
 import random
 import time
 import logging
-log = logging.getLogger("leobot.greet")
+
 from dataclasses import dataclass
-from services.store import Store
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
+
+from services.store import Store
+
+log = logging.getLogger("leobot.greet")
 
 GREETINGS_PATH_DEFAULT = Path("/var/lib/leobot/greetings.json")
 
@@ -30,15 +33,13 @@ def _safe_list(x) -> list:
 
 def _render(tpl: str, *, nick: str, channel: str) -> str:
     # Minimal templating; safe and predictable
-    return (
-        tpl.replace("{nick}", nick)
-        .replace("{channel}", channel)
-    )
+    return tpl.replace("{nick}", nick).replace("{channel}", channel)
 
 
 def _extract_hostmask(ev) -> dict[str, str]:
     """
     Best-effort extraction from whatever your event object provides.
+
     We support matching against:
       - hostmask: nick!user@host
       - userhost: user@host
@@ -55,6 +56,7 @@ def _extract_hostmask(ev) -> dict[str, str]:
         userhost = f"{user}@{host}"
     elif user and host:
         userhost = f"{user}@{host}"
+
     return {
         "nick": nick,
         "user": user,
@@ -69,13 +71,17 @@ class GreetConfig:
     path: Path
     enabled: bool = True
     channel_whitelist: list[str] | None = None
-    cooldown_seconds_per_nick: int = 900          # 15 min default
-    cooldown_seconds_per_channel: int = 3         # anti-flood for netsplits, etc.
-    rules: list[dict[str, Any]] = None
+    cooldown_seconds_per_nick: int = 900  # 15 min default
+    cooldown_seconds_per_channel: int = 3  # anti-flood for netsplits, etc.
+    rules: list[dict[str, Any]] | None = None
 
 
 class GreetService:
-        self.path = Path((cfg.get("path") or str(GREETINGS_PATH_DEFAULT)))  # legacy import location only
+    def __init__(self, bot, cfg: dict[str, Any]):
+        self.bot = bot
+
+        # legacy import location only
+        self.path = Path((cfg.get("path") or str(GREETINGS_PATH_DEFAULT)))
 
         db_path = "/var/lib/leobot/db/leobot.db"
         if isinstance(getattr(bot, "cfg", None), dict):
@@ -84,10 +90,19 @@ class GreetService:
         self.store = Store(db_path)
         self._loaded = False
 
-        self._cfg = GreetConfig(path=self.path, rules=[])
-        self._cool_nick: dict[str, int] = {}       # nick_lower -> ts_until
-        self._cool_chan: dict[str, int] = {}       # channel_lower -> ts_until
-    
+        # For now keep operational toggles local/defaults (move to kv later)
+        self._cfg = GreetConfig(
+            path=self.path,
+            enabled=True,
+            channel_whitelist=None,
+            cooldown_seconds_per_nick=900,
+            cooldown_seconds_per_channel=3,
+            rules=[],
+        )
+
+        self._cool_nick: dict[str, int] = {}  # nick_lower -> ts_until
+        self._cool_chan: dict[str, int] = {}  # channel_lower -> ts_until
+
     async def _load(self, force: bool = False) -> None:
         # DB is authoritative. Legacy JSON is imported ONCE if DB is empty.
         if self._loaded and not force:
@@ -97,21 +112,9 @@ class GreetService:
             imported = await self.store.greet_import_from_legacy_file(self.path)
             rules = await self.store.greet_list_rules()
 
-            # For now keep these operational toggles local/defaults (we can move to kv later)
-            enabled = True
-            whitelist = None
-            cd_nick = 900
-            cd_chan = 3
-
-            self._cfg = GreetConfig(
-                path=self.path,
-                enabled=enabled,
-                channel_whitelist=whitelist,
-                cooldown_seconds_per_nick=max(0, int(cd_nick)),
-                cooldown_seconds_per_channel=max(0, int(cd_chan)),
-                rules=rules,
-            )
+            self._cfg.rules = rules
             self._loaded = True
+
             if imported:
                 log.info("Greetings imported from legacy file into DB: %s rules", imported)
             log.info("Greetings loaded from DB: %s rules", len(rules))
@@ -153,13 +156,12 @@ class GreetService:
                 if _lower(n) == _lower(nick):
                     return True
 
-        # Host patterns are wildcard fnmatch against:
-        # - full hostmask: nick!user@host
+        # Host patterns wildcard fnmatch against:
+        # - nick!user@host
         # - user@host
         # - host
         if hosts:
-            candidates = [hostmask, userhost, host]
-            candidates = [c for c in candidates if c]
+            candidates = [c for c in [hostmask, userhost, host] if c]
             for pat in hosts:
                 pat = pat.strip()
                 if not pat:
@@ -193,7 +195,6 @@ class GreetService:
         if not matches:
             return None
 
-        # Highest priority wins; if tie, first in file wins
         matches.sort(key=lambda x: x[0], reverse=True)
         top_pr = matches[0][0]
         for pr, rule in matches:
@@ -202,8 +203,7 @@ class GreetService:
         return matches[0][1]
 
     async def on_join(self, bot, ev) -> None:
-        # Auto-reload on mtime change
-        self._load(force=False)
+        await self._load(force=False)
 
         if not self._cfg.enabled:
             return
@@ -220,7 +220,6 @@ class GreetService:
         if not nick:
             return
 
-        # cooldown to avoid spam
         if not self._cooldown_ok(nick, channel):
             return
 
@@ -236,8 +235,6 @@ class GreetService:
         await bot.privmsg(channel, msg)
 
     async def on_privmsg(self, bot, ev) -> None:
-        # Optional operational commands (no edits, just reload/test)
-
         prefix = bot.cfg.get("command_prefix", "!")
         text = (getattr(ev, "text", "") or "").strip()
         if not text.startswith(prefix):
@@ -254,17 +251,20 @@ class GreetService:
 
         # !greet reload
         if len(parts) == 2 and parts[1].lower() == "reload":
-            self._load(force=True)
+            await self._load(force=True)
             await bot.privmsg(ev.target, f"{ev.nick}: greetings reloaded ({len(self._cfg.rules or [])} rules).")
             return
 
         # !greet test <nick> [hostmask]
         # hostmask example: Ged!ged@HairyOctopus.net
         if len(parts) >= 3 and parts[1].lower() == "test":
+            await self._load(force=False)
+
             test_nick = parts[2]
             hostmask = parts[3] if len(parts) >= 4 else ""
             userhost = ""
             host = ""
+
             if "@" in hostmask and "!" in hostmask:
                 try:
                     userhost = hostmask.split("!", 1)[1]
@@ -284,20 +284,46 @@ class GreetService:
             if not rule:
                 await bot.privmsg(ev.target, f"{ev.nick}: no rule matched.")
                 return
+
             rid = rule.get("id") or "(no id)"
             await bot.privmsg(ev.target, f"{ev.nick}: matched rule '{rid}'.")
             return
 
-        await bot.privmsg(ev.target, f"{ev.nick}: usage: !greet reload  |  !greet test <nick> [hostmask]")
-        return
+        await bot.privmsg(ev.target, f"{ev.nick}: usage: !greet reload | !greet test <nick> [hostmask]")
 
 
 def setup(bot):
     if hasattr(bot, "register_command"):
-        bot.register_command("greet reload", min_role="contributor", mutating=False, help="Reload greetings.json from disk.", category="Fun")
-        bot.register_command("greet test", min_role="contributor", mutating=False, help="Test greeting matching. Usage: !greet test <nick> [hostmask]", category="Fun")
-    if getattr(bot, "acl", None) is not None and hasattr(bot.acl, "register"):
-        bot.acl.register("greet reload", min_role="contributor", mutating=False, help="Reload greetings.json from disk.", category="Fun")
-        bot.acl.register("greet test", min_role="contributor", mutating=False, help="Test greeting matching. Usage: !greet test <nick> [hostmask]", category="Fun")
+        bot.register_command(
+            "greet reload",
+            min_role="contributor",
+            mutating=False,
+            help="Reload greetings from database.",
+            category="Fun",
+        )
+        bot.register_command(
+            "greet test",
+            min_role="contributor",
+            mutating=False,
+            help="Test greeting matching. Usage: !greet test <nick> [hostmask]",
+            category="Fun",
+        )
 
-    return GreetService(bot, bot.cfg.get('greet', {}) if isinstance(bot.cfg, dict) else {})
+    if getattr(bot, "acl", None) is not None and hasattr(bot.acl, "register"):
+        bot.acl.register(
+            "greet reload",
+            min_role="contributor",
+            mutating=False,
+            help="Reload greetings from database.",
+            category="Fun",
+        )
+        bot.acl.register(
+            "greet test",
+            min_role="contributor",
+            mutating=False,
+            help="Test greeting matching. Usage: !greet test <nick> [hostmask]",
+            category="Fun",
+        )
+
+    cfg = bot.cfg.get("greet", {}) if isinstance(getattr(bot, "cfg", None), dict) else {}
+    return GreetService(bot, cfg)
