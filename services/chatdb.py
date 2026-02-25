@@ -107,7 +107,7 @@ CREATE TABLE IF NOT EXISTS stats_daily (
 CREATE INDEX IF NOT EXISTS idx_stats_day_chan ON stats_daily(day, channel);
 
 -- ============================================================
--- New state tables (greet/wiki/weather/acl)
+-- greet/wiki/weather/acl state
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS greet_rules (
@@ -156,45 +156,8 @@ CREATE TABLE IF NOT EXISTS acl_auth (
 );
 CREATE INDEX IF NOT EXISTS idx_acl_auth_until ON acl_auth(authed_until_ts);
 
-
 -- ============================================================
--- News (RSS sources + settings)
--- ============================================================
-
-CREATE TABLE IF NOT EXISTS news_settings (
-  k TEXT PRIMARY KEY,
-  v TEXT NOT NULL,
-  updated_ts INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS news_sources (
-  source_id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  enabled INTEGER NOT NULL DEFAULT 1,
-  created_ts INTEGER NOT NULL,
-  updated_ts INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS news_source_categories (
-  source_id TEXT NOT NULL,
-  category TEXT NOT NULL,
-  url TEXT NOT NULL,
-  PRIMARY KEY(source_id, category),
-  FOREIGN KEY (source_id) REFERENCES news_sources(source_id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS news_last_posted (
-  target TEXT NOT NULL,             -- channel or nick
-  source_id TEXT NOT NULL,
-  category TEXT NOT NULL,
-  limit_n INTEGER NOT NULL,
-  posted_ts INTEGER NOT NULL,
-  PRIMARY KEY(target, source_id, category, limit_n)
-);
-CREATE INDEX IF NOT EXISTS idx_news_last_posted_ts ON news_last_posted(posted_ts);
-
--- ============================================================
--- SysMon / Collector persistence (replaces health.json/events.log)
+-- sysmon / collector persistence
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS sys_health_snapshots (
@@ -209,19 +172,55 @@ CREATE TABLE IF NOT EXISTS sys_events (
 );
 CREATE INDEX IF NOT EXISTS idx_sys_events_ts ON sys_events(ts);
 
--- Generic collector state (optional; lets you migrate weather_state.json etc later)
 CREATE TABLE IF NOT EXISTS sys_state (
   k TEXT PRIMARY KEY,
   v_json TEXT NOT NULL,
   updated_ts INTEGER NOT NULL
 );
-"""
 
+-- ============================================================
+-- NEWS (DB-backed)  -- IMPORTANT: no reserved words like "limit"
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS news_settings (
+  k TEXT PRIMARY KEY,
+  v TEXT NOT NULL,
+  updated_ts INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS news_sources (
+  id TEXT PRIMARY KEY,
+  url TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  interval_minutes INTEGER NOT NULL DEFAULT 60,
+  created_ts INTEGER NOT NULL,
+  updated_ts INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS news_source_categories (
+  source_id TEXT NOT NULL,
+  category TEXT NOT NULL,
+  PRIMARY KEY (source_id, category),
+  FOREIGN KEY (source_id) REFERENCES news_sources(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS news_last_posted (
+  target TEXT NOT NULL,             -- channel or nick
+  source_id TEXT NOT NULL,
+  category TEXT NOT NULL,
+  limit_n INTEGER NOT NULL DEFAULT 10,   -- NOTE: NOT named "limit"
+  last_guid TEXT DEFAULT '',
+  last_ts INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (target, source_id, category, limit_n),
+  FOREIGN KEY (source_id) REFERENCES news_sources(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_news_sources_enabled ON news_sources(enabled);
+"""
 
 @dataclass
 class DBConfig:
     path: str
-
 
 class ChatDB:
     def __init__(self, cfg: DBConfig):
@@ -271,9 +270,6 @@ class ChatDB:
                 self._conn.close()
                 self._conn = None
 
-    # -----------------------------
-    # Control-plane helpers
-    # -----------------------------
     @staticmethod
     def _utc_now() -> str:
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -292,8 +288,7 @@ class ChatDB:
         if not s:
             return
         await self.execute(
-            "INSERT OR IGNORE INTO services(service, description, enabled_by_default, created_utc) "
-            "VALUES(?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO services(service, description, enabled_by_default, created_utc) VALUES(?, ?, ?, ?)",
             (s, (description or "").strip(), int(bool(enabled_by_default)), self._utc_now()),
         )
 
@@ -313,56 +308,15 @@ class ChatDB:
         )
 
     async def is_service_enabled(self, service: str, channel: str) -> bool:
-        """Default-off policy: if no row exists for (service, channel), treat as disabled."""
         s = (service or "").strip().lower()
         ch = (channel or "").strip()
         if not s or not ch:
             return True
-        row = await self.fetchone(
-            "SELECT enabled FROM service_channel WHERE service=? AND channel=?",
-            (s, ch),
-        )
+        row = await self.fetchone("SELECT enabled FROM service_channel WHERE service=? AND channel=?", (s, ch))
         if row is None:
             return False
         return bool(row[0])
 
-    async def is_service_enabled_any(self, service: str) -> bool:
-        s = (service or "").strip().lower()
-        if not s:
-            return True
-        row = await self.fetchone(
-            "SELECT 1 FROM service_channel WHERE service=? AND enabled=1 LIMIT 1",
-            (s,),
-        )
-        return row is not None
-
     async def list_services(self) -> list[str]:
         rows = await self.fetchall("SELECT service FROM services ORDER BY service")
         return [r[0] for r in rows]
-
-    async def list_service_status_for_channel(self, channel: str) -> list[tuple[str, bool]]:
-        ch = (channel or "").strip()
-        if not ch:
-            return []
-        rows = await self.fetchall(
-            "SELECT s.service, COALESCE(sc.enabled, 0) "
-            "FROM services s "
-            "LEFT JOIN service_channel sc ON sc.service=s.service AND sc.channel=? "
-            "ORDER BY s.service",
-            (ch,),
-        )
-        return [(r[0], bool(r[1])) for r in rows]
-
-
-def utc_day(ts: int | None = None) -> str:
-    ts = ts or int(time.time())
-    return time.strftime("%Y-%m-%d", time.gmtime(ts))
-
-
-def word_count(s: str) -> int:
-    return len([w for w in (s or "").strip().split() if w])
-
-
-def has_link(s: str) -> int:
-    t = (s or "").lower()
-    return 1 if ("http://" in t or "https://" in t) else 0
