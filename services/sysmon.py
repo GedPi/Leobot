@@ -1,12 +1,10 @@
+import asyncio
 import json
 import sqlite3
 import time
 from pathlib import Path
 
 DB_PATH = Path("/var/lib/leobot/db/leobot.db")
-
-HEALTH_JSON = Path("/var/lib/leobot/health.json")
-EVENTS_LOG = Path("/var/lib/leobot/events.log")
 
 
 def _fmt_bytes(n: int) -> str:
@@ -25,7 +23,7 @@ def _db() -> sqlite3.Connection:
     return sqlite3.connect(str(DB_PATH), timeout=10)
 
 
-def _load_health_from_db():
+def _load_health_db():
     if not DB_PATH.exists():
         return None, "db not found"
     try:
@@ -36,35 +34,13 @@ def _load_health_from_db():
         row = cur.fetchone()
         conn.close()
         if not row:
-            return None, "no health snapshot in DB"
+            return None, "no health snapshot in DB (collector not running?)"
         return json.loads(row[0]), None
     except Exception as e:
         return None, f"health DB unreadable: {e}"
 
 
-def _load_health_from_file():
-    if not HEALTH_JSON.exists():
-        return None, "health.json not found (collector not running?)"
-    try:
-        data = json.loads(HEALTH_JSON.read_text(encoding="utf-8"))
-    except Exception as e:
-        return None, f"health.json unreadable: {e}"
-    return data, None
-
-
-def _load_health():
-    # Prefer DB; fallback to legacy file
-    data, err = _load_health_from_db()
-    if data is not None:
-        return data, None
-    data2, err2 = _load_health_from_file()
-    if data2 is not None:
-        return data2, None
-    # prefer the more useful error
-    return None, err2 or err or "health unavailable"
-
-
-def _tail_events_from_db(n: int) -> list[str]:
+def _tail_events_db(n: int) -> list[str]:
     if not DB_PATH.exists():
         return []
     try:
@@ -85,27 +61,8 @@ def _tail_events_from_db(n: int) -> list[str]:
         return []
 
 
-def _tail_lines(path: Path, n: int) -> list[str]:
-    if not path.exists():
-        return []
-    try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        return lines[-n:]
-    except Exception:
-        return []
-
-
-def _tail_events(n: int) -> list[str]:
-    # Prefer DB; fallback to legacy file
-    lines = _tail_events_from_db(n)
-    if lines:
-        return lines
-    return _tail_lines(EVENTS_LOG, n)
-
-
 class SysMonService:
     def __init__(self):
-        # Basic spam protection: cooldown per target+command
         self._cooldown_until = {}  # (target, cmd) -> epoch
 
     def _cooldown_ok(self, target: str, cmd: str, seconds: int) -> bool:
@@ -122,6 +79,7 @@ class SysMonService:
         text = (ev.text or "").strip()
         if not text.startswith(prefix):
             return
+
         cmdline = text[len(prefix):].strip()
         if not cmdline:
             return
@@ -138,12 +96,12 @@ class SysMonService:
                 if not self._cooldown_ok(ev.target, cmd, seconds=20):
                     await bot.privmsg(ev.target, f"{ev.nick}: already posted recently. Try again in a bit.")
                     return
-            elif cmd in ("sys", "updates", "errors", "failed", "disk", "uptime"):
+            else:
                 if not self._cooldown_ok(ev.target, cmd, seconds=5):
                     await bot.privmsg(ev.target, f"{ev.nick}: slow down.")
                     return
 
-        data, err = _load_health()
+        data, err = _load_health_db()
         if err:
             await bot.privmsg(ev.target, f"{ev.nick}: {err}")
             return
@@ -229,6 +187,7 @@ class SysMonService:
             if not wl:
                 await bot.privmsg(ev.target, f"Services: watchlist empty (age {age_s})")
                 return
+
             bad = []
             good = []
             for s in wl:
@@ -253,15 +212,17 @@ class SysMonService:
             n = 10
             if len(parts) >= 2 and parts[1].isdigit():
                 n = max(1, min(50, int(parts[1])))
-            lines = _tail_events(n)
+
+            lines = _tail_events_db(n)
             if not lines:
                 await bot.privmsg(ev.target, f"Events: none (age {age_s})")
                 return
+
             await bot.privmsg(ev.target, f"Last {len(lines)} events:")
             for ln in lines:
                 await bot.privmsg(ev.target, ln)
                 if not ev.is_private:
-                    await time_sleep(0.8)
+                    await asyncio.sleep(0.8)
             return
 
         # cmd == "sys"
@@ -284,88 +245,59 @@ class SysMonService:
         )
 
 
-async def time_sleep(sec: float) -> None:
-    import asyncio
-    await asyncio.sleep(sec)
-
-
 def setup(bot):
+    # Register commands for help/ACL visibility
     if hasattr(bot, "register_command"):
         bot.register_command("sys", min_role="user", mutating=False,
-                             help="Server health summary from DB (fallback: health.json). Usage: !sys",
+                             help="Server health summary from DB. Usage: !sys",
                              category="System")
         bot.register_command("uptime", min_role="user", mutating=False,
-                             help="Show system uptime. Usage: !uptime",
+                             help="Show system uptime (DB). Usage: !uptime",
                              category="System")
         bot.register_command("disk", min_role="user", mutating=False,
-                             help="Show disk usage. Usage: !disk",
+                             help="Show disk usage (DB). Usage: !disk",
                              category="System")
         bot.register_command("updates", min_role="user", mutating=False,
-                             help="Show pending package updates. Usage: !updates",
+                             help="Show pending package updates (DB). Usage: !updates",
                              category="System")
         bot.register_command("failed", min_role="user", mutating=False,
-                             help="Show failed systemd units. Usage: !failed",
+                             help="Show failed systemd units (DB). Usage: !failed",
                              category="System")
         bot.register_command("errors", min_role="user", mutating=False,
-                             help="Show recent detected journal errors summary. Usage: !errors",
+                             help="Show recent journal errors summary (DB). Usage: !errors",
                              category="System")
         bot.register_command("services", min_role="user", mutating=False,
-                             help="Show watched services and failing ones. Usage: !services",
+                             help="Show watched services summary (DB). Usage: !services",
                              category="System")
         bot.register_command("events", min_role="user", mutating=False,
-                             help="Tail recent events (DB fallback: events.log). Usage: !events [N]",
+                             help="Tail recent events (DB). Usage: !events [N]",
                              category="System")
 
-        bot.register_command("sys services", min_role="user", mutating=False,
-                             help="Alias for !services",
-                             category="System")
-        bot.register_command("sys updates", min_role="user", mutating=False,
-                             help="Alias for !updates",
-                             category="System")
-        bot.register_command("sys errors", min_role="user", mutating=False,
-                             help="Alias for !errors",
-                             category="System")
-        bot.register_command("sys events", min_role="user", mutating=False,
-                             help="Alias for !events [N]",
-                             category="System")
-
+    # If ACL is present, register there too (some of your services use this)
     if getattr(bot, "acl", None) is not None and hasattr(bot.acl, "register"):
         bot.acl.register("sys", min_role="user", mutating=False,
-                         help="Server health summary from DB (fallback: health.json). Usage: !sys",
+                         help="Server health summary from DB. Usage: !sys",
                          category="System")
         bot.acl.register("uptime", min_role="user", mutating=False,
-                         help="Show system uptime. Usage: !uptime",
+                         help="Show system uptime (DB). Usage: !uptime",
                          category="System")
         bot.acl.register("disk", min_role="user", mutating=False,
-                         help="Show disk usage. Usage: !disk",
+                         help="Show disk usage (DB). Usage: !disk",
                          category="System")
         bot.acl.register("updates", min_role="user", mutating=False,
-                         help="Show pending package updates. Usage: !updates",
+                         help="Show pending package updates (DB). Usage: !updates",
                          category="System")
         bot.acl.register("failed", min_role="user", mutating=False,
-                         help="Show failed systemd units. Usage: !failed",
+                         help="Show failed systemd units (DB). Usage: !failed",
                          category="System")
         bot.acl.register("errors", min_role="user", mutating=False,
-                         help="Show recent detected journal errors summary. Usage: !errors",
+                         help="Show recent journal errors summary (DB). Usage: !errors",
                          category="System")
         bot.acl.register("services", min_role="user", mutating=False,
-                         help="Show watched services and failing ones. Usage: !services",
+                         help="Show watched services summary (DB). Usage: !services",
                          category="System")
         bot.acl.register("events", min_role="user", mutating=False,
-                         help="Tail recent events (DB fallback: events.log). Usage: !events [N]",
-                         category="System")
-
-        bot.acl.register("sys services", min_role="user", mutating=False,
-                         help="Alias for !services",
-                         category="System")
-        bot.acl.register("sys updates", min_role="user", mutating=False,
-                         help="Alias for !updates",
-                         category="System")
-        bot.acl.register("sys errors", min_role="user", mutating=False,
-                         help="Alias for !errors",
-                         category="System")
-        bot.acl.register("sys events", min_role="user", mutating=False,
-                         help="Alias for !events [N]",
+                         help="Tail recent events (DB). Usage: !events [N]",
                          category="System")
 
     return SysMonService()
