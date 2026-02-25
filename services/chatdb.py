@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -59,6 +58,7 @@ CREATE TABLE IF NOT EXISTS service_channel (
   FOREIGN KEY (channel) REFERENCES channels(channel) ON DELETE CASCADE
 );
 
+-- ---- Chat/history ----
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts INTEGER NOT NULL,
@@ -108,9 +108,10 @@ CREATE TABLE IF NOT EXISTS stats_daily (
 );
 
 CREATE INDEX IF NOT EXISTS idx_stats_day_chan ON stats_daily(day, channel);
-"""
 
-# --- add to SCHEMA in services/chatdb.py ---
+-- ============================================================
+-- New state tables (greet/wiki/weather/acl)
+-- ============================================================
 
 CREATE TABLE IF NOT EXISTS greet_rules (
   id TEXT PRIMARY KEY,
@@ -135,7 +136,6 @@ CREATE TABLE IF NOT EXISTS wiki_settings (
   updated_ts INTEGER NOT NULL
 );
 
--- weather watches (for collector / warn list/del/add)
 CREATE TABLE IF NOT EXISTS weather_watches (
   city TEXT PRIMARY KEY,
   duration_hours INTEGER NOT NULL,
@@ -153,7 +153,6 @@ CREATE TABLE IF NOT EXISTS weather_settings (
   updated_ts INTEGER NOT NULL
 );
 
--- persist ACL daily auth
 CREATE TABLE IF NOT EXISTS acl_auth (
   identity_key TEXT PRIMARY KEY,    -- user@host lower, or nick lower fallback
   role TEXT NOT NULL,
@@ -162,6 +161,7 @@ CREATE TABLE IF NOT EXISTS acl_auth (
 );
 
 CREATE INDEX IF NOT EXISTS idx_acl_auth_until ON acl_auth(authed_until_ts);
+"""
 
 @dataclass
 class DBConfig:
@@ -180,7 +180,7 @@ class ChatDB:
             self._conn = sqlite3.connect(
                 str(self.path),
                 timeout=30,
-                isolation_level=None,     # autocommit
+                isolation_level=None,  # autocommit
                 check_same_thread=False,
             )
             self._conn.executescript(SCHEMA)
@@ -219,7 +219,6 @@ class ChatDB:
     # -----------------------------
     # Control-plane helpers
     # -----------------------------
-
     @staticmethod
     def _utc_now() -> str:
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -262,7 +261,6 @@ class ChatDB:
         ch = (channel or "").strip()
         if not s or not ch:
             return True
-
         row = await self.fetchone(
             "SELECT enabled FROM service_channel WHERE service=? AND channel=?",
             (s, ch),
