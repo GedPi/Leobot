@@ -11,7 +11,9 @@ SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 
--- Control-plane (services/channels)
+-- ---------------------------------------------------------------------------
+-- Control plane: channels + service enablement per channel
+-- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS channels (
   channel TEXT PRIMARY KEY,
   created_utc TEXT NOT NULL
@@ -19,7 +21,7 @@ CREATE TABLE IF NOT EXISTS channels (
 
 CREATE TABLE IF NOT EXISTS services (
   service TEXT PRIMARY KEY,
-  description TEXT DEFAULT '',
+  description TEXT NOT NULL DEFAULT '',
   enabled_by_default INTEGER NOT NULL DEFAULT 0,
   created_utc TEXT NOT NULL
 );
@@ -29,15 +31,16 @@ CREATE TABLE IF NOT EXISTS service_channel (
   channel TEXT NOT NULL,
   enabled INTEGER NOT NULL,
   updated_utc TEXT NOT NULL,
-  updated_by TEXT DEFAULT '',
+  updated_by TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (service, channel),
   FOREIGN KEY (service) REFERENCES services(service) ON DELETE CASCADE,
   FOREIGN KEY (channel) REFERENCES channels(channel) ON DELETE CASCADE
 );
+CREATE INDEX IF NOT EXISTS idx_service_channel_channel ON service_channel(channel);
 
-CREATE INDEX IF NOT EXISTS idx_service_channel_chan ON service_channel(channel, enabled);
-
+-- ---------------------------------------------------------------------------
 -- Chat/history
+-- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts INTEGER NOT NULL,
@@ -74,7 +77,9 @@ CREATE TABLE IF NOT EXISTS stats_daily (
   PRIMARY KEY(day, channel, nick)
 );
 
+-- ---------------------------------------------------------------------------
 -- greet/wiki/weather/acl
+-- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS greet_rules (
   id TEXT PRIMARY KEY,
   priority INTEGER NOT NULL DEFAULT 0,
@@ -121,7 +126,9 @@ CREATE TABLE IF NOT EXISTS acl_auth (
 );
 CREATE INDEX IF NOT EXISTS idx_acl_auth_until ON acl_auth(authed_until_ts);
 
+-- ---------------------------------------------------------------------------
 -- sysmon
+-- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS sys_health_snapshots (
   ts INTEGER PRIMARY KEY,
   payload_json TEXT NOT NULL
@@ -140,7 +147,9 @@ CREATE TABLE IF NOT EXISTS sys_state (
   updated_ts INTEGER NOT NULL
 );
 
+-- ---------------------------------------------------------------------------
 -- NEWS (safe schema: NO "limit" column name)
+-- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS news_settings (
   k TEXT PRIMARY KEY,
   v TEXT NOT NULL,
@@ -185,7 +194,7 @@ _LINK_RE = re.compile(r"(https?://|www\.)\S+", re.IGNORECASE)
 
 
 def utc_day(ts: int) -> str:
-    """Convert unix epoch seconds -> YYYY-MM-DD in UTC."""
+    """Unix epoch seconds -> YYYY-MM-DD in UTC."""
     try:
         return time.strftime("%Y-%m-%d", time.gmtime(int(ts)))
     except Exception:
@@ -193,14 +202,12 @@ def utc_day(ts: int) -> str:
 
 
 def word_count(text: str) -> int:
-    """Approximate word count for stats."""
     if not text:
         return 0
     return len([w for w in str(text).strip().split() if w])
 
 
 def has_link(text: str) -> bool:
-    """Detect if a message likely contains a URL."""
     if not text:
         return False
     return _LINK_RE.search(str(text)) is not None
@@ -212,21 +219,20 @@ class ChatDB:
         self._conn: sqlite3.Connection | None = None
         self._lock = asyncio.Lock()
 
+    # ----------------------------
+    # connection + primitives
+    # ----------------------------
     def _connect(self) -> sqlite3.Connection:
         if self._conn is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._conn = sqlite3.connect(
                 str(self.path),
                 timeout=30,
-                isolation_level=None,
+                isolation_level=None,  # autocommit
                 check_same_thread=False,
             )
             self._conn.executescript(SCHEMA)
         return self._conn
-
-    @staticmethod
-    def _utc_now() -> str:
-        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     async def execute(self, sql: str, args: Iterable[Any] = ()) -> None:
         async with self._lock:
@@ -248,9 +254,18 @@ class ChatDB:
             cur = self._connect().execute(sql, tuple(args))
             return cur.fetchall()
 
-    # -----------------------------
-    # Control-plane helpers used by bot.py
-    # -----------------------------
+    async def close(self) -> None:
+        async with self._lock:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+
+    # ----------------------------
+    # control-plane helpers
+    # ----------------------------
+    @staticmethod
+    def _utc_now() -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     async def ensure_channel(self, channel: str) -> None:
         ch = (channel or "").strip()
@@ -290,48 +305,30 @@ class ChatDB:
         ch = (channel or "").strip()
         if not s or not ch:
             return True
-        row = await self.fetchone(
-            "SELECT COALESCE(sc.enabled, s.enabled_by_default) "
-            "FROM services s "
-            "LEFT JOIN service_channel sc ON sc.service=s.service AND sc.channel=? "
-            "WHERE s.service=?",
-            (ch, s),
-        )
+        row = await self.fetchone("SELECT enabled FROM service_channel WHERE service=? AND channel=?", (s, ch))
         if row is None:
+            # if not explicitly enabled, it's off (matches your !services enable behaviour)
             return False
         return bool(row[0])
 
     async def is_service_enabled_any(self, service: str) -> bool:
+        """True if service is enabled in at least one channel."""
         s = (service or "").strip().lower()
         if not s:
-            return True
-        # If explicitly enabled in any channel, allow background tasks.
-        row = await self.fetchone(
-            "SELECT 1 FROM service_channel WHERE service=? AND enabled=1 LIMIT 1",
-            (s,),
-        )
-        if row:
-            return True
-        # Otherwise fall back to enabled_by_default.
-        row2 = await self.fetchone("SELECT enabled_by_default FROM services WHERE service=?", (s,))
-        return bool(row2 and row2[0])
+            return False
+        row = await self.fetchone("SELECT 1 FROM service_channel WHERE service=? AND enabled=1 LIMIT 1", (s,))
+        return row is not None
 
-    async def list_service_status_for_channel(self, channel: str) -> list[tuple[str, bool]]:
+    async def list_service_status_for_channel(self, channel: str) -> tuple[list[str], list[str]]:
+        """Return (enabled, disabled) service lists for a given channel."""
         ch = (channel or "").strip()
         if not ch:
-            return []
-        await self.ensure_channel(ch)
+            return ([], [])
+        # services that have an explicit row
         rows = await self.fetchall(
-            "SELECT s.service, COALESCE(sc.enabled, s.enabled_by_default) AS enabled "
-            "FROM services s "
-            "LEFT JOIN service_channel sc ON sc.service=s.service AND sc.channel=? "
-            "ORDER BY s.service",
+            "SELECT service, enabled FROM service_channel WHERE channel=? ORDER BY service",
             (ch,),
         )
-        return [(r[0], bool(r[1])) for r in rows]
-
-    async def close(self) -> None:
-        async with self._lock:
-            if self._conn is not None:
-                self._conn.close()
-                self._conn = None
+        enabled = [r[0] for r in rows if int(r[1]) == 1]
+        disabled = [r[0] for r in rows if int(r[1]) == 0]
+        return (enabled, disabled)
