@@ -9,6 +9,30 @@ SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 
+-- Control-plane (services/channels)
+CREATE TABLE IF NOT EXISTS channels (
+  channel TEXT PRIMARY KEY,
+  created_utc TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS services (
+  service TEXT PRIMARY KEY,
+  description TEXT DEFAULT '',
+  enabled_by_default INTEGER NOT NULL DEFAULT 0,
+  created_utc TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS service_channel (
+  service TEXT NOT NULL,
+  channel TEXT NOT NULL,
+  enabled INTEGER NOT NULL,
+  updated_utc TEXT NOT NULL,
+  updated_by TEXT DEFAULT '',
+  PRIMARY KEY (service, channel),
+  FOREIGN KEY (service) REFERENCES services(service) ON DELETE CASCADE,
+  FOREIGN KEY (channel) REFERENCES channels(channel) ON DELETE CASCADE
+);
+
 -- Chat/history
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -194,5 +218,55 @@ class ChatDB:
     async def close(self) -> None:
         async with self._lock:
             if self._conn is not None:
+    @staticmethod
+    def _utc_now() -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    async def ensure_channel(self, channel: str) -> None:
+        ch = (channel or "").strip()
+        if not ch:
+            return
+        await self.execute(
+            "INSERT OR IGNORE INTO channels(channel, created_utc) VALUES(?, ?)",
+            (ch, self._utc_now()),
+        )
+
+    async def ensure_service(self, service: str, description: str = "", enabled_by_default: int = 0) -> None:
+        s = (service or "").strip().lower()
+        if not s:
+            return
+        await self.execute(
+            "INSERT OR IGNORE INTO services(service, description, enabled_by_default, created_utc) VALUES(?, ?, ?, ?)",
+            (s, (description or "").strip(), int(bool(enabled_by_default)), self._utc_now()),
+        )
+
+    async def set_service_channel_enabled(self, service: str, channel: str, enabled: bool, updated_by: str = "") -> None:
+        s = (service or "").strip().lower()
+        ch = (channel or "").strip()
+        if not s or not ch:
+            return
+        await self.ensure_service(s)
+        await self.ensure_channel(ch)
+        await self.execute(
+            "INSERT INTO service_channel(service, channel, enabled, updated_utc, updated_by) "
+            "VALUES(?, ?, ?, ?, ?) "
+            "ON CONFLICT(service, channel) DO UPDATE SET "
+            "enabled=excluded.enabled, updated_utc=excluded.updated_utc, updated_by=excluded.updated_by",
+            (s, ch, 1 if enabled else 0, self._utc_now(), (updated_by or "")[:128]),
+        )
+
+    async def is_service_enabled(self, service: str, channel: str) -> bool:
+        s = (service or "").strip().lower()
+        ch = (channel or "").strip()
+        if not s or not ch:
+            return True
+        row = await self.fetchone("SELECT enabled FROM service_channel WHERE service=? AND channel=?", (s, ch))
+        if row is None:
+            return False
+        return bool(row[0])
+
+    async def list_services(self) -> list[str]:
+        rows = await self.fetchall("SELECT service FROM services ORDER BY service")
+        return [r[0] for r in rows]
                 self._conn.close()
                 self._conn = None
