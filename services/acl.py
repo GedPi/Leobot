@@ -3,15 +3,16 @@ import hashlib
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 try:
     from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None
 
-LONDON_TZ = ZoneInfo("Europe/London") if ZoneInfo else None
+from services.store import Store
 
+LONDON_TZ = ZoneInfo("Europe/London") if ZoneInfo else None
 
 ROLE_ORDER = {
     "guest": 0,
@@ -26,16 +27,14 @@ def _sha256_hex(s: str) -> str:
 
 
 def _identity_key(ev) -> str:
-    # Stable-ish identity: user@host if present, otherwise nick
-    if ev.user and ev.host:
+    # Stable identity: user@host if present, otherwise nick
+    if getattr(ev, "user", None) and getattr(ev, "host", None):
         return f"{ev.user}@{ev.host}".lower()
     return (ev.nick or "").lower()
 
 
 def _next_local_midnight_epoch() -> int:
-    # “Once a day” -> valid until next midnight in Europe/London
     if LONDON_TZ is None:
-        # fallback: 24h
         return int(time.time() + 24 * 3600)
 
     now = datetime.now(tz=LONDON_TZ)
@@ -46,34 +45,37 @@ def _next_local_midnight_epoch() -> int:
 
 @dataclass
 class CommandPolicy:
-    min_role: str          # guest/user/contributor/admin
-    mutating: bool = False # if True, requires daily auth for admin/contributor
+    min_role: str
+    mutating: bool = False
 
 
 class ACLService:
     """
-    Bot-wide access control with optional 'daily password re-auth' for mutating commands.
+    Bot-wide access control with optional daily password re-auth for mutating commands.
+    Persist auth in sqlite (acl_auth).
     """
 
     def __init__(self, bot):
         self.bot = bot
-
-        # command -> policy
         self.policies: Dict[str, CommandPolicy] = {}
 
-        # identity_key -> auth_until_epoch
+        db_path = "/var/lib/leobot/db/leobot.db"
+        if isinstance(getattr(bot, "cfg", None), dict):
+            db_path = bot.cfg.get("chatdb", {}).get("db_path", db_path)
+        self.store = Store(db_path)
+
+        # in-memory cache: identity_key -> auth_until_epoch
         self.auth_until: Dict[str, int] = {}
+        self._init_done = False
 
-        # identity_key -> role (cached per message is fine, but keep simple)
-        # no persistent storage by default (can add later)
-
-        # “pending auth” isn’t strictly required; we just accept !auth in PM any time
-
-        # register built-ins
         self.register("auth", min_role="guest", mutating=False)
         self.register("whoami", min_role="guest", mutating=False)
 
-    # ---------- policy registration ----------
+    async def _init_once(self) -> None:
+        if self._init_done:
+            return
+        await self.store.acl_prune_expired()
+        self._init_done = True
 
     def register(self, command: str, min_role: str = "user", mutating: bool = False, help: str = "", category: str = "General", **_ignored) -> None:
         command = command.lower().lstrip("!")
@@ -81,9 +83,8 @@ class ACLService:
             raise ValueError(f"Unknown role: {min_role}")
         self.policies[command] = CommandPolicy(min_role=min_role, mutating=mutating)
 
-        if hasattr(self.bot, 'register_command'):
-            self.bot.register_command(command, min_role=min_role, mutating=mutating, help=help or '', category=category or 'General')
-    # ---------- role resolution ----------
+        if hasattr(self.bot, "register_command"):
+            self.bot.register_command(command, min_role=min_role, mutating=mutating, help=help or "", category=category or "General")
 
     def _cfg(self) -> dict:
         return self.bot.cfg.get("acl", {}) if isinstance(self.bot.cfg, dict) else {}
@@ -93,29 +94,20 @@ class ACLService:
 
     def role_for(self, ev) -> str:
         cfg = self._cfg()
-
-        # Match lists in descending privilege order
         if self._match_any(cfg.get("admins", []), ev):
             return "admin"
         if self._match_any(cfg.get("contributors", []), ev):
             return "contributor"
         if self._match_any(cfg.get("users", []), ev):
             return "user"
-
         return "guest"
 
     def _match_any(self, entries, ev) -> bool:
-        """
-        entries supports:
-          - string masks like "*!*@example.com"
-          - objects like {"mask": "*!*@example.com", "pass_sha256": "..."} for admins/contributors
-        """
         if not isinstance(entries, list):
             return False
 
-        # Construct mask forms
         full = None
-        if ev.user and ev.host:
+        if getattr(ev, "user", None) and getattr(ev, "host", None):
             full = f"{ev.nick}!{ev.user}@{ev.host}"
         nick_only = ev.nick or ""
 
@@ -135,8 +127,6 @@ class ACLService:
                     return True
         return False
 
-    # ---------- daily auth ----------
-
     def _pass_sha256_for(self, ev, role: str) -> Optional[str]:
         cfg = self._cfg()
         key = "admins" if role == "admin" else "contributors"
@@ -145,7 +135,7 @@ class ACLService:
             return None
 
         full = None
-        if ev.user and ev.host:
+        if getattr(ev, "user", None) and getattr(ev, "host", None):
             full = f"{ev.nick}!{ev.user}@{ev.host}"
 
         for e in entries:
@@ -161,23 +151,31 @@ class ACLService:
                 return p
         return None
 
-    def is_authed_today(self, identity_key: str) -> bool:
-        until = self.auth_until.get(identity_key)
-        return bool(until and time.time() < until)
+    async def _is_authed_today(self, identity_key: str) -> bool:
+        now = int(time.time())
+        cached = self.auth_until.get(identity_key)
+        if cached and now < cached:
+            return True
+
+        until = await self.store.acl_get_authed_until(identity_key)
+        if until and now < until:
+            self.auth_until[identity_key] = int(until)
+            return True
+
+        return False
 
     async def require_auth(self, bot, ev, role: str) -> None:
-        # Ask privately for auth; also nudge in channel if needed
         if not ev.is_private:
             await bot.privmsg(ev.target, f"{ev.nick}: check your PMs to authenticate.")
-        await bot.privmsg(ev.nick, "Auth required for changes. Reply here with: !auth <password>")
-
-    # ---------- bot-wide precheck ----------
+        await bot.privmsg(ev.nick, "Auth required for changes.\nReply here with: !auth <password>")
 
     async def precheck(self, bot, ev) -> bool:
+        await self._init_once()
+
         prefix = bot.cfg.get("command_prefix", "!")
         text = (ev.text or "").strip()
         if not text.startswith(prefix):
-            return True  # not a command
+            return True
 
         cmdline = text[len(prefix):].strip()
         if not cmdline:
@@ -187,8 +185,6 @@ class ACLService:
         if not parts:
             return True
 
-        # Longest-prefix match against registered policies.
-        # This is required so that policies like "wikimon list" or "weather warn del" work correctly.
         cmd = parts[0]
         best = None
         for i in range(len(parts), 0, -1):
@@ -199,13 +195,10 @@ class ACLService:
         if best is not None:
             cmd = best
 
-        # Always allow auth/whoami to reach us
         if parts[0] in ("auth", "whoami"):
             return True
 
         policy = self.policies.get(cmd)
-
-        # Unknown commands: let services decide (don’t block)
         if policy is None:
             return True
 
@@ -214,18 +207,17 @@ class ACLService:
             await bot.privmsg(ev.target, f"{ev.nick}: not allowed (requires {policy.min_role}).")
             return False
 
-        # Mutating commands: require daily auth for admin/contributor
         if policy.mutating and role in ("admin", "contributor"):
             ident = _identity_key(ev)
-            if not self.is_authed_today(ident):
+            if not await self._is_authed_today(ident):
                 await self.require_auth(bot, ev, role)
                 return False
 
         return True
 
-    # ---------- command handling ----------
-
     async def on_privmsg(self, bot, ev) -> None:
+        await self._init_once()
+
         prefix = bot.cfg.get("command_prefix", "!")
         text = (ev.text or "").strip()
         if not text.startswith(prefix):
@@ -242,7 +234,7 @@ class ACLService:
         if cmd == "whoami":
             role = self.role_for(ev)
             ident = _identity_key(ev)
-            authed = self.is_authed_today(ident)
+            authed = await self._is_authed_today(ident)
             await bot.privmsg(ev.target, f"{ev.nick}: role={role}, daily_auth={'yes' if authed else 'no'}")
             return
 
@@ -270,27 +262,22 @@ class ACLService:
                 return
 
             ident = _identity_key(ev)
-            self.auth_until[ident] = _next_local_midnight_epoch()
+            until = _next_local_midnight_epoch()
+            self.auth_until[ident] = until
+            await self.store.acl_set_auth(identity_key=ident, role=role, authed_until_ts=until)
+
             await bot.privmsg(ev.nick, "Auth OK. You’re cleared for changes until next midnight.")
             return
 
 
 def setup(bot):
     svc = ACLService(bot)
-
-    # Expose on bot so other services can register policies
     bot.acl = svc
 
-    # Register policies for existing commands (bot-wide).
-    # eightball: safe for guests
     svc.register("8ball", min_role="guest", mutating=False)
     svc.register("eightball", min_role="guest", mutating=False)
 
-    # news: allow users to read news; later we’ll add mutating subcommands
     svc.register("news", min_role="user", mutating=False)
     svc.register("headlines", min_role="user", mutating=False)
-
-    # future examples:
-    # svc.register("newsaddsource", min_role="contributor", mutating=True)
 
     return svc
