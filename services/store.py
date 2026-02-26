@@ -26,7 +26,7 @@ class Store:
         if isinstance(db, ChatDB):
             self.db: ChatDB = db
         else:
-            cfg = db_config or DBConfig(db_path=str(db))
+            cfg = db_config or DBConfig.from_any(db_path=str(db))
             self.db = ChatDB(cfg)
 
         self._schema_checked = False
@@ -54,11 +54,11 @@ class Store:
     async def acl_prune_expired(self, now_ts: Optional[int] = None) -> int:
         await self._ensure_schema()
         now_ts = _now() if now_ts is None else int(now_ts)
-        cur = await self.db.execute(
+        rc = await self.db.execute(
             "DELETE FROM acl_auth WHERE authed_until_ts < ?",
             (now_ts,),
         )
-        return int(getattr(cur, "rowcount", 0) or 0)
+        return int(rc or 0)
 
     async def acl_set_auth(self, identity_key: str, role: str, authed_until_ts: int, authed_ts: Optional[int] = None) -> None:
         await self._ensure_schema()
@@ -149,7 +149,7 @@ class Store:
         await self.db.execute(
             "INSERT INTO greet_rules(id, priority, enabled, match_json, greetings_json, updated_ts) "
             "VALUES(?,?,?,?,?,?) "
-            "ON CONFLICT(id) DO UPDATE SET "
+            "ON CONFLICT(source_id) DO UPDATE SET "
             "priority=excluded.priority, enabled=excluded.enabled, match_json=excluded.match_json, greetings_json=excluded.greetings_json, updated_ts=excluded.updated_ts",
             (
                 str(rule_id),
@@ -163,7 +163,7 @@ class Store:
 
     async def greet_delete_rule(self, rule_id: str) -> None:
         await self._ensure_schema()
-        await self.db.execute("DELETE FROM greet_rules WHERE id = ?", (str(rule_id),))
+        await self.db.execute("DELETE FROM greet_rules WHERE source_id = ?", (str(rule_id),))
 
     async def greet_list_rules(self) -> List[Dict[str, Any]]:
         await self._ensure_schema()
@@ -301,7 +301,6 @@ class Store:
             "INSERT INTO weather_watches(city, duration_hours, types_json, interval_minutes, created_ts, expires_ts) "
             "VALUES(?,?,?,?,?,?) "
             "ON CONFLICT(city) DO UPDATE SET duration_hours=excluded.duration_hours, types_json=excluded.types_json, "
-            "interval_minutes=excluded.interval_minutes, created_ts=excluded.created_ts, expires_ts=excluded.expires_ts",
             (
                 str(city).strip(),
                 int(duration_hours),
@@ -334,8 +333,8 @@ class Store:
     async def weather_prune_expired(self, now_ts: Optional[int] = None) -> int:
         await self._ensure_schema()
         now_ts = _now() if now_ts is None else int(now_ts)
-        cur = await self.db.execute("DELETE FROM weather_watches WHERE expires_ts < ?", (now_ts,))
-        return int(getattr(cur, "rowcount", 0) or 0)
+        rc = await self.db.execute("DELETE FROM weather_watches WHERE expires_ts < ?", (now_ts,))
+        return int(rc or 0)
 
     async def weather_get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
         await self._ensure_schema()
@@ -393,8 +392,8 @@ class Store:
     async def news_list_sources(self, include_disabled: bool = True) -> List[Dict[str, Any]]:
         await self._ensure_schema()
         # sources + categories
-        sql = ("SELECT id, COALESCE(name, id) AS name, url, enabled, interval_minutes, created_ts, updated_ts "
-               "FROM news_sources" + ("" if include_disabled else " WHERE enabled=1") + " ORDER BY enabled DESC, id ASC")
+        sql = ("SELECT source_id, COALESCE(name, source_id) AS name, enabled, created_ts, updated_ts "
+               "FROM news_sources" + ("" if include_disabled else " WHERE enabled=1") + " ORDER BY enabled DESC, source_id ASC")
         src_rows = await self.db.fetchall(sql)
         cat_rows = await self.db.fetchall(
             "SELECT source_id, category, url FROM news_source_categories ORDER BY source_id ASC, category ASC"
@@ -405,7 +404,11 @@ class Store:
         out = []
         for r in src_rows:
             d = dict(r)
-            d["categories"] = cats.get(d["id"], {})
+            d["id"] = d.get("id") or d.get("source_id")
+            d["categories"] = cats.get(d.get("source_id") or d.get("id"), {})
+            d["url"] = d["categories"].get("default", "")
+            d["interval_minutes"] = await self.news_get_int(f"source_interval:{d.get('source_id')}", 60)
+            d["interval_minutes"] = await self.news_get_int(f"source_interval:{d.get('source_id')}", 60)
             out.append(d)
         return out
 
@@ -421,11 +424,10 @@ class Store:
         await self._ensure_schema()
         ts = _now()
         await self.db.execute(
-            "INSERT INTO news_sources(id, name, url, enabled, interval_minutes, created_ts, updated_ts) "
+            "INSERT INTO news_sources(source_id, name, enabled, created_ts, updated_ts) "
             "VALUES(?,?,?,?,?,?,?) "
-            "ON CONFLICT(id) DO UPDATE SET name=excluded.name, url=excluded.url, enabled=excluded.enabled, "
-            "interval_minutes=excluded.interval_minutes, updated_ts=excluded.updated_ts",
-            (str(source_id).strip(), str(name).strip(), str(url).strip(), int(enabled), int(interval_minutes), ts, ts),
+            "ON CONFLICT(source_id) DO UPDATE SET name=excluded.name, enabled=excluded.enabled, "
+            (str(source_id).strip(), str(name).strip(), int(enabled), ts, ts),
         )
         if categories:
             for cat, cat_url in categories.items():
@@ -435,35 +437,30 @@ class Store:
         await self._ensure_schema()
         sid = str(source_id).strip()
         await self.db.execute("DELETE FROM news_source_categories WHERE source_id = ?", (sid,))
-        await self.db.execute("DELETE FROM news_sources WHERE id = ?", (sid,))
+        await self.db.execute("DELETE FROM news_sources WHERE source_id = ?", (sid,))
 
     async def news_set_source_enabled(self, source_id: str, enabled: int) -> None:
         await self._ensure_schema()
         await self.db.execute(
-            "UPDATE news_sources SET enabled=?, updated_ts=? WHERE id=?",
+            "UPDATE news_sources SET enabled=?, updated_ts=? WHERE source_id=?",
             (int(enabled), _now(), str(source_id).strip()),
         )
 
     async def news_set_source_interval(self, source_id: str, interval_minutes: int) -> None:
         await self._ensure_schema()
-        await self.db.execute(
-            "UPDATE news_sources SET interval_minutes=?, updated_ts=? WHERE id=?",
-            (int(interval_minutes), _now(), str(source_id).strip()),
-        )
+        key = f"source_interval:{str(source_id).strip()}"
+        await self.news_set_setting(key, str(int(interval_minutes)))
 
     async def news_set_source_name(self, source_id: str, name: str) -> None:
         await self._ensure_schema()
         await self.db.execute(
-            "UPDATE news_sources SET name=?, updated_ts=? WHERE id=?",
+            "UPDATE news_sources SET name=?, updated_ts=? WHERE source_id=?",
             (str(name).strip(), _now(), str(source_id).strip()),
         )
 
     async def news_set_source_url(self, source_id: str, url: str) -> None:
-        await self._ensure_schema()
-        await self.db.execute(
-            "UPDATE news_sources SET url=?, updated_ts=? WHERE id=?",
-            (str(url).strip(), _now(), str(source_id).strip()),
-        )
+        # legacy compatibility: store "source url" as a default category url
+        await self.news_set_category_url(source_id, "default", url)
 
     async def news_set_category_url(self, source_id: str, category: str, url: str) -> None:
         await self._ensure_schema()

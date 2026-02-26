@@ -1,12 +1,21 @@
+"""
+services.chatdb
+
+A small async-friendly SQLite wrapper used by Leonidas/Leobot services.
+"""
+
+from __future__ import annotations
+
 import asyncio
+import dataclasses
+import json
+import os
+import re
 import sqlite3
 import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Iterable
-import re
+from typing import Any, Iterable, List, Optional, Sequence, Tuple, Union
 
-SCHEMA = r'''
+SCHEMA = r"""
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 
@@ -170,141 +179,155 @@ CREATE TABLE IF NOT EXISTS news_last_posted (
   PRIMARY KEY (target, source_id, category, limit_n),
   FOREIGN KEY (source_id) REFERENCES news_sources(id) ON DELETE CASCADE
 );
-'''
+"""
 
-@dataclass
-class DBConfig:
-    path: str
+def _now() -> int:
+    return int(time.time())
 
-class ChatDB:
-    def __init__(self, cfg: DBConfig):
-        self.path = Path(cfg.path)
-        self._conn: sqlite3.Connection | None = None
-        self._lock = asyncio.Lock()
-
-    def _connect(self) -> sqlite3.Connection:
-        if self._conn is None:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(
-                str(self.path),
-                timeout=30,
-                isolation_level=None,
-                check_same_thread=False,
-            )
-            self._conn.executescript(SCHEMA)
-        return self._conn
-
-    async def execute(self, sql: str, args: Iterable[Any] = ()) -> None:
-        async with self._lock:
-            self._connect().execute(sql, tuple(args))
-
-    async def executemany(self, sql: str, rows: list[tuple[Any, ...]]) -> None:
-        if not rows:
-            return
-        async with self._lock:
-            self._connect().executemany(sql, rows)
-
-    async def fetchone(self, sql: str, args: Iterable[Any] = ()) -> tuple[Any, ...] | None:
-        async with self._lock:
-            cur = self._connect().execute(sql, tuple(args))
-            return cur.fetchone()
-
-    async def fetchall(self, sql: str, args: Iterable[Any] = ()) -> list[tuple[Any, ...]]:
-        async with self._lock:
-            cur = self._connect().execute(sql, tuple(args))
-            return cur.fetchall()
-
-    async def close(self) -> None:
-        async with self._lock:
-            if self._conn is not None:
-                self._conn.close()
-                self._conn = None
-
-    # Control-plane API (used by bot.py)
-    @staticmethod
-    def _utc_now() -> str:
-        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-    async def ensure_channel(self, channel: str) -> None:
-        ch = (channel or "").strip()
-        if not ch:
-            return
-        await self.execute(
-            "INSERT OR IGNORE INTO channels(channel, created_utc) VALUES(?, ?)",
-            (ch, self._utc_now()),
-        )
-
-    async def ensure_service(self, service: str, description: str = "", enabled_by_default: int = 0) -> None:
-        s = (service or "").strip().lower()
-        if not s:
-            return
-        await self.execute(
-            "INSERT OR IGNORE INTO services(service, description, enabled_by_default, created_utc) VALUES(?, ?, ?, ?)",
-            (s, (description or "").strip(), int(bool(enabled_by_default)), self._utc_now()),
-        )
-
-    async def set_service_channel_enabled(self, service: str, channel: str, enabled: bool, updated_by: str = "") -> None:
-        s = (service or "").strip().lower()
-        ch = (channel or "").strip()
-        if not s or not ch:
-            return
-        await self.ensure_service(s)
-        await self.ensure_channel(ch)
-        await self.execute(
-            "INSERT INTO service_channel(service, channel, enabled, updated_utc, updated_by) "
-            "VALUES(?, ?, ?, ?, ?) "
-            "ON CONFLICT(service, channel) DO UPDATE SET "
-            "enabled=excluded.enabled, updated_utc=excluded.updated_utc, updated_by=excluded.updated_by",
-            (s, ch, 1 if enabled else 0, self._utc_now(), (updated_by or "")[:128]),
-        )
-
-    async def is_service_enabled(self, service: str, channel: str) -> bool:
-        s = (service or "").strip().lower()
-        ch = (channel or "").strip()
-        if not s or not ch:
-            return True
-        row = await self.fetchone("SELECT enabled FROM service_channel WHERE service=? AND channel=?", (s, ch))
-        if row is None:
-            return False
-        return bool(row[0])
-
-    async def is_service_enabled_any(self, service: str) -> bool:
-        s = (service or "").strip().lower()
-        if not s:
-            return True
-        row = await self.fetchone("SELECT 1 FROM service_channel WHERE service=? AND enabled=1 LIMIT 1", (s,))
-        return row is not None
-
-    async def list_service_status_for_channel(self, channel: str) -> list[tuple[str, bool]]:
-        ch = (channel or "").strip()
-        if not ch:
-            return []
-        rows = await self.fetchall(
-            "SELECT s.service, COALESCE(sc.enabled, 0) "
-            "FROM services s "
-            "LEFT JOIN service_channel sc ON sc.service=s.service AND sc.channel=? "
-            "ORDER BY s.service",
-            (ch,),
-        )
-        return [(r[0], bool(r[1])) for r in rows]
-
-# Compatibility helpers (used by services.stats and others)
-_LINK_RE = re.compile(r"(https?://|www\\.)\\S+", re.IGNORECASE)
-
-def utc_day(ts: int | None = None) -> str:
+def utc_day(ts: Optional[int] = None) -> int:
+    import datetime
     if ts is None:
-        ts = int(time.time())
-    try:
-        return time.strftime("%Y-%m-%d", time.gmtime(int(ts)))
-    except Exception:
-        return "1970-01-01"
+        ts = _now()
+    dt = datetime.datetime.utcfromtimestamp(int(ts))
+    return dt.year * 10000 + dt.month * 100 + dt.day
 
-def word_count(text: str) -> int:
+_WORD_RE = re.compile(r"[A-Za-z0-9']+")
+_URL_RE = re.compile(r"(https?://|www\.)", re.I)
+
+def word_count(text: Optional[str]) -> int:
     if not text:
         return 0
-    return len([w for w in re.split(r"\\s+", text.strip()) if w])
+    return len(_WORD_RE.findall(text))
 
-def has_link(text: str) -> bool:
+def has_link(text: Optional[str]) -> int:
     if not text:
-        return False
-    return bool(_LINK_RE.search(text))
+        return 0
+    return 1 if _URL_RE.search(text) else 0
+
+
+@dataclasses.dataclass(frozen=True)
+class DBConfig:
+    path: str
+    timeout: float = 30.0
+    pragmas: Tuple[Tuple[str, Union[str, int]], ...] = (
+        ("journal_mode", "WAL"),
+        ("synchronous", "NORMAL"),
+        ("temp_store", "MEMORY"),
+        ("foreign_keys", 1),
+    )
+
+    @staticmethod
+    def from_any(*, path: Optional[str] = None, db_path: Optional[str] = None, db_file: Optional[str] = None, db: Optional[str] = None) -> "DBConfig":
+        p = path or db_path or db_file or db
+        if not p:
+            raise TypeError("DBConfig requires path/db_path/db_file")
+        return DBConfig(path=str(p))
+
+
+class ChatDB:
+    def __init__(self, config: Union[DBConfig, str, os.PathLike[str]]):
+        if isinstance(config, DBConfig):
+            self.cfg = config
+        else:
+            self.cfg = DBConfig.from_any(path=str(config))
+        self._schema_ready = False
+        self._schema_lock = asyncio.Lock()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.cfg.path, timeout=self.cfg.timeout)
+        conn.row_factory = sqlite3.Row
+        for k, v in self.cfg.pragmas:
+            if isinstance(v, str):
+                conn.execute(f"PRAGMA {k}={json.dumps(v)}")
+            else:
+                conn.execute(f"PRAGMA {k}={int(v)}")
+        return conn
+
+    def _ensure_schema_sync(self) -> None:
+        conn = self._connect()
+        try:
+            conn.executescript(SCHEMA)
+            conn.commit()
+        finally:
+            conn.close()
+
+    async def ensure_schema(self) -> None:
+        if self._schema_ready:
+            return
+        async with self._schema_lock:
+            if self._schema_ready:
+                return
+            await asyncio.to_thread(self._ensure_schema_sync)
+            self._schema_ready = True
+
+    async def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
+        """Execute a statement and return affected rowcount (best-effort)."""
+        await self.ensure_schema()
+
+        def _do() -> int:
+            conn = self._connect()
+            try:
+                cur = conn.execute(sql, params)
+                conn.commit()
+                # sqlite3 rowcount is sometimes -1; treat that as 0
+                return int(cur.rowcount) if cur.rowcount is not None and cur.rowcount >= 0 else 0
+            finally:
+                conn.close()
+
+        return await asyncio.to_thread(_do)
+
+    async def executemany(self, sql: str, seq_params: Iterable[Sequence[Any]]) -> int:
+        """Execute many statements and return total affected rows (best-effort)."""
+        await self.ensure_schema()
+        seq_params = list(seq_params)
+
+        def _do() -> int:
+            conn = self._connect()
+            try:
+                cur = conn.executemany(sql, seq_params)
+                conn.commit()
+                return int(cur.rowcount) if cur.rowcount is not None and cur.rowcount >= 0 else 0
+            finally:
+                conn.close()
+
+        return await asyncio.to_thread(_do)
+
+    async def fetchone(self, sql: str, params: Sequence[Any] = ()) -> Optional[sqlite3.Row]:
+        await self.ensure_schema()
+        def _do():
+            conn = self._connect()
+            try:
+                return conn.execute(sql, params).fetchone()
+            finally:
+                conn.close()
+        return await asyncio.to_thread(_do)
+
+    async def fetchall(self, sql: str, params: Sequence[Any] = ()) -> List[sqlite3.Row]:
+        await self.ensure_schema()
+        def _do():
+            conn = self._connect()
+            try:
+                return conn.execute(sql, params).fetchall()
+            finally:
+                conn.close()
+        return await asyncio.to_thread(_do)
+
+    async def ensure_channel(self, channel: str) -> None:
+        await self.ensure_schema()
+        channel = (channel or "").strip()
+        if not channel:
+            return
+        row = await self.fetchone("SELECT name FROM sqlite_master WHERE type='table' AND name='channels'")
+        if not row:
+            return
+        await self.execute("INSERT OR IGNORE INTO channels(channel, created_ts) VALUES (?, ?)", (channel, _now()))
+
+    async def ensure_service(self, service_name: str) -> None:
+        await self.ensure_schema()
+        service_name = (service_name or "").strip()
+        if not service_name:
+            return
+        row = await self.fetchone("SELECT name FROM sqlite_master WHERE type='table' AND name='services'")
+        if not row:
+            return
+        await self.execute("INSERT OR IGNORE INTO services(name, created_ts) VALUES (?, ?)", (service_name, _now()))
