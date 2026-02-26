@@ -26,7 +26,7 @@ class Store:
         if isinstance(db, ChatDB):
             self.db: ChatDB = db
         else:
-            cfg = db_config or DBConfig(path=str(db))
+            cfg = db_config or DBConfig(db_path=str(db))
             self.db = ChatDB(cfg)
 
         self._schema_checked = False
@@ -390,13 +390,12 @@ class Store:
         except Exception:
             return float(default)
 
-    async def news_list_sources(self) -> List[Dict[str, Any]]:
+    async def news_list_sources(self, include_disabled: bool = True) -> List[Dict[str, Any]]:
         await self._ensure_schema()
         # sources + categories
-        src_rows = await self.db.fetchall(
-            "SELECT id, COALESCE(name, id) AS name, url, enabled, interval_minutes, created_ts, updated_ts "
-            "FROM news_sources ORDER BY enabled DESC, id ASC"
-        )
+        sql = ("SELECT id, COALESCE(name, id) AS name, url, enabled, interval_minutes, created_ts, updated_ts "
+               "FROM news_sources" + ("" if include_disabled else " WHERE enabled=1") + " ORDER BY enabled DESC, id ASC")
+        src_rows = await self.db.fetchall(sql)
         cat_rows = await self.db.fetchall(
             "SELECT source_id, category, url FROM news_source_categories ORDER BY source_id ASC, category ASC"
         )
