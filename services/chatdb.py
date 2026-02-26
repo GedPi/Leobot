@@ -324,22 +324,168 @@ class ChatDB:
                 conn.close()
         return await asyncio.to_thread(_do)
 
+    async def _table_cols(self, table: str) -> set[str]:
+        rows = await self.fetchall(f"PRAGMA table_info({table})")
+        # rows are sqlite3.Row; "name" column holds the column name
+        return {str(r["name"]) for r in rows}
+
     async def ensure_channel(self, channel: str) -> None:
         await self.ensure_schema()
         channel = (channel or "").strip()
         if not channel:
             return
-        row = await self.fetchone("SELECT name FROM sqlite_master WHERE type='table' AND name='channels'")
-        if not row:
+
+        cols = await self._table_cols("channels")
+        if "channel" not in cols:
             return
-        await self.execute("INSERT OR IGNORE INTO channels(channel, created_ts) VALUES (?, ?)", (channel, _now()))
+
+        if "created_ts" in cols:
+            await self.execute(
+                "INSERT OR IGNORE INTO channels(channel, created_ts) VALUES (?, ?)",
+                (channel, _now()),
+            )
+        elif "created_utc" in cols:
+            # fallback to older schema
+            await self.execute(
+                "INSERT OR IGNORE INTO channels(channel, created_utc) VALUES (?, datetime('now'))",
+                (channel,),
+            )
+        else:
+            await self.execute(
+                "INSERT OR IGNORE INTO channels(channel) VALUES (?)",
+                (channel,),
+            )
 
     async def ensure_service(self, service_name: str) -> None:
         await self.ensure_schema()
-        service_name = (service_name or "").strip()
+        service_name = (service_name or "").strip().lower()
         if not service_name:
             return
-        row = await self.fetchone("SELECT name FROM sqlite_master WHERE type='table' AND name='services'")
-        if not row:
+
+        cols = await self._table_cols("services")
+
+        # support both old and new column names
+        name_col = "name" if "name" in cols else ("service" if "service" in cols else None)
+        if not name_col:
             return
-        await self.execute("INSERT OR IGNORE INTO services(name, created_ts) VALUES (?, ?)", (service_name, _now()))
+
+        if "created_ts" in cols:
+            await self.execute(
+                f"INSERT OR IGNORE INTO services({name_col}, created_ts) VALUES (?, ?)",
+                (service_name, _now()),
+            )
+        elif "created_utc" in cols:
+            await self.execute(
+                f"INSERT OR IGNORE INTO services({name_col}, created_utc) VALUES (?, datetime('now'))",
+                (service_name,),
+            )
+        else:
+            await self.execute(
+                f"INSERT OR IGNORE INTO services({name_col}) VALUES (?)",
+                (service_name,),
+            )
+
+    async def set_service_channel_enabled(self, service: str, channel: str, enabled: bool, updated_by: str = "") -> None:
+        await self.ensure_schema()
+        service = (service or "").strip().lower()
+        channel = (channel or "").strip()
+        if not service or not channel:
+            return
+
+        await self.ensure_service(service)
+        await self.ensure_channel(channel)
+
+        cols = await self._table_cols("service_channel")
+
+        # required columns: service, channel, enabled
+        if not {"service", "channel", "enabled"}.issubset(cols):
+            return
+
+        # update time column may be updated_utc or updated_ts
+        if "updated_ts" in cols:
+            await self.execute(
+                """
+                INSERT INTO service_channel(service, channel, enabled, updated_ts, updated_by)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(service, channel) DO UPDATE SET
+                    enabled=excluded.enabled,
+                    updated_ts=excluded.updated_ts,
+                    updated_by=excluded.updated_by
+                """,
+                (service, channel, 1 if enabled else 0, _now(), updated_by or ""),
+            )
+        else:
+            # default older schema with updated_utc TEXT
+            await self.execute(
+                """
+                INSERT INTO service_channel(service, channel, enabled, updated_utc, updated_by)
+                VALUES (?, ?, ?, datetime('now'), ?)
+                ON CONFLICT(service, channel) DO UPDATE SET
+                    enabled=excluded.enabled,
+                    updated_utc=datetime('now'),
+                    updated_by=excluded.updated_by
+                """,
+                (service, channel, 1 if enabled else 0, updated_by or ""),
+            )
+
+    async def is_service_enabled(self, service: str, channel: str) -> bool:
+        await self.ensure_schema()
+        service = (service or "").strip().lower()
+        channel = (channel or "").strip()
+        if not service or not channel:
+            return False
+
+        row = await self.fetchone(
+            "SELECT enabled FROM service_channel WHERE service=? AND channel=?",
+            (service, channel),
+        )
+        if row is None:
+            # fallback: enabled_by_default if present
+            cols = await self._table_cols("services")
+            name_col = "name" if "name" in cols else ("service" if "service" in cols else None)
+            if not name_col or "enabled_by_default" not in cols:
+                return False
+            r2 = await self.fetchone(f"SELECT enabled_by_default FROM services WHERE {name_col}=?", (service,))
+            return bool(r2 and int(r2["enabled_by_default"]) == 1)
+        return bool(int(row["enabled"]) == 1)
+
+    async def is_service_enabled_any(self, service: str) -> bool:
+        await self.ensure_schema()
+        service = (service or "").strip().lower()
+        if not service:
+            return False
+        row = await self.fetchone("SELECT 1 FROM service_channel WHERE service=? AND enabled=1 LIMIT 1", (service,))
+        if row:
+            return True
+        # fallback: enabled_by_default
+        cols = await self._table_cols("services")
+        name_col = "name" if "name" in cols else ("service" if "service" in cols else None)
+        if not name_col or "enabled_by_default" not in cols:
+            return False
+        r2 = await self.fetchone(f"SELECT enabled_by_default FROM services WHERE {name_col}=?", (service,))
+        return bool(r2 and int(r2["enabled_by_default"]) == 1)
+
+    async def list_service_status_for_channel(self, channel: str) -> list[tuple[str, bool]]:
+        await self.ensure_schema()
+        channel = (channel or "").strip()
+        if not channel:
+            return []
+
+        # list all known services, left-join enablement
+        cols = await self._table_cols("services")
+        name_col = "name" if "name" in cols else ("service" if "service" in cols else None)
+        if not name_col:
+            return []
+
+        rows = await self.fetchall(
+            f"""
+            SELECT s.{name_col} AS service,
+                   COALESCE(sc.enabled, s.enabled_by_default, 0) AS enabled
+            FROM services s
+            LEFT JOIN service_channel sc
+              ON sc.service = s.{name_col} AND sc.channel = ?
+            ORDER BY s.{name_col} ASC
+            """,
+            (channel,),
+        )
+        return [(str(r["service"]), bool(int(r["enabled"]))) for r in rows]
