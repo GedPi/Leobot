@@ -36,12 +36,21 @@ class Store:
         if self._schema_checked:
             return
 
-        # NEWS: ensure optional 'name' column exists (older schema lacked it).
+        # NEWS: historical schema drift.
+        # Oldest: (source_id, enabled, created_ts, updated_ts)
+        # Older:  + (name)
+        # Current: + (url, interval_minutes)
         try:
             cols = await self.db.fetchall("PRAGMA table_info(news_sources)")
             colnames = {c["name"] if isinstance(c, dict) else c[1] for c in cols}
             if "name" not in colnames:
                 await self.db.execute("ALTER TABLE news_sources ADD COLUMN name TEXT")
+            if "url" not in colnames:
+                await self.db.execute("ALTER TABLE news_sources ADD COLUMN url TEXT")
+            if "interval_minutes" not in colnames:
+                await self.db.execute(
+                    "ALTER TABLE news_sources ADD COLUMN interval_minutes INTEGER NOT NULL DEFAULT 60"
+                )
         except Exception:
             # If the table doesn't exist yet, ChatDB schema will create it.
             pass
@@ -300,7 +309,12 @@ class Store:
         await self.db.execute(
             "INSERT INTO weather_watches(city, duration_hours, types_json, interval_minutes, created_ts, expires_ts) "
             "VALUES(?,?,?,?,?,?) "
-            "ON CONFLICT(city) DO UPDATE SET duration_hours=excluded.duration_hours, types_json=excluded.types_json, "
+            "ON CONFLICT(city) DO UPDATE SET "
+            "duration_hours=excluded.duration_hours, "
+            "types_json=excluded.types_json, "
+            "interval_minutes=excluded.interval_minutes, "
+            "created_ts=excluded.created_ts, "
+            "expires_ts=excluded.expires_ts",
             (
                 str(city).strip(),
                 int(duration_hours),
@@ -389,11 +403,18 @@ class Store:
         except Exception:
             return float(default)
 
-    async def news_list_sources(self, include_disabled: bool = True) -> List[Dict[str, Any]]:
+    async def news_list_sources(self, *, include_disabled: bool = True) -> List[Dict[str, Any]]:
         await self._ensure_schema()
         # sources + categories
-        sql = ("SELECT source_id, COALESCE(name, source_id) AS name, enabled, created_ts, updated_ts "
-               "FROM news_sources" + ("" if include_disabled else " WHERE enabled=1") + " ORDER BY enabled DESC, source_id ASC")
+        sql = (
+            "SELECT source_id, COALESCE(name, source_id) AS name, "
+            "COALESCE(url,'') AS url, "
+            "COALESCE(interval_minutes, 60) AS interval_minutes, "
+            "enabled, created_ts, updated_ts "
+            "FROM news_sources"
+            + ("" if include_disabled else " WHERE enabled=1")
+            + " ORDER BY enabled DESC, source_id ASC"
+        )
         src_rows = await self.db.fetchall(sql)
         cat_rows = await self.db.fetchall(
             "SELECT source_id, category, url FROM news_source_categories ORDER BY source_id ASC, category ASC"
@@ -401,14 +422,16 @@ class Store:
         cats: Dict[str, Dict[str, str]] = {}
         for r in cat_rows:
             cats.setdefault(r["source_id"], {})[r["category"]] = r["url"]
-        out = []
+        out: List[Dict[str, Any]] = []
         for r in src_rows:
             d = dict(r)
             d["id"] = d.get("id") or d.get("source_id")
             d["categories"] = cats.get(d.get("source_id") or d.get("id"), {})
-            d["url"] = d["categories"].get("default", "")
-            d["interval_minutes"] = await self.news_get_int(f"source_interval:{d.get('source_id')}", 60)
-            d["interval_minutes"] = await self.news_get_int(f"source_interval:{d.get('source_id')}", 60)
+            # Backwards compat: if categories has a default URL, prefer it.
+            if d["categories"].get("default"):
+                d["url"] = d["categories"].get("default", "")
+            d["url"] = (d.get("url") or "").strip()
+            d["interval_minutes"] = int(d.get("interval_minutes") or 60)
             out.append(d)
         return out
 
@@ -424,10 +447,20 @@ class Store:
         await self._ensure_schema()
         ts = _now()
         await self.db.execute(
-            "INSERT INTO news_sources(source_id, name, enabled, created_ts, updated_ts) "
+            "INSERT INTO news_sources(source_id, name, url, interval_minutes, enabled, created_ts, updated_ts) "
             "VALUES(?,?,?,?,?,?,?) "
-            "ON CONFLICT(source_id) DO UPDATE SET name=excluded.name, enabled=excluded.enabled, "
-            (str(source_id).strip(), str(name).strip(), int(enabled), ts, ts),
+            "ON CONFLICT(source_id) DO UPDATE SET "
+            "name=excluded.name, url=excluded.url, interval_minutes=excluded.interval_minutes, "
+            "enabled=excluded.enabled, updated_ts=excluded.updated_ts",
+            (
+                str(source_id).strip(),
+                str(name).strip(),
+                str(url).strip(),
+                int(interval_minutes),
+                int(enabled),
+                ts,
+                ts,
+            ),
         )
         if categories:
             for cat, cat_url in categories.items():
@@ -448,8 +481,10 @@ class Store:
 
     async def news_set_source_interval(self, source_id: str, interval_minutes: int) -> None:
         await self._ensure_schema()
-        key = f"source_interval:{str(source_id).strip()}"
-        await self.news_set_setting(key, str(int(interval_minutes)))
+        await self.db.execute(
+            "UPDATE news_sources SET interval_minutes=?, updated_ts=? WHERE source_id=?",
+            (int(interval_minutes), _now(), str(source_id).strip()),
+        )
 
     async def news_set_source_name(self, source_id: str, name: str) -> None:
         await self._ensure_schema()
@@ -459,7 +494,12 @@ class Store:
         )
 
     async def news_set_source_url(self, source_id: str, url: str) -> None:
-        # legacy compatibility: store "source url" as a default category url
+        # Keep both the modern column and the legacy per-category store in sync.
+        await self._ensure_schema()
+        await self.db.execute(
+            "UPDATE news_sources SET url=?, updated_ts=? WHERE source_id=?",
+            (str(url).strip(), _now(), str(source_id).strip()),
+        )
         await self.news_set_category_url(source_id, "default", url)
 
     async def news_set_category_url(self, source_id: str, category: str, url: str) -> None:
