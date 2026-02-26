@@ -403,7 +403,7 @@ class IRCBot:
         self.db = ChatDB(DBConfig(str(db_path)))
 
         # Standard storage facade (services should prefer this over ad-hoc DB access)
-        self.store = Store(str(db_path))
+        self.store = Store(self.db)
 
         # Built-in router commands
         self.router.register(

@@ -26,7 +26,7 @@ class Store:
         if isinstance(db, ChatDB):
             self.db: ChatDB = db
         else:
-            cfg = db_config or DBConfig(db_path=str(db))
+            cfg = db_config or DBConfig(path=str(db))
             self.db = ChatDB(cfg)
 
         self._schema_checked = False
