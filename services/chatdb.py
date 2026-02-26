@@ -18,6 +18,36 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+import datetime
+import re
+
+_LINK_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+def utc_day(ts: int | None = None) -> str:
+    """
+    Return UTC day string 'YYYY-MM-DD' for an epoch seconds timestamp.
+    If ts is None, uses current time.
+    """
+    if ts is None:
+        ts = int(time.time())
+    return datetime.datetime.fromtimestamp(int(ts), tz=datetime.timezone.utc).strftime("%Y-%m-%d")
+
+def word_count(text: str | None) -> int:
+    """
+    Basic word count used by stats. Treats consecutive whitespace as one separator.
+    """
+    if not text:
+        return 0
+    return len([w for w in str(text).strip().split() if w])
+
+def has_link(text: str | None) -> int:
+    """
+    Return 1 if text contains an http(s) URL, else 0.
+    (Existing code expects int-ish.)
+    """
+    if not text:
+        return 0
+    return 1 if _LINK_RE.search(str(text)) else 0
 
 SCHEMA = r"""
 PRAGMA journal_mode=WAL;
