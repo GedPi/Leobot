@@ -3,18 +3,10 @@ services.chatdb
 
 Async-friendly SQLite wrapper + schema for Leobot.
 
-Design goals:
-- Single persistent connection (WAL) with serialized access.
-- Foreign keys ALWAYS ON (per connection).
-- Schema includes control-plane (services/channels toggles) + service data tables.
-- Control-plane API used by bot.py:
-    - ensure_schema()
-    - ensure_channel()
-    - ensure_service()
-    - set_service_channel_enabled()
-    - is_service_enabled()
-    - is_service_enabled_any()
-    - list_service_status_for_channel()
+Compatibility requirements with existing code:
+- DBConfig.from_any(...) exists (Store calls it)
+- ChatDB.execute(...) returns an integer rowcount-ish (Store expects rc/int(rc or 0))
+- foreign_keys is enabled on every connection (FKs are per-connection in SQLite)
 """
 
 from __future__ import annotations
@@ -26,9 +18,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-# -----------------------------
-# Schema
-# -----------------------------
 
 SCHEMA = r"""
 PRAGMA journal_mode=WAL;
@@ -62,7 +51,7 @@ CREATE TABLE IF NOT EXISTS service_channel (
   FOREIGN KEY (channel) REFERENCES channels(channel) ON DELETE CASCADE
 );
 
--- Chat/history (used by lastseen/stats)
+-- Lightweight message store (used by lastseen/stats)
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts INTEGER NOT NULL,
@@ -99,7 +88,7 @@ CREATE TABLE IF NOT EXISTS stats_daily (
   PRIMARY KEY(day, channel, nick)
 );
 
--- Full channel logging (human-readable stream)
+-- Full channel log stream
 CREATE TABLE IF NOT EXISTS channel_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts INTEGER NOT NULL,               -- epoch seconds
@@ -111,7 +100,7 @@ CREATE TABLE IF NOT EXISTS channel_log (
 CREATE INDEX IF NOT EXISTS idx_channel_log_chan_ts ON channel_log(channel, ts);
 CREATE INDEX IF NOT EXISTS idx_channel_log_nick_ts ON channel_log(nick, ts);
 
--- greet/wiki/weather/acl/news/sysmon tables (kept for compatibility)
+-- Compatibility tables referenced by existing services
 CREATE TABLE IF NOT EXISTS greet_rules (
   id TEXT PRIMARY KEY,
   priority INTEGER NOT NULL DEFAULT 0,
@@ -120,7 +109,6 @@ CREATE TABLE IF NOT EXISTS greet_rules (
   greetings_json TEXT NOT NULL,
   updated_ts INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_greet_rules_enabled_pri ON greet_rules(enabled, priority);
 
 CREATE TABLE IF NOT EXISTS wiki_watch (
   title TEXT PRIMARY KEY,
@@ -142,7 +130,6 @@ CREATE TABLE IF NOT EXISTS weather_watches (
   created_ts INTEGER NOT NULL,
   expires_ts INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_weather_watches_expires ON weather_watches(expires_ts);
 
 CREATE TABLE IF NOT EXISTS weather_settings (
   k TEXT PRIMARY KEY,
@@ -156,7 +143,6 @@ CREATE TABLE IF NOT EXISTS acl_auth (
   authed_until_ts INTEGER NOT NULL,
   authed_ts INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_acl_auth_until ON acl_auth(authed_until_ts);
 
 CREATE TABLE IF NOT EXISTS sys_health_snapshots (
   ts INTEGER PRIMARY KEY,
@@ -168,7 +154,6 @@ CREATE TABLE IF NOT EXISTS sys_events (
   ts INTEGER NOT NULL,
   message TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_sys_events_ts ON sys_events(ts);
 
 CREATE TABLE IF NOT EXISTS sys_state (
   k TEXT PRIMARY KEY,
@@ -184,7 +169,8 @@ CREATE TABLE IF NOT EXISTS news_settings (
 
 CREATE TABLE IF NOT EXISTS news_sources (
   id TEXT PRIMARY KEY,
-  url TEXT NOT NULL,
+  url TEXT,
+  name TEXT,
   enabled INTEGER NOT NULL DEFAULT 1,
   interval_minutes INTEGER NOT NULL DEFAULT 60,
   created_ts INTEGER NOT NULL,
@@ -220,8 +206,30 @@ class DBConfig:
     db_path: str
     timeout: float = 30.0
 
+    @classmethod
+    def from_any(cls, db_path: str | None = None, **kwargs) -> "DBConfig":
+        """
+        Compatibility shim for older code that calls DBConfig.from_any(...).
+
+        Accepts:
+          - db_path as str
+          - timeout optionally via kwargs
+        """
+        if not db_path:
+            db_path = "/var/lib/leobot/db/leobot.db"
+        timeout = float(kwargs.get("timeout", 30.0))
+        return cls(db_path=str(db_path), timeout=timeout)
+
 
 class ChatDB:
+    """
+    Single-connection SQLite wrapper with an asyncio lock.
+
+    IMPORTANT:
+      - SQLite foreign keys are enabled per-connection.
+      - Store expects execute() to return a rowcount-ish integer.
+    """
+
     def __init__(self, cfg: DBConfig):
         self.cfg = cfg
         self._path = Path(cfg.db_path)
@@ -239,7 +247,6 @@ class ChatDB:
                 check_same_thread=False,
             )
             conn.row_factory = sqlite3.Row
-            # Foreign keys are per-connection. This must be set every time.
             conn.execute("PRAGMA foreign_keys=ON;")
             self._conn = conn
         return self._conn
@@ -250,29 +257,40 @@ class ChatDB:
                 return
             conn = self._connect()
             conn.executescript(SCHEMA)
-            # Make sure the connection still has FK ON after schema script.
             conn.execute("PRAGMA foreign_keys=ON;")
             self._schema_ready = True
 
-    # -------------
-    # Low-level IO
-    # -------------
+    # ----------------
+    # low-level helpers
+    # ----------------
 
-    async def execute(self, sql: str, params: Iterable[Any] = ()) -> None:
+    async def execute(self, sql: str, params: Iterable[Any] = ()) -> int:
+        """
+        Execute a statement and return 'changes' count for compatibility.
+        """
         await self.ensure_schema()
         async with self._lock:
             conn = self._connect()
             conn.execute("PRAGMA foreign_keys=ON;")
+            before = conn.total_changes
             conn.execute(sql, tuple(params))
+            after = conn.total_changes
+            return int(after - before)
 
-    async def executemany(self, sql: str, rows: list[tuple[Any, ...]]) -> None:
+    async def executemany(self, sql: str, rows: list[tuple[Any, ...]]) -> int:
+        """
+        Execute many statements and return 'changes' count for compatibility.
+        """
         if not rows:
-            return
+            return 0
         await self.ensure_schema()
         async with self._lock:
             conn = self._connect()
             conn.execute("PRAGMA foreign_keys=ON;")
+            before = conn.total_changes
             conn.executemany(sql, rows)
+            after = conn.total_changes
+            return int(after - before)
 
     async def fetchone(self, sql: str, params: Iterable[Any] = ()) -> Optional[sqlite3.Row]:
         await self.ensure_schema()
@@ -300,7 +318,7 @@ class ChatDB:
                     self._schema_ready = False
 
     # -----------------------------
-    # Control-plane helpers
+    # Control-plane API (bot.py uses these)
     # -----------------------------
 
     async def ensure_channel(self, channel: str) -> None:
@@ -308,7 +326,6 @@ class ChatDB:
         channel = (channel or "").strip()
         if not channel:
             return
-        # created_utc is NOT NULL in your DB, so always satisfy it.
         await self.execute(
             "INSERT OR IGNORE INTO channels(channel, created_utc, created_ts) VALUES (?, datetime('now'), ?)",
             (channel, _now()),
@@ -319,7 +336,6 @@ class ChatDB:
         service = (service or "").strip().lower()
         if not service:
             return
-        # created_utc is NOT NULL in your DB, so always satisfy it.
         await self.execute(
             "INSERT OR IGNORE INTO services(service, created_utc, created_ts) VALUES (?, datetime('now'), ?)",
             (service, _now()),
@@ -332,7 +348,7 @@ class ChatDB:
         if not service or not channel:
             return
 
-        # Hard guarantee FK targets exist (this is what prevents your FK failures).
+        # Guarantee FK targets exist (prevents FK constraint failures)
         await self.ensure_service(service)
         await self.ensure_channel(channel)
 
@@ -362,7 +378,7 @@ class ChatDB:
         if row is not None:
             return bool(int(row["enabled"]) == 1)
 
-        # fallback to enabled_by_default
+        # fallback: enabled_by_default
         row2 = await self.fetchone(
             "SELECT enabled_by_default FROM services WHERE service=?",
             (service,),
