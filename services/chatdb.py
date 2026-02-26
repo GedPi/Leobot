@@ -80,6 +80,18 @@ CREATE TABLE IF NOT EXISTS stats_daily (
   PRIMARY KEY(day, channel, nick)
 );
 
+-- Full channel logging (human-readable stream)
+CREATE TABLE IF NOT EXISTS channel_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,          -- epoch seconds
+  channel TEXT NOT NULL,
+  mode TEXT NOT NULL DEFAULT '', -- ~ & @ % + (or '')
+  nick TEXT NOT NULL,
+  message TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_channel_log_chan_ts ON channel_log(channel, ts);
+CREATE INDEX IF NOT EXISTS idx_channel_log_nick_ts ON channel_log(nick, ts);
+
 -- greet/wiki/weather/acl
 CREATE TABLE IF NOT EXISTS greet_rules (
   id TEXT PRIMARY KEY,

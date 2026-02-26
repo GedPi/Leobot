@@ -779,6 +779,65 @@ class IRCBot:
             await self.dispatch("on_kick", ev)
             return
 
+        # ---- ADDED: TOPIC ----
+        if cmd == "TOPIC" and len(params) >= 2:
+            channel = params[0]
+            topic = params[1]
+            ev = Event(
+                nick=nick,
+                user=user,
+                host=host,
+                target=channel,
+                channel=channel,
+                text=topic,
+                is_private=False,
+                raw=line,
+                cmd=cmd,
+                params=params,
+            )
+            await self.dispatch("on_topic", ev)
+            return
+
+        # ---- ADDED: MODE (channel only) ----
+        if cmd == "MODE" and params:
+            target = params[0]
+            if target.startswith("#"):
+                channel = target
+                ev = Event(
+                    nick=nick,
+                    user=user,
+                    host=host,
+                    target=channel,
+                    channel=channel,
+                    text=" ".join(params[1:]) if len(params) > 1 else "",
+                    is_private=False,
+                    raw=line,
+                    cmd=cmd,
+                    params=params,
+                )
+                await self.dispatch("on_mode", ev)
+                return
+
+        # ---- ADDED: 353 (RPL_NAMREPLY) ----
+        if cmd == "353" and len(params) >= 4:
+            # format: <me> <symbol> <#channel> <names...>
+            channel = params[2]
+            names = params[3]
+            ev = Event(
+                nick=nick,
+                user=user,
+                host=host,
+                target=channel,
+                channel=channel,
+                text=names,
+                is_private=False,
+                raw=line,
+                cmd=cmd,
+                params=params,
+            )
+            await self.dispatch("on_names", ev)
+            return
+
     async def dispatch(self, hook: str, ev: Event) -> None:
         # ACL precheck (if installed)
         if getattr(self, "acl", None) is not None and hook == "on_privmsg":
