@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -14,8 +15,27 @@ UA = "LeonidasIRCbot/1.0 (https://hairyoctopus.net; admin: Ged)"
 
 def _http_get_json(url: str, timeout: int = 10) -> dict:
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8", errors="replace"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as e:
+        # Wikipedia APIs often return a JSON error payload even on non-200.
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+
+        try:
+            data = json.loads(body) if body else {}
+        except Exception:
+            data = {}
+
+        data["_http_status"] = getattr(e, "code", None)
+        data["_http_error"] = str(e)
+        return data
+    except Exception as e:
+        return {"_http_status": None, "_http_error": str(e)}
 
 
 async def _get_json(url: str, timeout: int = 10) -> dict:
@@ -156,11 +176,33 @@ class WikiService:
                 return
 
             title = _norm_title(query)
-            try:
-                data = await self._summary(lang, title)
-            except Exception:
-                await bot.privmsg(ev.target, f"{ev.nick}: Wikipedia lookup failed.")
-                return
+            data = await self._summary(lang, title)
+
+            # If the exact title doesn't exist, try OpenSearch and either:
+            # - auto-resolve to the best match, or
+            # - show suggestions.
+            not_found = (
+                data.get("_http_status") == 404
+                or data.get("detail") == "Not found."
+                or data.get("type") == "https://mediawiki.org/wiki/HyperSwitch/errors/not_found"
+            )
+            if not_found:
+                suggestions = await self._opensearch(lang, query, limit=5)
+                if not suggestions:
+                    await bot.privmsg(ev.target, "WIKI: not found.")
+                    return
+
+                # Try the top suggestion for nicer UX (handles typos well).
+                best = suggestions[0]
+                data2 = await self._summary(lang, _norm_title(best))
+                if (
+                    data2.get("_http_status") == 404
+                    or data2.get("detail") == "Not found."
+                    or data2.get("type") == "https://mediawiki.org/wiki/HyperSwitch/errors/not_found"
+                ):
+                    await bot.privmsg(ev.target, f"WIKI: not found. Suggestions: {', '.join(suggestions[:5])}")
+                    return
+                data = data2
 
             page_type = (data.get("type") or "").lower()
             actual_title = data.get("title") or title
@@ -197,17 +239,17 @@ class WikiService:
                 return
 
             title = _norm_title(query)
-            try:
-                data = await self._summary(lang, title)
-            except Exception:
-                await bot.privmsg(ev.target, f"{ev.nick}: Wikipedia check failed.")
-                return
+            data = await self._summary(lang, title)
 
             page_type = (data.get("type") or "").lower()
             actual_title = data.get("title") or title
             url = (((data.get("content_urls") or {}).get("desktop") or {}).get("page")) or ""
 
-            if data.get("detail") == "Not found." or data.get("type") == "https://mediawiki.org/wiki/HyperSwitch/errors/not_found":
+            if (
+                data.get("_http_status") == 404
+                or data.get("detail") == "Not found."
+                or data.get("type") == "https://mediawiki.org/wiki/HyperSwitch/errors/not_found"
+            ):
                 suggestions = await self._opensearch(lang, query, limit=5)
                 s = ", ".join(suggestions[:5]) if suggestions else "no suggestions"
                 await bot.privmsg(ev.target, f"WIKICHECK: not found. Suggestions: {s}")

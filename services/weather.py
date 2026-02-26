@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -23,8 +24,24 @@ WEATHER_CODE = {
 
 def _http_get_json(url: str, timeout: int = 10) -> dict:
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8", errors="replace"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        try:
+            data = json.loads(body) if body else {}
+        except Exception:
+            data = {}
+        data["_http_status"] = getattr(e, "code", None)
+        data["_http_error"] = str(e)
+        return data
+    except Exception as e:
+        return {"_http_status": None, "_http_error": str(e)}
 
 
 async def _get_json(url: str, timeout: int = 10) -> dict:
@@ -87,7 +104,7 @@ class WeatherService:
     async def _init_once(self) -> None:
         if self._init_done:
             return
-        await self.store.weather_import_from_legacy_file(WATCH_PATH)
+        await self.store.weather_import_from_legacy_file(str(WATCH_PATH))
         self._init_done = True
 
     def _cooldown_ok(self, target: str, cmd: str, seconds: int) -> bool:
@@ -118,12 +135,15 @@ class WeatherService:
         cached = self._cache_get(key)
         if cached:
             return cached
+
         q = urllib.parse.quote(name)
         url = f"https://geocoding-api.open-meteo.com/v1/search?name={q}&count=1&language={lang}&format=json"
         data = await _get_json(url, timeout=10)
+
         res = (data.get("results") or [])
         if not res:
             return None
+
         g = res[0]
         out = {
             "name": g.get("name") or name,
@@ -153,6 +173,7 @@ class WeatherService:
         qs = "&".join([f"{k}={urllib.parse.quote(v)}" for k, v in params.items()])
         url = f"https://api.open-meteo.com/v1/forecast?{qs}"
         data = await _get_json(url, timeout=12)
+
         self._cache_set(key, data, ttl)
         return data
 
@@ -182,9 +203,10 @@ class WeatherService:
             await self._handle_warn(bot, ev, parts, cmdline)
             return
 
+        # Normal forecast: !weather <city> [today|tomorrow|3d|5d] (timeframe can be first or last)
         args = cmdline[len("weather"):].strip()
         tokens = args.split()
-        _mode, _days = _parse_timeframe(tokens)
+        _mode, _days = _parse_timeframe(tokens)  # kept for future use
         city_tokens = _strip_timeframe(tokens)
         city = _norm_city(" ".join(city_tokens))
 
@@ -242,7 +264,7 @@ class WeatherService:
 
     async def _handle_warn(self, bot, ev, parts, cmdline):
         # !weather warn types
-        if len(parts) == 3 and parts[2].lower() == "types":
+        if len(parts) >= 3 and parts[2].lower() == "types":
             await bot.privmsg(ev.target, "WEATHER WARN types: rain, snow, wind, any")
             return
 
@@ -252,31 +274,35 @@ class WeatherService:
             if not watches:
                 await bot.privmsg(ev.target, "WEATHER WARN: no watches set.")
                 return
+
             show = []
             for w in watches[:15]:
-                show.append(f"{w.get('city')} ({w.get('duration_hours')}h {','.join(w.get('types',[]))})")
+                city = w.get("city") or "?"
+                dur = w.get("duration_hours")
+                types = w.get("types") or []
+                show.append(f"{city} ({dur}h {','.join(types)})")
+
             await bot.privmsg(
                 ev.target,
                 "WEATHER WARN: " + " | ".join(show) + ("" if len(watches) <= 15 else f" (+{len(watches)-15} more)"),
             )
             return
 
-        # !weather warn del <city>
+        # !weather warn del <city...>
         if len(parts) >= 3 and parts[2].lower() == "del":
-            city = _norm_city(cmdline.split("del", 1)[1])
+            # everything after "del"
+            tail = cmdline.split("del", 1)[1] if "del" in cmdline else ""
+            city = _norm_city(tail)
             if not city:
                 await bot.privmsg(ev.target, f"{ev.nick}: usage: !weather warn del <city>")
                 return
-            ok = await self.store.weather_del_watch(city)
-            if not ok:
-                await bot.privmsg(ev.target, f"WEATHER WARN: {city} was not in watchlist.")
-            else:
-                await bot.privmsg(ev.target, f"WEATHER WARN: removed {city}.")
+            await self.store.weather_remove_watch(city)
+            await bot.privmsg(ev.target, f"WEATHER WARN: removed {city}.")
             return
 
-        # !weather warn <duration> <city...> [type]
+        # Add/update: !weather warn <24h> <city...> [type]
         if len(parts) < 4:
-            await bot.privmsg(ev.target, f"{ev.nick}: usage: !weather warn <24h> <city> [rain|snow|wind|any]")
+            await bot.privmsg(ev.target, f"{ev.nick}: usage: !weather warn <24h> <city> [rain|snow|wind|any] | !weather warn list | !weather warn del <city>")
             return
 
         dur_raw = parts[2].lower()
@@ -301,12 +327,29 @@ class WeatherService:
             await bot.privmsg(ev.target, f"{ev.nick}: city required")
             return
 
-        types = (self.cfg.get("warn_default_types") or ["rain"])
-        if typ:
+        # Types
+        if typ is None:
+            types = (self.cfg.get("warn_default_types") or ["rain"])
+            if not isinstance(types, list) or not types:
+                types = ["rain"]
+        else:
             types = ["rain", "snow", "wind"] if typ == "any" else [typ]
 
+        # Interval
         interval = int(self.cfg.get("warn_check_minutes", 15))
-        await self.store.weather_upsert_watch(city=city, duration_hours=duration_hours, types=types, interval_minutes=interval)
+        created_ts = int(time.time())
+        expires_ts = created_ts + duration_hours * 3600
+
+        # IMPORTANT: use correct Store method names
+        await self.store.weather_add_watch(
+            city=city,
+            duration_hours=duration_hours,
+            types=types,
+            interval_minutes=interval,
+            created_ts=created_ts,
+            expires_ts=expires_ts,
+        )
+
         await bot.privmsg(ev.target, f"WEATHER WARN: watching {city} for {duration_hours}h ({','.join(types)}).")
 
 
