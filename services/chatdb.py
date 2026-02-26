@@ -1,35 +1,54 @@
 """
 services.chatdb
 
-A small async-friendly SQLite wrapper used by Leonidas/Leobot services.
+Async-friendly SQLite wrapper + schema for Leobot.
+
+Design goals:
+- Single persistent connection (WAL) with serialized access.
+- Foreign keys ALWAYS ON (per connection).
+- Schema includes control-plane (services/channels toggles) + service data tables.
+- Control-plane API used by bot.py:
+    - ensure_schema()
+    - ensure_channel()
+    - ensure_service()
+    - set_service_channel_enabled()
+    - is_service_enabled()
+    - is_service_enabled_any()
+    - list_service_status_for_channel()
 """
 
 from __future__ import annotations
 
 import asyncio
-import dataclasses
-import json
-import os
-import re
 import sqlite3
 import time
-from typing import Any, Iterable, List, Optional, Sequence, Tuple, Union
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable, Optional
+
+# -----------------------------
+# Schema
+# -----------------------------
 
 SCHEMA = r"""
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
+PRAGMA temp_store=MEMORY;
+PRAGMA foreign_keys=ON;
 
--- Control-plane (services/channels)
+-- Control-plane
 CREATE TABLE IF NOT EXISTS channels (
   channel TEXT PRIMARY KEY,
-  created_utc TEXT NOT NULL
+  created_utc TEXT NOT NULL,
+  created_ts INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS services (
   service TEXT PRIMARY KEY,
   description TEXT DEFAULT '',
   enabled_by_default INTEGER NOT NULL DEFAULT 0,
-  created_utc TEXT NOT NULL
+  created_utc TEXT NOT NULL,
+  created_ts INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS service_channel (
@@ -43,7 +62,7 @@ CREATE TABLE IF NOT EXISTS service_channel (
   FOREIGN KEY (channel) REFERENCES channels(channel) ON DELETE CASCADE
 );
 
--- Chat/history
+-- Chat/history (used by lastseen/stats)
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts INTEGER NOT NULL,
@@ -65,7 +84,7 @@ CREATE TABLE IF NOT EXISTS seen (
 );
 
 CREATE TABLE IF NOT EXISTS stats_daily (
-  day TEXT NOT NULL,
+  day TEXT NOT NULL,        -- YYYY-MM-DD (UTC)
   channel TEXT NOT NULL,
   nick TEXT NOT NULL,
   msgs INTEGER NOT NULL DEFAULT 0,
@@ -83,16 +102,16 @@ CREATE TABLE IF NOT EXISTS stats_daily (
 -- Full channel logging (human-readable stream)
 CREATE TABLE IF NOT EXISTS channel_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts INTEGER NOT NULL,          -- epoch seconds
+  ts INTEGER NOT NULL,               -- epoch seconds
   channel TEXT NOT NULL,
-  mode TEXT NOT NULL DEFAULT '', -- ~ & @ % + (or '')
+  mode TEXT NOT NULL DEFAULT '',     -- ~ & @ % + (or '')
   nick TEXT NOT NULL,
   message TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_channel_log_chan_ts ON channel_log(channel, ts);
 CREATE INDEX IF NOT EXISTS idx_channel_log_nick_ts ON channel_log(nick, ts);
 
--- greet/wiki/weather/acl
+-- greet/wiki/weather/acl/news/sysmon tables (kept for compatibility)
 CREATE TABLE IF NOT EXISTS greet_rules (
   id TEXT PRIMARY KEY,
   priority INTEGER NOT NULL DEFAULT 0,
@@ -139,7 +158,6 @@ CREATE TABLE IF NOT EXISTS acl_auth (
 );
 CREATE INDEX IF NOT EXISTS idx_acl_auth_until ON acl_auth(authed_until_ts);
 
--- sysmon
 CREATE TABLE IF NOT EXISTS sys_health_snapshots (
   ts INTEGER PRIMARY KEY,
   payload_json TEXT NOT NULL
@@ -158,7 +176,6 @@ CREATE TABLE IF NOT EXISTS sys_state (
   updated_ts INTEGER NOT NULL
 );
 
--- NEWS (safe schema: NO "limit" column name)
 CREATE TABLE IF NOT EXISTS news_settings (
   k TEXT PRIMARY KEY,
   v TEXT NOT NULL,
@@ -193,197 +210,120 @@ CREATE TABLE IF NOT EXISTS news_last_posted (
 );
 """
 
+
 def _now() -> int:
     return int(time.time())
 
-def utc_day(ts: Optional[int] = None) -> int:
-    import datetime
-    if ts is None:
-        ts = _now()
-    dt = datetime.datetime.utcfromtimestamp(int(ts))
-    return dt.year * 10000 + dt.month * 100 + dt.day
 
-_WORD_RE = re.compile(r"[A-Za-z0-9']+")
-_URL_RE = re.compile(r"(https?://|www\.)", re.I)
-
-def word_count(text: Optional[str]) -> int:
-    if not text:
-        return 0
-    return len(_WORD_RE.findall(text))
-
-def has_link(text: Optional[str]) -> int:
-    if not text:
-        return 0
-    return 1 if _URL_RE.search(text) else 0
-
-
-@dataclasses.dataclass(frozen=True)
+@dataclass(frozen=True)
 class DBConfig:
-    path: str
+    db_path: str
     timeout: float = 30.0
-    pragmas: Tuple[Tuple[str, Union[str, int]], ...] = (
-        ("journal_mode", "WAL"),
-        ("synchronous", "NORMAL"),
-        ("temp_store", "MEMORY"),
-        ("foreign_keys", 1),
-    )
-
-    @staticmethod
-    def from_any(*, path: Optional[str] = None, db_path: Optional[str] = None, db_file: Optional[str] = None, db: Optional[str] = None) -> "DBConfig":
-        p = path or db_path or db_file or db
-        if not p:
-            raise TypeError("DBConfig requires path/db_path/db_file")
-        return DBConfig(path=str(p))
 
 
 class ChatDB:
-    def __init__(self, config: Union[DBConfig, str, os.PathLike[str]]):
-        if isinstance(config, DBConfig):
-            self.cfg = config
-        else:
-            self.cfg = DBConfig.from_any(path=str(config))
+    def __init__(self, cfg: DBConfig):
+        self.cfg = cfg
+        self._path = Path(cfg.db_path)
+        self._conn: Optional[sqlite3.Connection] = None
+        self._lock = asyncio.Lock()
         self._schema_ready = False
-        self._schema_lock = asyncio.Lock()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.cfg.path, timeout=self.cfg.timeout)
-        conn.row_factory = sqlite3.Row
-        for k, v in self.cfg.pragmas:
-            if isinstance(v, str):
-                conn.execute(f"PRAGMA {k}={json.dumps(v)}")
-            else:
-                conn.execute(f"PRAGMA {k}={int(v)}")
-        return conn
-
-    def _ensure_schema_sync(self) -> None:
-        conn = self._connect()
-        try:
-            conn.executescript(SCHEMA)
-            conn.commit()
-        finally:
-            conn.close()
+        if self._conn is None:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(
+                str(self._path),
+                timeout=float(self.cfg.timeout),
+                isolation_level=None,      # autocommit
+                check_same_thread=False,
+            )
+            conn.row_factory = sqlite3.Row
+            # Foreign keys are per-connection. This must be set every time.
+            conn.execute("PRAGMA foreign_keys=ON;")
+            self._conn = conn
+        return self._conn
 
     async def ensure_schema(self) -> None:
-        if self._schema_ready:
-            return
-        async with self._schema_lock:
+        async with self._lock:
             if self._schema_ready:
                 return
-            await asyncio.to_thread(self._ensure_schema_sync)
+            conn = self._connect()
+            conn.executescript(SCHEMA)
+            # Make sure the connection still has FK ON after schema script.
+            conn.execute("PRAGMA foreign_keys=ON;")
             self._schema_ready = True
 
-    async def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
-        """Execute a statement and return affected rowcount (best-effort)."""
+    # -------------
+    # Low-level IO
+    # -------------
+
+    async def execute(self, sql: str, params: Iterable[Any] = ()) -> None:
         await self.ensure_schema()
-
-        def _do() -> int:
+        async with self._lock:
             conn = self._connect()
-            try:
-                cur = conn.execute(sql, params)
-                conn.commit()
-                # sqlite3 rowcount is sometimes -1; treat that as 0
-                return int(cur.rowcount) if cur.rowcount is not None and cur.rowcount >= 0 else 0
-            finally:
-                conn.close()
+            conn.execute("PRAGMA foreign_keys=ON;")
+            conn.execute(sql, tuple(params))
 
-        return await asyncio.to_thread(_do)
-
-    async def executemany(self, sql: str, seq_params: Iterable[Sequence[Any]]) -> int:
-        """Execute many statements and return total affected rows (best-effort)."""
+    async def executemany(self, sql: str, rows: list[tuple[Any, ...]]) -> None:
+        if not rows:
+            return
         await self.ensure_schema()
-        seq_params = list(seq_params)
-
-        def _do() -> int:
+        async with self._lock:
             conn = self._connect()
-            try:
-                cur = conn.executemany(sql, seq_params)
-                conn.commit()
-                return int(cur.rowcount) if cur.rowcount is not None and cur.rowcount >= 0 else 0
-            finally:
-                conn.close()
+            conn.execute("PRAGMA foreign_keys=ON;")
+            conn.executemany(sql, rows)
 
-        return await asyncio.to_thread(_do)
-
-    async def fetchone(self, sql: str, params: Sequence[Any] = ()) -> Optional[sqlite3.Row]:
+    async def fetchone(self, sql: str, params: Iterable[Any] = ()) -> Optional[sqlite3.Row]:
         await self.ensure_schema()
-        def _do():
+        async with self._lock:
             conn = self._connect()
-            try:
-                return conn.execute(sql, params).fetchone()
-            finally:
-                conn.close()
-        return await asyncio.to_thread(_do)
+            conn.execute("PRAGMA foreign_keys=ON;")
+            cur = conn.execute(sql, tuple(params))
+            return cur.fetchone()
 
-    async def fetchall(self, sql: str, params: Sequence[Any] = ()) -> List[sqlite3.Row]:
+    async def fetchall(self, sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
         await self.ensure_schema()
-        def _do():
+        async with self._lock:
             conn = self._connect()
-            try:
-                return conn.execute(sql, params).fetchall()
-            finally:
-                conn.close()
-        return await asyncio.to_thread(_do)
+            conn.execute("PRAGMA foreign_keys=ON;")
+            cur = conn.execute(sql, tuple(params))
+            return cur.fetchall()
 
-    async def _table_cols(self, table: str) -> set[str]:
-        rows = await self.fetchall(f"PRAGMA table_info({table})")
-        # rows are sqlite3.Row; "name" column holds the column name
-        return {str(r["name"]) for r in rows}
+    async def close(self) -> None:
+        async with self._lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                finally:
+                    self._conn = None
+                    self._schema_ready = False
+
+    # -----------------------------
+    # Control-plane helpers
+    # -----------------------------
 
     async def ensure_channel(self, channel: str) -> None:
         await self.ensure_schema()
         channel = (channel or "").strip()
         if not channel:
             return
+        # created_utc is NOT NULL in your DB, so always satisfy it.
+        await self.execute(
+            "INSERT OR IGNORE INTO channels(channel, created_utc, created_ts) VALUES (?, datetime('now'), ?)",
+            (channel, _now()),
+        )
 
-        cols = await self._table_cols("channels")
-        if "channel" not in cols:
-            return
-
-        if "created_ts" in cols:
-            await self.execute(
-                "INSERT OR IGNORE INTO channels(channel, created_ts) VALUES (?, ?)",
-                (channel, _now()),
-            )
-        elif "created_utc" in cols:
-            # fallback to older schema
-            await self.execute(
-                "INSERT OR IGNORE INTO channels(channel, created_utc) VALUES (?, datetime('now'))",
-                (channel,),
-            )
-        else:
-            await self.execute(
-                "INSERT OR IGNORE INTO channels(channel) VALUES (?)",
-                (channel,),
-            )
-
-    async def ensure_service(self, service_name: str) -> None:
+    async def ensure_service(self, service: str) -> None:
         await self.ensure_schema()
-        service_name = (service_name or "").strip().lower()
-        if not service_name:
+        service = (service or "").strip().lower()
+        if not service:
             return
-
-        cols = await self._table_cols("services")
-
-        # support both old and new column names
-        name_col = "name" if "name" in cols else ("service" if "service" in cols else None)
-        if not name_col:
-            return
-
-        if "created_ts" in cols:
-            await self.execute(
-                f"INSERT OR IGNORE INTO services({name_col}, created_ts) VALUES (?, ?)",
-                (service_name, _now()),
-            )
-        elif "created_utc" in cols:
-            await self.execute(
-                f"INSERT OR IGNORE INTO services({name_col}, created_utc) VALUES (?, datetime('now'))",
-                (service_name,),
-            )
-        else:
-            await self.execute(
-                f"INSERT OR IGNORE INTO services({name_col}) VALUES (?)",
-                (service_name,),
-            )
+        # created_utc is NOT NULL in your DB, so always satisfy it.
+        await self.execute(
+            "INSERT OR IGNORE INTO services(service, created_utc, created_ts) VALUES (?, datetime('now'), ?)",
+            (service, _now()),
+        )
 
     async def set_service_channel_enabled(self, service: str, channel: str, enabled: bool, updated_by: str = "") -> None:
         await self.ensure_schema()
@@ -392,41 +332,21 @@ class ChatDB:
         if not service or not channel:
             return
 
+        # Hard guarantee FK targets exist (this is what prevents your FK failures).
         await self.ensure_service(service)
         await self.ensure_channel(channel)
 
-        cols = await self._table_cols("service_channel")
-
-        # required columns: service, channel, enabled
-        if not {"service", "channel", "enabled"}.issubset(cols):
-            return
-
-        # update time column may be updated_utc or updated_ts
-        if "updated_ts" in cols:
-            await self.execute(
-                """
-                INSERT INTO service_channel(service, channel, enabled, updated_ts, updated_by)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(service, channel) DO UPDATE SET
-                    enabled=excluded.enabled,
-                    updated_ts=excluded.updated_ts,
-                    updated_by=excluded.updated_by
-                """,
-                (service, channel, 1 if enabled else 0, _now(), updated_by or ""),
-            )
-        else:
-            # default older schema with updated_utc TEXT
-            await self.execute(
-                """
-                INSERT INTO service_channel(service, channel, enabled, updated_utc, updated_by)
-                VALUES (?, ?, ?, datetime('now'), ?)
-                ON CONFLICT(service, channel) DO UPDATE SET
-                    enabled=excluded.enabled,
-                    updated_utc=datetime('now'),
-                    updated_by=excluded.updated_by
-                """,
-                (service, channel, 1 if enabled else 0, updated_by or ""),
-            )
+        await self.execute(
+            """
+            INSERT INTO service_channel(service, channel, enabled, updated_utc, updated_by)
+            VALUES (?, ?, ?, datetime('now'), ?)
+            ON CONFLICT(service, channel) DO UPDATE SET
+                enabled=excluded.enabled,
+                updated_utc=datetime('now'),
+                updated_by=excluded.updated_by
+            """,
+            (service, channel, 1 if enabled else 0, (updated_by or "")),
+        )
 
     async def is_service_enabled(self, service: str, channel: str) -> bool:
         await self.ensure_schema()
@@ -439,31 +359,34 @@ class ChatDB:
             "SELECT enabled FROM service_channel WHERE service=? AND channel=?",
             (service, channel),
         )
-        if row is None:
-            # fallback: enabled_by_default if present
-            cols = await self._table_cols("services")
-            name_col = "name" if "name" in cols else ("service" if "service" in cols else None)
-            if not name_col or "enabled_by_default" not in cols:
-                return False
-            r2 = await self.fetchone(f"SELECT enabled_by_default FROM services WHERE {name_col}=?", (service,))
-            return bool(r2 and int(r2["enabled_by_default"]) == 1)
-        return bool(int(row["enabled"]) == 1)
+        if row is not None:
+            return bool(int(row["enabled"]) == 1)
+
+        # fallback to enabled_by_default
+        row2 = await self.fetchone(
+            "SELECT enabled_by_default FROM services WHERE service=?",
+            (service,),
+        )
+        return bool(row2 is not None and int(row2["enabled_by_default"]) == 1)
 
     async def is_service_enabled_any(self, service: str) -> bool:
         await self.ensure_schema()
         service = (service or "").strip().lower()
         if not service:
             return False
-        row = await self.fetchone("SELECT 1 FROM service_channel WHERE service=? AND enabled=1 LIMIT 1", (service,))
-        if row:
+
+        row = await self.fetchone(
+            "SELECT 1 FROM service_channel WHERE service=? AND enabled=1 LIMIT 1",
+            (service,),
+        )
+        if row is not None:
             return True
-        # fallback: enabled_by_default
-        cols = await self._table_cols("services")
-        name_col = "name" if "name" in cols else ("service" if "service" in cols else None)
-        if not name_col or "enabled_by_default" not in cols:
-            return False
-        r2 = await self.fetchone(f"SELECT enabled_by_default FROM services WHERE {name_col}=?", (service,))
-        return bool(r2 and int(r2["enabled_by_default"]) == 1)
+
+        row2 = await self.fetchone(
+            "SELECT enabled_by_default FROM services WHERE service=?",
+            (service,),
+        )
+        return bool(row2 is not None and int(row2["enabled_by_default"]) == 1)
 
     async def list_service_status_for_channel(self, channel: str) -> list[tuple[str, bool]]:
         await self.ensure_schema()
@@ -471,20 +394,14 @@ class ChatDB:
         if not channel:
             return []
 
-        # list all known services, left-join enablement
-        cols = await self._table_cols("services")
-        name_col = "name" if "name" in cols else ("service" if "service" in cols else None)
-        if not name_col:
-            return []
-
         rows = await self.fetchall(
-            f"""
-            SELECT s.{name_col} AS service,
+            """
+            SELECT s.service AS service,
                    COALESCE(sc.enabled, s.enabled_by_default, 0) AS enabled
             FROM services s
             LEFT JOIN service_channel sc
-              ON sc.service = s.{name_col} AND sc.channel = ?
-            ORDER BY s.{name_col} ASC
+              ON sc.service = s.service AND sc.channel = ?
+            ORDER BY s.service ASC
             """,
             (channel,),
         )

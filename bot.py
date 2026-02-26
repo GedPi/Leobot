@@ -392,6 +392,9 @@ class IRCBot:
         self.core_services: set[str] = {"acl", "help", "control"}
         self.router = CommandRouter(self)
 
+        # Graceful shutdown flag (systemd SIGTERM must stop reconnect loop)
+        self.shutting_down = False
+
         # Control-plane DB (single source of truth)
         db_path = None
         try:
@@ -488,7 +491,10 @@ class IRCBot:
             return
         on = [s for s, en in rows if en]
         off = [s for s, en in rows if not en]
-        await self.privmsg(ev.target, f"{ev.nick}: services in {ev.channel} — ON: {', '.join(on) if on else '(none)'} | OFF: {', '.join(off) if off else '(none)'}")
+        await self.privmsg(
+            ev.target,
+            f"{ev.nick}: services in {ev.channel} — ON: {', '.join(on) if on else '(none)'} | OFF: {', '.join(off) if off else '(none)'}"
+        )
 
     async def cmd_service_status(self, bot: "IRCBot", ev: "Event", args: CommandArgs) -> None:
         channel = ev.channel
@@ -505,7 +511,10 @@ class IRCBot:
         rows = [(s, True if s in self.core_services else en) for (s, en) in rows]
         on = [s for s, en in rows if en]
         off = [s for s, en in rows if not en]
-        await self.privmsg(ev.target, f"{ev.nick}: {channel} — ON: {', '.join(on) if on else '(none)'} | OFF: {', '.join(off) if off else '(none)'}")
+        await self.privmsg(
+            ev.target,
+            f"{ev.nick}: {channel} — ON: {', '.join(on) if on else '(none)'} | OFF: {', '.join(off) if off else '(none)'}"
+        )
 
     async def _set_service(self, ev: "Event", service: str, channel: str | None, enabled: bool) -> None:
         svc = self._norm_service(service)
@@ -519,6 +528,7 @@ class IRCBot:
         if not ch:
             await self.privmsg(ev.target, f"{ev.nick}: provide a channel, e.g. !service {'enable' if enabled else 'disable'} {svc} #chan")
             return
+
         await self.db.set_service_channel_enabled(svc, ch, enabled, updated_by=ev.nick)
 
         # optional lifecycle hook
@@ -619,8 +629,6 @@ class IRCBot:
                 setattr(svc, "_service_name", key)
                 self.service_map[key] = svc
 
-        # Catalog rows will be ensured from the async run() context.
-
     async def connect(self) -> None:
         server = self.cfg["server"]
         port = int(self.cfg["port"])
@@ -651,6 +659,7 @@ class IRCBot:
             await self.db.ensure_channel(ch)
         for svc in self.service_map.keys():
             await self.db.ensure_service(svc)
+
         await self.connect()
 
         assert self.reader is not None
@@ -658,8 +667,6 @@ class IRCBot:
             try:
                 line_b = await self.reader.readline()
             except ssl.SSLError as e:
-                # When systemd stops the service, the TLS shutdown can race with in-flight data.
-                # Treat this as a clean stop if we're already stopping.
                 if self.stop_event.is_set() and "APPLICATION_DATA_AFTER_CLOSE_NOTIFY" in str(e):
                     break
                 raise
@@ -712,7 +719,6 @@ class IRCBot:
                         if not await self.db.is_service_enabled_any(str(svc_name)):
                             continue
                     except Exception:
-                        # fail open on DB issues
                         pass
                 fn = getattr(svc, "on_ready", None)
                 if callable(fn):
@@ -779,7 +785,7 @@ class IRCBot:
             await self.dispatch("on_kick", ev)
             return
 
-        # ---- ADDED: TOPIC ----
+        # TOPIC
         if cmd == "TOPIC" and len(params) >= 2:
             channel = params[0]
             topic = params[1]
@@ -798,7 +804,7 @@ class IRCBot:
             await self.dispatch("on_topic", ev)
             return
 
-        # ---- ADDED: MODE (channel only) ----
+        # MODE (channel only)
         if cmd == "MODE" and params:
             target = params[0]
             if target.startswith("#"):
@@ -818,9 +824,8 @@ class IRCBot:
                 await self.dispatch("on_mode", ev)
                 return
 
-        # ---- ADDED: 353 (RPL_NAMREPLY) ----
+        # 353 (RPL_NAMREPLY)
         if cmd == "353" and len(params) >= 4:
-            # format: <me> <symbol> <#channel> <names...>
             channel = params[2]
             names = params[3]
             ev = Event(
@@ -847,9 +852,8 @@ class IRCBot:
                     return
             except Exception:
                 self.log.exception("ACL precheck error")
-                # fail open
 
-        # Router dispatch (strict router is migration-safe by only intercepting commands with handlers)
+        # Router dispatch
         if hook == "on_privmsg" and getattr(self, "router", None) is not None:
             try:
                 handled = await self.router.dispatch(self, ev)
@@ -857,17 +861,14 @@ class IRCBot:
                     return
             except Exception:
                 self.log.exception("Router dispatch error")
-                # fail open
 
         for svc in self.services:
             svc_name = getattr(svc, "_service_name", None)
-            # Option 2: if disabled, it's disabled — suppress ALL hooks for that service in that channel.
             if ev.channel and svc_name and str(svc_name) not in self.core_services:
                 try:
                     if not await self.db.is_service_enabled(str(svc_name), ev.channel):
                         continue
                 except Exception:
-                    # fail open on DB issues
                     pass
             fn = getattr(svc, hook, None)
             if callable(fn):
@@ -877,12 +878,17 @@ class IRCBot:
                     self.log.exception("Service error in %s (%s)", hook, type(svc).__name__)
 
     async def shutdown(self) -> None:
+        # Make sure systemd SIGTERM stops the reconnect loop quickly
+        self.shutting_down = True
         self.stop_event.set()
+
+        # Unblock any pending reader.readline() immediately
+        await self.close_connection()
+
+        # Best-effort QUIT (only if we still have a writer)
         try:
             if self.writer:
                 await self.send_raw("QUIT :Shutting down")
-                self.writer.close()
-                await self.writer.wait_closed()
         except Exception:
             pass
 
@@ -899,17 +905,23 @@ async def main():
     backoff = int(cfg["reconnect_min_seconds"])
     backoff_max = int(cfg["reconnect_max_seconds"])
 
-    while True:
+    while not bot.shutting_down:
         try:
             await bot.run()
             backoff = int(cfg["reconnect_min_seconds"])
         except Exception as e:
-            # If we are shutting down, a TLS close-notify race can surface as an SSLError.
             if bot.stop_event.is_set() and isinstance(e, ssl.SSLError) and "APPLICATION_DATA_AFTER_CLOSE_NOTIFY" in str(e):
                 logging.info("Bot stopped (TLS close-notify race): %s", e)
+            elif bot.shutting_down:
+                logging.info("Bot stopping: %s", e)
             else:
                 logging.exception("Bot crashed/disconnected: %s", e)
 
+        # If we are shutting down, do not reconnect.
+        if bot.shutting_down:
+            break
+
+        # Clean up and reconnect with backoff
         await bot.shutdown()
         await bot.close_connection()
         logging.info("Reconnecting in %ss...", backoff)
