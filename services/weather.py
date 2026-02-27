@@ -4,7 +4,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
 from pathlib import Path
+from typing import Any
 
 from services.store import Store
 
@@ -12,6 +14,7 @@ WATCH_PATH = Path("/var/lib/leobot/weather_watch.json")
 
 UA = "LeonidasIRCbot/1.0 (https://hairyoctopus.net; admin: Ged)"
 
+# WMO-ish codes used by Open-Meteo
 WEATHER_CODE = {
     0: "Clear", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast", 45: "Fog", 48: "Rime fog",
     51: "Light drizzle", 53: "Drizzle", 55: "Heavy drizzle", 56: "Freezing drizzle", 57: "Heavy freezing drizzle",
@@ -54,6 +57,10 @@ def _norm_city(s: str) -> str:
 
 
 def _parse_timeframe(tokens: list[str]) -> tuple[str, int | None]:
+    """
+    Currently only kept for backward-compat. We ignore timeframe in output for now,
+    but keep parsing so existing usage doesn't break.
+    """
     if not tokens:
         return ("now", None)
 
@@ -87,12 +94,66 @@ def _strip_timeframe(tokens: list[str]) -> list[str]:
     return tokens
 
 
+def _safe_list(x: Any) -> list:
+    return x if isinstance(x, list) else []
+
+
+def _safe_num(x: Any) -> float | None:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _trend_word(a: float | None, b: float | None) -> str | None:
+    if a is None or b is None:
+        return None
+    if b > a:
+        return "increase"
+    if b < a:
+        return "decrease"
+    return "remain steady"
+
+
+def _precip_kind_from_code(code: int | None) -> str | None:
+    if code is None:
+        return None
+    # Broad buckets for a "weatherman" summary.
+    if code in (45, 48):
+        return "fog"
+    if code in (71, 73, 75, 77, 85, 86):
+        return "snow"
+    if code in (51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82, 95, 96, 99):
+        return "rain"
+    return None
+
+
+def _fmt_pct(v: float | None) -> str | None:
+    if v is None:
+        return None
+    return f"{int(round(v))}%"
+
+
+def _fmt_c(v: float | None) -> str | None:
+    if v is None:
+        return None
+    return f"{v:.0f}°C"
+
+
+def _fmt_kmh(v: float | None) -> str | None:
+    if v is None:
+        return None
+    return f"{v:.0f}km/h"
+
+
 class WeatherService:
     def __init__(self, bot, cfg: dict):
         self.bot = bot
         self.cfg = cfg
-        self.cache = {}
-        self.cooldown = {}
+        self.cache: dict[tuple, tuple[float, dict]] = {}
+        self.cooldown: dict[tuple[str, str], float] = {}
 
         db_path = "/var/lib/leobot/db/leobot.db"
         if isinstance(getattr(bot, "cfg", None), dict):
@@ -104,6 +165,7 @@ class WeatherService:
     async def _init_once(self) -> None:
         if self._init_done:
             return
+        # Keep legacy import (some users may still have old JSON watch file)
         await self.store.weather_import_from_legacy_file(str(WATCH_PATH))
         self._init_done = True
 
@@ -162,12 +224,32 @@ class WeatherService:
         if cached:
             return cached
 
+        # Expanded fields:
+        # - relative_humidity_2m
+        # - cloud_cover
         params = {
             "latitude": str(lat),
             "longitude": str(lon),
             "timezone": "auto",
-            "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m,wind_gusts_10m,precipitation,rain,showers,snowfall",
-            "hourly": "temperature_2m,apparent_temperature,precipitation,precipitation_probability,rain,showers,snowfall,weather_code,wind_speed_10m,wind_gusts_10m",
+            "current": (
+                "temperature_2m,"
+                "apparent_temperature,"
+                "weather_code,"
+                "wind_speed_10m,"
+                "wind_gusts_10m,"
+                "relative_humidity_2m,"
+                "cloud_cover"
+            ),
+            "hourly": (
+                "temperature_2m,"
+                "apparent_temperature,"
+                "weather_code,"
+                "wind_speed_10m,"
+                "wind_gusts_10m,"
+                "relative_humidity_2m,"
+                "precipitation_probability,"
+                "cloud_cover"
+            ),
             "forecast_days": "2",
         }
         qs = "&".join([f"{k}={urllib.parse.quote(v)}" for k, v in params.items()])
@@ -176,6 +258,171 @@ class WeatherService:
 
         self._cache_set(key, data, ttl)
         return data
+
+    def _place_str(self, g: dict) -> str:
+        place = g.get("name") or "Unknown"
+        if g.get("admin1"):
+            place += f", {g['admin1']}"
+        if g.get("country"):
+            place += f" ({g['country']})"
+        return place
+
+    def _extract_12h_window(self, data: dict) -> dict:
+        """
+        Returns a dict containing:
+          start_idx, end_idx,
+          temps, feels, winds, gusts, humidity, pprob, cloud, codes, times
+        All arrays are aligned and sliced to a forward 12-hour window starting at "current.time" if possible.
+        """
+        hourly = data.get("hourly") or {}
+        cur = data.get("current") or {}
+
+        times = _safe_list(hourly.get("time"))
+        cur_time = cur.get("time")
+
+        start_idx = 0
+        if cur_time and times:
+            try:
+                start_idx = times.index(cur_time)
+            except ValueError:
+                start_idx = 0
+
+        end_idx = min(start_idx + 12, len(times))
+
+        def sl(key: str) -> list:
+            arr = _safe_list(hourly.get(key))
+            return arr[start_idx:end_idx] if arr else []
+
+        out = {
+            "start_idx": start_idx,
+            "end_idx": end_idx,
+            "times": times[start_idx:end_idx] if times else [],
+            "temps": sl("temperature_2m"),
+            "feels": sl("apparent_temperature"),
+            "winds": sl("wind_speed_10m"),
+            "gusts": sl("wind_gusts_10m"),
+            "humidity": sl("relative_humidity_2m"),
+            "pprob": sl("precipitation_probability"),
+            "cloud": sl("cloud_cover"),
+            "codes": sl("weather_code"),
+        }
+        return out
+
+    def _format_weatherman(self, *, nick: str, place: str, cur: dict, win: dict) -> str:
+        # --- current snapshot ---
+        code = cur.get("weather_code")
+        cond = WEATHER_CODE.get(code, "Unknown")
+        t = _safe_num(cur.get("temperature_2m"))
+        feels = _safe_num(cur.get("apparent_temperature"))
+        wind = _safe_num(cur.get("wind_speed_10m"))
+        gust = _safe_num(cur.get("wind_gusts_10m"))
+        rh = _safe_num(cur.get("relative_humidity_2m"))
+        cloud = _safe_num(cur.get("cloud_cover"))
+
+        # Precip probability is hourly-only; use first hour in window if present.
+        cur_pprob = None
+        pprob_list = win.get("pprob") or []
+        if pprob_list:
+            cur_pprob = _safe_num(pprob_list[0])
+
+        # --- next 12h outlook ---
+        temps = [ _safe_num(x) for x in (win.get("temps") or []) ]
+        feels_list = [ _safe_num(x) for x in (win.get("feels") or []) ]
+        winds = [ _safe_num(x) for x in (win.get("winds") or []) ]
+        gusts = [ _safe_num(x) for x in (win.get("gusts") or []) ]
+        humid = [ _safe_num(x) for x in (win.get("humidity") or []) ]
+        clouds = [ _safe_num(x) for x in (win.get("cloud") or []) ]
+        probs = [ _safe_num(x) for x in (win.get("pprob") or []) ]
+        codes = [ int(x) for x in (win.get("codes") or []) if x is not None ]
+
+        # Guard against empty windows
+        temp0 = temps[0] if temps else None
+        tempN = temps[-1] if temps else None
+        prob0 = probs[0] if probs else None
+        probN = probs[-1] if probs else None
+
+        temp_trend = _trend_word(temp0, tempN)
+        prob_trend = _trend_word(prob0, probN)
+
+        dominant_code = None
+        if codes:
+            dominant_code = Counter(codes).most_common(1)[0][0]
+        next_cond = WEATHER_CODE.get(dominant_code, "changing conditions") if dominant_code is not None else "changing conditions"
+
+        # If precipitation is likely, state what kind (rain/snow/fog)
+        precip_kind = _precip_kind_from_code(dominant_code)
+        precip_phrase = None
+        if precip_kind == "rain":
+            precip_phrase = "with rain becoming the main theme"
+        elif precip_kind == "snow":
+            precip_phrase = "with snow in the mix"
+        elif precip_kind == "fog":
+            precip_phrase = "with fog likely lingering"
+
+        # Also compute max wind/gust in window
+        max_wind = None
+        max_gust = None
+        if winds:
+            max_wind = max([v for v in winds if v is not None], default=None)
+        if gusts:
+            max_gust = max([v for v in gusts if v is not None], default=None)
+
+        # --- build message ---
+        parts: list[str] = []
+        parts.append(f"Hello {nick}, the weather in {place} is currently {cond}")
+
+        # temperature
+        if t is not None and feels is not None:
+            parts.append(f"at {_fmt_c(t)} (feels {_fmt_c(feels)})")
+        elif t is not None:
+            parts.append(f"at {_fmt_c(t)}")
+
+        # wind
+        if wind is not None and gust is not None:
+            parts.append(f"with winds {_fmt_kmh(wind)} gusting {_fmt_kmh(gust)}")
+        elif wind is not None:
+            parts.append(f"with winds {_fmt_kmh(wind)}")
+
+        # humidity / cloud / precip prob
+        extras: list[str] = []
+        if rh is not None:
+            extras.append(f"humidity {_fmt_pct(rh)}")
+        if cloud is not None:
+            extras.append(f"cloud cover {_fmt_pct(cloud)}")
+        if cur_pprob is not None:
+            extras.append(f"precipitation probability {_fmt_pct(cur_pprob)}")
+        if extras:
+            parts.append("(" + ", ".join(extras) + ").")
+        else:
+            parts.append(".")
+
+        # outlook sentence
+        outlook: list[str] = []
+        outlook.append("Over the next 12 hours")
+        if temp0 is not None and tempN is not None and temp_trend:
+            outlook.append(f"temperatures are expected to {temp_trend} from {_fmt_c(temp0)} to {_fmt_c(tempN)}")
+        else:
+            outlook.append("conditions should evolve gradually")
+
+        outlook.append(f"toward {next_cond}")
+        if precip_phrase:
+            outlook.append(precip_phrase)
+
+        # precip probability trend
+        if prob0 is not None and probN is not None and prob_trend:
+            outlook.append(f"and precipitation probability should {prob_trend} to around {_fmt_pct(probN)}")
+        elif probN is not None:
+            outlook.append(f"and precipitation probability sits around {_fmt_pct(probN)}")
+
+        # wind outlook
+        if max_wind is not None and max_gust is not None:
+            outlook.append(f"(winds peaking near {_fmt_kmh(max_wind)} gusting {_fmt_kmh(max_gust)}).")
+        else:
+            outlook.append(".")
+
+        parts.append(" ".join(outlook).replace(" .", "."))
+
+        return " ".join(parts).replace("  ", " ").strip()
 
     async def on_privmsg(self, bot, ev) -> None:
         await self._init_once()
@@ -206,7 +453,7 @@ class WeatherService:
         # Normal forecast: !weather <city> [today|tomorrow|3d|5d] (timeframe can be first or last)
         args = cmdline[len("weather"):].strip()
         tokens = args.split()
-        _mode, _days = _parse_timeframe(tokens)  # kept for future use
+        _mode, _days = _parse_timeframe(tokens)  # kept for future use / backward compat
         city_tokens = _strip_timeframe(tokens)
         city = _norm_city(" ".join(city_tokens))
 
@@ -226,42 +473,16 @@ class WeatherService:
         data = await self._forecast(float(g["lat"]), float(g["lon"]))
         cur = data.get("current") or {}
 
-        code = cur.get("weather_code")
-        cond = WEATHER_CODE.get(code, "Unknown")
-        t = cur.get("temperature_2m")
-        feels = cur.get("apparent_temperature")
-        wind = cur.get("wind_speed_10m")
-        gust = cur.get("wind_gusts_10m")
+        place = self._place_str(g)
+        win = self._extract_12h_window(data)
 
-        hourly = data.get("hourly") or {}
-        times = hourly.get("time") or []
-        pprob = hourly.get("precipitation_probability") or []
-        precip = hourly.get("precipitation") or []
+        # Narrative output
+        msg = self._format_weatherman(nick=ev.nick, place=place, cur=cur, win=win)
+        await bot.privmsg(ev.target, msg)
 
-        rain_msg = ""
-        for i in range(min(12, len(times))):
-            prob = pprob[i] if i < len(pprob) else None
-            mm = precip[i] if i < len(precip) else None
-            if prob is not None and mm is not None and prob >= 60 and mm >= 0.3:
-                rain_msg = f"Rain likely within ~{i+1}h ({int(prob)}%)."
-                break
-
-        place = g["name"]
-        if g.get("admin1"):
-            place += f", {g['admin1']}"
-        if g.get("country"):
-            place += f" ({g['country']})"
-
-        bits = [f"WEATHER: {place} — {cond}."]
-        if t is not None and feels is not None:
-            bits.append(f"{t:.0f}°C (feels {feels:.0f}°C).")
-        if wind is not None and gust is not None:
-            bits.append(f"Wind {wind:.0f}km/h gust {gust:.0f}km/h.")
-        if rain_msg:
-            bits.append(rain_msg)
-
-        await bot.privmsg(ev.target, " ".join(bits))
-
+    # -----------------------
+    # WARN subsystem (KEEP)
+    # -----------------------
     async def _handle_warn(self, bot, ev, parts, cmdline):
         # !weather warn types
         if len(parts) >= 3 and parts[2].lower() == "types":
@@ -290,7 +511,6 @@ class WeatherService:
 
         # !weather warn del <city...>
         if len(parts) >= 3 and parts[2].lower() == "del":
-            # everything after "del"
             tail = cmdline.split("del", 1)[1] if "del" in cmdline else ""
             city = _norm_city(tail)
             if not city:
@@ -359,7 +579,7 @@ def setup(bot):
             "weather",
             min_role="user",
             mutating=False,
-            help="Weather lookup. Usage: !weather <city> [today|tomorrow|3d|5d] (timeframe can also be first)",
+            help="Weather lookup. Usage: !weather <city> | !weather <city> today|tomorrow|3d|5d | !weather today|tomorrow|3d|5d <city>",
             category="Weather",
         )
         bot.register_command(
@@ -378,6 +598,6 @@ def setup(bot):
         bot.acl.register("weather warn", min_role="user", mutating=False, help="Manage weather watches. Usage: !weather warn ...", category="Weather")
         bot.acl.register("weather warn types", min_role="user", mutating=False, help="List supported watch types.", category="Weather")
         bot.acl.register("weather warn list", min_role="user", mutating=False, help="List watches.", category="Weather")
-        bot.acl.register("weather warn del", min_role="user", mutating=False, help="Delete a watch.", category="Weather")
+        bot.acl.register("weather warn del", min_role="user", mutating=False, help="Delete a watch. Usage: !weather warn del <city>", category="Weather")
 
     return WeatherService(bot, bot.cfg.get("weather", {}) if isinstance(bot.cfg, dict) else {})
