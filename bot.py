@@ -1,18 +1,18 @@
 #!/opt/leobot/venv/bin/python
-"""Leonidas IRC Bot entrypoint.
+"""Leobot entrypoint.
 
-This file wires together:
-- config loading
-- SQLite store
-- core handlers (ACL/Help/ServiceCtl)
-- pluggable services under ./services
-- IRC client loop
-- graceful shutdown for SIGTERM/SIGINT (stop) and SIGUSR1 (restart)
+This file orchestrates the refactored system/* modules:
+  - system.config        (./config/config.json)
+  - system.logging_setup (file+stdout logging)
+  - system.store         (sqlite + migrations)
+  - system.acl/help/servicectl core handlers
+  - system.dispatcher    (hook dispatch to services)
+  - system.irc_client    (socket + PING/PONG)
 
-Notes:
-- Repo layout has *core* modules under ./system and *services* under ./services.
-- Services are generally created via module-level setup(bot) -> service instance.
-- Dispatcher API is dispatcher.dispatch(hook, ev).
+Change implemented here:
+  - Graceful SIGTERM/SIGINT and SIGUSR1 handling with IRC QUIT messages.
+
+This is designed to match the repo structure you uploaded (services/* + system/*).
 """
 
 from __future__ import annotations
@@ -25,18 +25,19 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
-# Ensure local packages (./system, ./services) are importable when launched by systemd.
+# Ensure local packages (./services, ./system, etc.) are importable when launched by systemd.
 _BASE_DIR = str(Path(__file__).resolve().parent)
 if _BASE_DIR not in sys.path:
     sys.path.insert(0, _BASE_DIR)
 
 from system.acl import ACL
-from system.config import load_config
+from system.config import ConfigError, load_config
 from system.dispatcher import Dispatcher
 from system.help import Help
 from system.irc_client import IRCClient
 from system.irc_parse import parse_line, parse_prefix
 from system.logging_setup import setup_logging
+from system.scheduler import Scheduler
 from system.servicectl import ServiceCtl
 from system.store import Store
 from system.types import Event
@@ -44,65 +45,45 @@ from system.types import Event
 log = logging.getLogger("leobot")
 
 
-def _import_module_with_fallback(name: str):
-    """Import a module referenced in config.
-
-    Accepts:
-      - "greet"            -> services.greet then system.greet
-      - "services.greet"   -> services.greet then system.greet
-      - "system.acl"       -> system.acl then services.acl
-
-    The fallback is there to tolerate older configs, but *core* modules (system.*)
-    are not expected to be loaded as channel services.
-    """
-    name = (name or "").strip()
-    if not name:
-        raise ModuleNotFoundError("empty module name")
-
-    candidates: list[str] = []
-    if "." in name:
-        candidates.append(name)
-        if name.startswith("services."):
-            candidates.append("system." + name.split(".", 1)[1])
-        elif name.startswith("system."):
-            candidates.append("services." + name.split(".", 1)[1])
-    else:
-        candidates.append(f"services.{name}")
-        candidates.append(f"system.{name}")
-
-    last: Exception | None = None
-    for modname in candidates:
-        try:
-            return importlib.import_module(modname)
-        except ModuleNotFoundError as e:
-            last = e
-    assert last is not None
-    raise last
-
-
 class Bot:
     def __init__(self, cfg: dict):
         self.cfg = cfg
+
+        # Persistence
+        self.store = Store(cfg.get("db_path", "./data/leonidas.db"))
+
+        # Core subsystems
+        self.dispatcher = Dispatcher(self)
+        self.scheduler = Scheduler()
+        self.irc: Optional[IRCClient] = None
+
+        # Commands registry (used by Help/ACL UX)
         self.commands: dict[str, dict[str, Any]] = {}
 
-        # Runtime wiring
-        self.store = Store(cfg.get("db_path", "./data/leonidas.db"))
+        # Core handlers
         self.acl = ACL(self.store, cfg)
-        self.dispatcher = Dispatcher(self)
+        self.help = Help()
+        self.servicectl = ServiceCtl()
 
-        # Core handlers run before services (auth/help/servicectl)
         self.dispatcher.add_core_handler(self.acl)
-        self.dispatcher.add_core_handler(Help())
-        self.dispatcher.add_core_handler(ServiceCtl())
+        self.dispatcher.add_core_handler(self.help)
+        self.dispatcher.add_core_handler(self.servicectl)
 
-        self.irc: IRCClient | None = None
+        # Register core commands
+        self._register_core_commands()
 
-        # Shutdown semantics
-        self._shutdown_once = False
+        # Service instances added to dispatcher
+        self._services: list[Any] = []
+
+        # Shutdown control
+        self.stop_event = asyncio.Event()
         self.exit_requested = False
         self.quit_message = "Shutting down"
+        self._shutdown_once = False
 
-    # ---- command registry (used by ACL/help) ----
+    # -----------------------------
+    # Public helpers used by services
+    # -----------------------------
     def register_command(
         self,
         cmd: str,
@@ -116,48 +97,279 @@ class Bot:
         if not c:
             return
         self.commands[c] = {
-            "min_role": min_role,
+            "min_role": (min_role or "user").strip(),
             "mutating": bool(mutating),
             "help": (help or "").strip(),
             "category": (category or "General").strip(),
         }
 
-    # ---- IRC send helpers ----
     async def send_raw(self, line: str) -> None:
         if not self.irc:
-            return
+            raise RuntimeError("IRC client not initialized")
         await self.irc.send_raw(line)
 
     async def privmsg(self, target: str, msg: str) -> None:
         if not self.irc:
-            return
+            raise RuntimeError("IRC client not initialized")
         await self.irc.privmsg(target, msg)
 
-    # ---- service loading ----
+    # -----------------------------
+    # Startup
+    # -----------------------------
+    def _register_core_commands(self) -> None:
+        # help/commands live in system.help (core handler), but we list them here.
+        self.register_command(
+            "help",
+            min_role="guest",
+            mutating=False,
+            help="Show help for a command. Usage: !help <command>",
+            category="System",
+        )
+        self.register_command(
+            "commands",
+            min_role="guest",
+            mutating=False,
+            help="List available commands for your role. Usage: !commands",
+            category="System",
+        )
+        # ACL core commands
+        self.register_command(
+            "auth",
+            min_role="guest",
+            mutating=True,
+            help="Authenticate to a higher role. Usage: !auth <password>",
+            category="System",
+        )
+        self.register_command(
+            "whoami",
+            min_role="guest",
+            mutating=False,
+            help="Show your effective role/identity. Usage: !whoami",
+            category="System",
+        )
+        # Service control commands
+        self.servicectl.register_commands(self)
+
+    def _import_service_module(self, name: str):
+        """Import service module with a tolerant fallback between services.* and system.*.
+
+        Only modules providing setup(bot) are treated as services.
+        If core modules appear in cfg['services'] by mistake, we skip them.
+        """
+        name = (name or "").strip()
+        if not name:
+            raise ModuleNotFoundError("empty service module name")
+
+        candidates: list[str] = []
+        if "." in name:
+            candidates.append(name)
+            if name.startswith("services."):
+                candidates.append("system." + name.split(".", 1)[1])
+            elif name.startswith("system."):
+                candidates.append("services." + name.split(".", 1)[1])
+        else:
+            candidates.append(f"services.{name}")
+            candidates.append(f"system.{name}")
+
+        last: Exception | None = None
+        for modname in candidates:
+            try:
+                return importlib.import_module(modname)
+            except ModuleNotFoundError as e:
+                last = e
+        assert last is not None
+        raise last
+
     def load_services(self) -> None:
-        # Clear existing list on dispatcher
-        self.dispatcher.services = []
+        # Reset dispatcher services list each time we (re)load.
+        self.dispatcher.services.clear()
+        self._services.clear()
 
-        for raw in (self.cfg.get("services") or []):
-            name = str(raw)
+        for name in (self.cfg.get("services", []) or []):
             log.info("Loading service: %s", name)
-            mod = _import_module_with_fallback(name)
-
-            # Service modules are expected to provide setup(bot)->service
+            mod = self._import_service_module(str(name))
             setup_fn = getattr(mod, "setup", None)
-            if callable(setup_fn):
-                svc = setup_fn(self)
-                if svc is not None:
-                    self.dispatcher.add_service(svc)
+            if not callable(setup_fn):
+                log.warning("Skipping %s (no setup(bot))", getattr(mod, "__name__", str(mod)))
                 continue
+            svc = setup_fn(self)
+            if svc is None:
+                continue
+            self._services.append(svc)
+            self.dispatcher.add_service(svc)
 
-            # If config references a core module (e.g. system.acl), do NOT crash.
-            # Just log and skip: core functionality is already wired separately.
-            log.warning("Module %s has no setup(bot); skipping", mod.__name__)
+    async def connect(self) -> None:
+        self.irc = IRCClient(self.cfg, self.on_line)
+        await self.irc.connect()
 
-    # ---- lifecycle ----
+    # -----------------------------
+    # IRC line handling
+    # -----------------------------
+    async def on_line(self, line: str) -> None:
+        pl = parse_line(line)
+        if not pl:
+            return
+
+        cmd = pl.cmd
+        params = pl.params
+
+        # Welcome
+        if cmd == "001":
+            for chan in self.cfg.get("channels", []):
+                await self.send_raw(f"JOIN {chan}")
+                await asyncio.sleep(0.7)
+
+            if self.cfg.get("nickserv_password"):
+                await self.privmsg("NickServ", f"IDENTIFY {self.cfg['nickserv_password']}")
+
+            try:
+                await self.scheduler.start()
+            except Exception:
+                log.exception("Scheduler start failed")
+
+            for svc in list(self._services):
+                fn = getattr(svc, "on_ready", None)
+                if callable(fn):
+                    try:
+                        await fn(self)
+                    except Exception:
+                        log.exception("Service error in on_ready (%s)", type(svc).__name__)
+            return
+
+        prefix = pl.prefix
+        nick, user, host = ("", None, None)
+        if prefix:
+            nick, user, host = parse_prefix(prefix)
+
+        # PRIVMSG
+        if cmd == "PRIVMSG" and len(params) >= 2:
+            target = params[0]
+            text = params[1]
+            is_private = target.lower() == (self.cfg.get("nick", "").lower())
+            reply_target = nick if is_private else target
+            channel = None if is_private else target
+
+            ev = Event(
+                nick=nick,
+                user=user,
+                host=host,
+                target=reply_target,
+                channel=channel,
+                text=text,
+                is_private=is_private,
+                raw=line,
+                cmd=cmd,
+                params=params,
+            )
+            await self.dispatcher.dispatch("on_privmsg", ev)
+            return
+
+        # JOIN
+        if cmd == "JOIN" and params:
+            channel = params[0]
+            ev = Event(
+                nick=nick,
+                user=user,
+                host=host,
+                target=channel,
+                channel=channel,
+                text=None,
+                is_private=False,
+                raw=line,
+                cmd=cmd,
+                params=params,
+            )
+            await self.dispatcher.dispatch("on_join", ev)
+            return
+
+        # PART
+        if cmd == "PART" and params:
+            channel = params[0]
+            ev = Event(
+                nick=nick,
+                user=user,
+                host=host,
+                target=channel,
+                channel=channel,
+                text=params[1] if len(params) > 1 else None,
+                is_private=False,
+                raw=line,
+                cmd=cmd,
+                params=params,
+            )
+            await self.dispatcher.dispatch("on_part", ev)
+            return
+
+        # QUIT
+        if cmd == "QUIT":
+            ev = Event(
+                nick=nick,
+                user=user,
+                host=host,
+                target=nick,
+                channel=None,
+                text=params[0] if params else None,
+                is_private=True,
+                raw=line,
+                cmd=cmd,
+                params=params,
+            )
+            await self.dispatcher.dispatch("on_quit", ev)
+            return
+
+        # NICK
+        if cmd == "NICK" and params:
+            new_nick = params[0]
+            ev = Event(
+                nick=new_nick,
+                user=user,
+                host=host,
+                target=new_nick,
+                channel=None,
+                text=None,
+                is_private=True,
+                raw=line,
+                cmd=cmd,
+                params=params,
+                old_nick=nick,
+                new_nick=new_nick,
+            )
+            await self.dispatcher.dispatch("on_nick", ev)
+            return
+
+        # KICK
+        if cmd == "KICK" and len(params) >= 2:
+            channel = params[0]
+            victim = params[1]
+            ev = Event(
+                nick=nick,
+                user=user,
+                host=host,
+                target=channel,
+                channel=channel,
+                text=params[2] if len(params) > 2 else None,
+                is_private=False,
+                raw=line,
+                cmd=cmd,
+                params=params,
+                victim=victim,
+                kicker=nick,
+            )
+            await self.dispatcher.dispatch("on_kick", ev)
+            return
+
+    # -----------------------------
+    # Shutdown
+    # -----------------------------
+    def request_exit(self, quit_message: str) -> None:
+        """Signal-safe request to exit."""
+        self.exit_requested = True
+        self.quit_message = (quit_message or "Shutting down").strip() or "Shutting down"
+        self.stop_event.set()
+        asyncio.create_task(self.shutdown(self.quit_message))
+
     async def shutdown(self, quit_message: Optional[str] = None) -> None:
-        """Best-effort graceful QUIT + stop flag. Idempotent."""
+        """Gracefully QUIT, stop scheduler, close DB. Idempotent."""
         if self._shutdown_once:
             return
         self._shutdown_once = True
@@ -167,220 +379,75 @@ class Bot:
             msg = msg[:220]
 
         try:
+            await self.scheduler.stop()
+        except Exception:
+            pass
+
+        # Send QUIT and close socket to break any pending readline()
+        try:
             if self.irc and self.irc.writer:
-                await self.irc.send_raw(f"QUIT :{msg}")
+                try:
+                    await self.irc.send_raw(f"QUIT :{msg}")
+                except Exception:
+                    pass
+                await self.irc.close()
+        except Exception:
+            pass
+
+        try:
+            await self.store.close()
         except Exception:
             pass
 
 
-async def handle_line(bot: Bot, line: str) -> None:
-    pl = parse_line(line)
-    if not pl:
-        return
-
-    # Welcome => join channels + NickServ identify
-    if pl.cmd == "001":
-        for chan in bot.cfg.get("channels", []):
-            await bot.send_raw(f"JOIN {chan}")
-            await asyncio.sleep(0.7)
-        if bot.cfg.get("nickserv_password"):
-            await bot.privmsg("NickServ", f"IDENTIFY {bot.cfg['nickserv_password']}")
-
-        # Optional on_ready hook for services
-        for svc in bot.dispatcher.services:
-            fn = getattr(svc, "on_ready", None)
-            if callable(fn):
-                try:
-                    await fn(bot)
-                except Exception:
-                    logging.getLogger("leobot.dispatch").exception(
-                        "Service error in on_ready (%s)", type(svc).__name__
-                    )
-        return
-
-    nick, user, host = ("", None, None)
-    if pl.prefix:
-        nick, user, host = parse_prefix(pl.prefix)
-
-    cmd = pl.cmd
-    params = pl.params
-
-    # PRIVMSG
-    if cmd == "PRIVMSG" and len(params) >= 2:
-        target = params[0]
-        text = params[1]
-        is_private = target.lower() == bot.cfg.get("nick", "").lower()
-        reply_target = nick if is_private else target
-        channel = None if is_private else target
-
-        ev = Event(
-            nick=nick,
-            user=user,
-            host=host,
-            target=reply_target,
-            channel=channel,
-            text=text,
-            is_private=is_private,
-            raw=line,
-            cmd=cmd,
-            params=params,
-        )
-        await bot.dispatcher.dispatch("on_privmsg", ev)
-        return
-
-    # JOIN
-    if cmd == "JOIN" and params:
-        channel = params[0]
-        ev = Event(
-            nick=nick,
-            user=user,
-            host=host,
-            target=channel,
-            channel=channel,
-            text=None,
-            is_private=False,
-            raw=line,
-            cmd=cmd,
-            params=params,
-        )
-        await bot.dispatcher.dispatch("on_join", ev)
-        return
-
-    # PART
-    if cmd == "PART" and params:
-        channel = params[0]
-        ev = Event(
-            nick=nick,
-            user=user,
-            host=host,
-            target=channel,
-            channel=channel,
-            text=params[1] if len(params) > 1 else None,
-            is_private=False,
-            raw=line,
-            cmd=cmd,
-            params=params,
-        )
-        await bot.dispatcher.dispatch("on_part", ev)
-        return
-
-    # QUIT
-    if cmd == "QUIT":
-        ev = Event(
-            nick=nick,
-            user=user,
-            host=host,
-            target=nick,
-            channel=None,
-            text=params[0] if params else None,
-            is_private=True,
-            raw=line,
-            cmd=cmd,
-            params=params,
-        )
-        await bot.dispatcher.dispatch("on_quit", ev)
-        return
-
-    # NICK
-    if cmd == "NICK" and params:
-        new_nick = params[0]
-        ev = Event(
-            nick=new_nick,
-            user=user,
-            host=host,
-            target=new_nick,
-            channel=None,
-            text=None,
-            is_private=True,
-            raw=line,
-            cmd=cmd,
-            params=params,
-            old_nick=nick,
-            new_nick=new_nick,
-        )
-        await bot.dispatcher.dispatch("on_nick", ev)
-        return
-
-    # KICK
-    if cmd == "KICK" and len(params) >= 2:
-        channel = params[0]
-        victim = params[1]
-        ev = Event(
-            nick=nick,
-            user=user,
-            host=host,
-            target=channel,
-            channel=channel,
-            text=params[2] if len(params) > 2 else None,
-            is_private=False,
-            raw=line,
-            cmd=cmd,
-            params=params,
-            victim=victim,
-            kicker=nick,
-        )
-        await bot.dispatcher.dispatch("on_kick", ev)
-        return
-
-
 async def main() -> None:
-    cfg = load_config()  # defaults to ./config/config.json
+    cfg = load_config()
     setup_logging(cfg.get("log_path"))
 
     bot = Bot(cfg)
     bot.load_services()
-
-    stop_event = asyncio.Event()
-
-    async def request_exit(msg: str) -> None:
-        bot.exit_requested = True
-        bot.quit_message = msg
-        stop_event.set()
-        await bot.shutdown(msg)
+    await bot.connect()
 
     loop = asyncio.get_running_loop()
 
-    # SIGTERM/SIGINT => stop
-    loop.add_signal_handler(signal.SIGINT, lambda: asyncio.create_task(request_exit("Shot in the head by God")))
-    loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(request_exit("Shot in the head by God")))
-
-    # SIGUSR1 => restart (systemd Restart=always will bring it back)
+    # Graceful signals
+    loop.add_signal_handler(signal.SIGINT, lambda: bot.request_exit("Shot in the head by God"))
+    loop.add_signal_handler(signal.SIGTERM, lambda: bot.request_exit("Shot in the head by God"))
     if hasattr(signal, "SIGUSR1"):
-        loop.add_signal_handler(signal.SIGUSR1, lambda: asyncio.create_task(request_exit("I'll be back, even stronger")))
+        loop.add_signal_handler(signal.SIGUSR1, lambda: bot.request_exit("I'll be back, even stronger"))
 
     backoff = int(cfg.get("reconnect_min_seconds", 2))
     backoff_max = int(cfg.get("reconnect_max_seconds", 60))
 
     while True:
-        irc = IRCClient(cfg, on_line=lambda line: handle_line(bot, line))
-        bot.irc = irc
-
         try:
-            await irc.connect()
-            await irc.run(stop_event)
+            assert bot.irc is not None
+            await bot.irc.run(bot.stop_event)
             backoff = int(cfg.get("reconnect_min_seconds", 2))
         except Exception as e:
             if not bot.exit_requested:
                 bot.quit_message = f"Internal fault: {type(e).__name__}"
-            logging.getLogger().exception("Bot crashed/disconnected: %s", e)
+            log.exception("Bot crashed/disconnected: %s", e)
 
-        # Ensure QUIT if possible
-        try:
-            await bot.shutdown(bot.quit_message)
-        finally:
-            await irc.close()
+        await bot.shutdown(bot.quit_message)
 
         if bot.exit_requested:
             break
 
-        logging.getLogger("leobot").info("Reconnecting in %ss...", backoff)
+        log.info("Reconnecting in %ss...", backoff)
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, backoff_max)
 
-        # reset loop state
-        stop_event = asyncio.Event()
-        bot._shutdown_once = False
+        # New session (fresh Bot avoids stale dispatcher/services/scheduler state)
+        bot = Bot(cfg)
+        bot.load_services()
+        await bot.connect()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except ConfigError as e:
+        logging.basicConfig(level=logging.INFO)
+        logging.error(str(e))
+        raise
