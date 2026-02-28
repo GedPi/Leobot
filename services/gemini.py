@@ -196,14 +196,14 @@ def setup(bot):
     if hasattr(bot, "register_command"):
         bot.register_command(
             "gemini",
-            min_role="user",
+            min_role="admin",
             mutating=False,
             help="Ask Gemini. Usage: !gemini <question>",
             category="Info",
         )
         bot.register_command(
             "g",
-            min_role="user",
+            min_role="admin",
             mutating=False,
             help="Alias for !gemini",
             category="Info",
