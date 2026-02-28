@@ -97,7 +97,7 @@ class GeminiService:
         timeout = int(gcfg.get("timeout_seconds", 12))
         cooldown = int(gcfg.get("cooldown_seconds", 6))
         max_chars = int(gcfg.get("max_reply_chars", 360))
-        max_tokens = int(gcfg.get("max_output_tokens", 150))
+        max_tokens = int(gcfg.get("max_output_tokens", 380))
         temperature = float(gcfg.get("temperature", 0.2))
 
         if not api_key:
