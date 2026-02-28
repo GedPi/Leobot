@@ -5,10 +5,16 @@ import json
 import logging
 import signal
 import ssl
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+
+# Ensure local packages (./services, ./system, etc.) are importable when launched by systemd.
+_BASE_DIR = str(Path(__file__).resolve().parent)
+if _BASE_DIR not in sys.path:
+    sys.path.insert(0, _BASE_DIR)
 
 CONFIG_PATH = Path("/etc/leobot/config.json")
 LOG_PATH = Path("/var/log/leobot/bot.log")
@@ -30,6 +36,7 @@ def load_config() -> dict:
         raise FileNotFoundError(
             f"Missing config at {CONFIG_PATH}. Create it before starting the service."
         )
+
     with CONFIG_PATH.open("r", encoding="utf-8") as f:
         cfg = json.load(f)
 
@@ -39,10 +46,13 @@ def load_config() -> dict:
             raise ValueError(f"Config missing required key: {k}")
 
     if not isinstance(cfg["channels"], list) or not cfg["channels"]:
-        raise ValueError("Config 'channels' must be a non-empty list (e.g. ['#test']).")
+        raise ValueError("Config 'channels' must be a non-empty list (e.g. ['#general']).")
 
     if not isinstance(cfg["services"], list) or not cfg["services"]:
-        raise ValueError("Config 'services' must be a non-empty list (e.g. ['services.acl', 'services.help']).")
+        raise ValueError(
+            "Config 'services' must be a non-empty list (e.g. ['acl', 'help', 'weather'] "
+            "or fully-qualified like ['services.greet', 'system.acl'])."
+        )
 
     cfg.setdefault("use_tls", True)
     cfg.setdefault("verify_tls", True)
@@ -59,8 +69,8 @@ class Event:
     nick: str
     user: str | None
     host: str | None
-    target: str            # where bot should reply (channel or PM nick)
-    channel: str | None    # channel if applicable
+    target: str  # where bot should reply (channel or PM nick)
+    channel: str | None  # channel if applicable
     text: str | None
     is_private: bool
     raw: str
@@ -91,12 +101,13 @@ class IRCBot:
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
         self.stop_event = asyncio.Event()
+
         # Shutdown/exit semantics
         self.quit_message: str = "Shutting down"
         self.exit_requested: bool = False  # stop/restart requested via signal
         self._shutdown_once: bool = False
 
-        # ACL service will set this in its setup()
+        # Optional ACL hook: set by acl.setup(bot)
         self.acl = None
 
     def register_command(
@@ -147,13 +158,52 @@ class IRCBot:
             msg = msg[limit:]
         yield msg
 
+    def _import_service(self, name: str):
+        """Import a service module by name.
+
+        Supports:
+          - "greet"            -> tries services.greet then system.greet
+          - "services.greet"   -> tries that, then system.greet
+          - "system.acl"       -> tries that directly
+
+        This matches your repo layout where some modules are under ./services
+        and some are under ./system.
+        """
+        name = (name or "").strip()
+        if not name:
+            raise ModuleNotFoundError("empty service module name")
+
+        candidates: list[str] = []
+
+        if "." in name:
+            candidates.append(name)
+            # Friendly fallback between packages if config uses "services.*" or "system.*"
+            if name.startswith("services."):
+                candidates.append("system." + name.split(".", 1)[1])
+            elif name.startswith("system."):
+                candidates.append("services." + name.split(".", 1)[1])
+        else:
+            candidates.append(f"services.{name}")
+            candidates.append(f"system.{name}")
+
+        last_exc: Exception | None = None
+        for modname in candidates:
+            try:
+                return importlib.import_module(modname)
+            except ModuleNotFoundError as e:
+                last_exc = e
+                continue
+
+        assert last_exc is not None
+        raise last_exc
+
     def load_services(self) -> None:
         self.services = []
-        for modname in self.cfg.get("services", []):
-            self.log.info("Loading service: %s", modname)
-            mod = importlib.import_module(modname)
+        for name in self.cfg.get("services", []):
+            self.log.info("Loading service: %s", name)
+            mod = self._import_service(str(name))
             if not hasattr(mod, "setup"):
-                raise RuntimeError(f"Service module {modname} has no setup(bot)")
+                raise RuntimeError(f"Service module {mod.__name__} has no setup(bot)")
             svc = mod.setup(self)
             if svc is not None:
                 self.services.append(svc)
@@ -227,6 +277,7 @@ class IRCBot:
                 await asyncio.sleep(0.7)
             if self.cfg.get("nickserv_password"):
                 await self.privmsg("NickServ", f"IDENTIFY {self.cfg['nickserv_password']}")
+
             # notify services
             for svc in self.services:
                 fn = getattr(svc, "on_ready", None)
@@ -266,31 +317,90 @@ class IRCBot:
 
         if cmd == "JOIN" and params:
             channel = params[0]
-            ev = Event(nick=nick, user=user, host=host, target=channel, channel=channel, text=None, is_private=False, raw=line, cmd=cmd, params=params)
+            ev = Event(
+                nick=nick,
+                user=user,
+                host=host,
+                target=channel,
+                channel=channel,
+                text=None,
+                is_private=False,
+                raw=line,
+                cmd=cmd,
+                params=params,
+            )
             await self.dispatch("on_join", ev)
             return
 
         if cmd == "PART" and params:
             channel = params[0]
-            ev = Event(nick=nick, user=user, host=host, target=channel, channel=channel, text=params[1] if len(params) > 1 else None, is_private=False, raw=line, cmd=cmd, params=params)
+            ev = Event(
+                nick=nick,
+                user=user,
+                host=host,
+                target=channel,
+                channel=channel,
+                text=params[1] if len(params) > 1 else None,
+                is_private=False,
+                raw=line,
+                cmd=cmd,
+                params=params,
+            )
             await self.dispatch("on_part", ev)
             return
 
         if cmd == "QUIT":
-            ev = Event(nick=nick, user=user, host=host, target=nick, channel=None, text=params[0] if params else None, is_private=True, raw=line, cmd=cmd, params=params)
+            ev = Event(
+                nick=nick,
+                user=user,
+                host=host,
+                target=nick,
+                channel=None,
+                text=params[0] if params else None,
+                is_private=True,
+                raw=line,
+                cmd=cmd,
+                params=params,
+            )
             await self.dispatch("on_quit", ev)
             return
 
         if cmd == "NICK" and params:
             new_nick = params[0]
-            ev = Event(nick=new_nick, user=user, host=host, target=new_nick, channel=None, text=None, is_private=True, raw=line, cmd=cmd, params=params, old_nick=nick, new_nick=new_nick)
+            ev = Event(
+                nick=new_nick,
+                user=user,
+                host=host,
+                target=new_nick,
+                channel=None,
+                text=None,
+                is_private=True,
+                raw=line,
+                cmd=cmd,
+                params=params,
+                old_nick=nick,
+                new_nick=new_nick,
+            )
             await self.dispatch("on_nick", ev)
             return
 
         if cmd == "KICK" and len(params) >= 2:
             channel = params[0]
             victim = params[1]
-            ev = Event(nick=nick, user=user, host=host, target=channel, channel=channel, text=params[2] if len(params) > 2 else None, is_private=False, raw=line, cmd=cmd, params=params, victim=victim, kicker=nick)
+            ev = Event(
+                nick=nick,
+                user=user,
+                host=host,
+                target=channel,
+                channel=channel,
+                text=params[2] if len(params) > 2 else None,
+                is_private=False,
+                raw=line,
+                cmd=cmd,
+                params=params,
+                victim=victim,
+                kicker=nick,
+            )
             await self.dispatch("on_kick", ev)
             return
 
@@ -314,14 +424,7 @@ class IRCBot:
                     self.log.exception("Service error in %s (%s)", hook, type(svc).__name__)
 
     async def shutdown(self, quit_message: Optional[str] = None) -> None:
-        """Gracefully shut down the IRC connection.
-
-        - Sets stop_event so run-loop exits.
-        - Best-effort sends QUIT with a message.
-        - Closes the writer.
-
-        This is idempotent; repeated calls are ignored after the first.
-        """
+        """Gracefully shut down the IRC connection (idempotent)."""
         if self._shutdown_once:
             return
         self._shutdown_once = True
@@ -330,6 +433,10 @@ class IRCBot:
         msg = (quit_message or self.quit_message or "Shutting down").strip()
         if not msg:
             msg = "Shutting down"
+
+        # Keep QUIT reason short-ish to avoid server truncation/odd formatting.
+        if len(msg) > 220:
+            msg = msg[:220]
 
         try:
             if self.writer:
@@ -382,6 +489,8 @@ async def main():
 
         logging.info("Reconnecting in %ss...", backoff)
         await asyncio.sleep(backoff)
+
+        # reset for next connection attempt
         bot.stop_event = asyncio.Event()
         bot._shutdown_once = False
         backoff = min(backoff * 2, backoff_max)
