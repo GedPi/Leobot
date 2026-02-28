@@ -1,14 +1,19 @@
 import asyncio
 import json
 import time
+import logging
 import urllib.request
-from typing import Optional
+import urllib.error
+import ssl
 
-UA = "LeonidasIRCbot/1.0 (https://hairyoctopus.net; admin: Ged)"
+log = logging.getLogger(__name__)
+
+UA = "LeonidasIRCbot/1.0"
 
 
 def _http_post_json(url: str, payload: dict, timeout: int) -> dict:
     data = json.dumps(payload).encode("utf-8")
+
     req = urllib.request.Request(
         url,
         data=data,
@@ -19,8 +24,10 @@ def _http_post_json(url: str, payload: dict, timeout: int) -> dict:
         },
         method="POST",
     )
+
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8", errors="replace"))
+        body = r.read().decode("utf-8", errors="replace")
+        return json.loads(body)
 
 
 async def _post_json(url: str, payload: dict, timeout: int) -> dict:
@@ -28,34 +35,44 @@ async def _post_json(url: str, payload: dict, timeout: int) -> dict:
     return await loop.run_in_executor(None, _http_post_json, url, payload, timeout)
 
 
-def _clean_one_paragraph(s: str) -> str:
-    s = (s or "").replace("\r", " ").replace("\n", " ").strip()
-    # collapse whitespace
-    while "  " in s:
-        s = s.replace("  ", " ")
-    return s
-
-
 class GeminiService:
     def __init__(self, cfg: dict):
         self.cfg = cfg or {}
-        self.cooldown = {}  # (target, cmd) -> until_epoch
+        self.cooldowns = {}  # (target) -> timestamp
 
-    def _cooldown_ok(self, target: str, cmd: str, seconds: int) -> bool:
-        now = time.time()
-        k = (target, cmd)
-        until = self.cooldown.get(k, 0)
-        if now < until:
-            return False
-        self.cooldown[k] = now + seconds
-        return True
-
-    def _cfg(self, bot) -> dict:
+    def _cfg(self, bot):
         return bot.cfg.get("gemini", {}) if isinstance(bot.cfg, dict) else {}
 
-    async def on_privmsg(self, bot, ev) -> None:
+    def _cooldown_ok(self, target: str, seconds: int) -> bool:
+        now = time.time()
+        until = self.cooldowns.get(target, 0)
+        if now < until:
+            return False
+        self.cooldowns[target] = now + seconds
+        return True
+
+    def _extract_text(self, data: dict) -> str:
+        try:
+            candidates = data.get("candidates", [])
+            if not candidates:
+                return ""
+
+            content = candidates[0].get("content", {})
+            parts = content.get("parts", [])
+
+            texts = []
+            for p in parts:
+                if isinstance(p, dict) and "text" in p:
+                    texts.append(p["text"].strip())
+
+            return " ".join(t for t in texts if t)
+        except Exception:
+            return ""
+
+    async def on_privmsg(self, bot, ev):
         prefix = bot.cfg.get("command_prefix", "!")
         text = (ev.text or "").strip()
+
         if not text.startswith(prefix):
             return
 
@@ -66,44 +83,48 @@ class GeminiService:
         cmd, *rest = cmdline.split(maxsplit=1)
         cmd = cmd.lower()
 
-        if cmd not in ("gemini", "gamini", "g"):  # support your typo + short alias
+        if cmd not in ("gemini", "g", "gamini"):
             return
 
-        q = rest[0].strip() if rest else ""
-        if not q:
+        question = rest[0].strip() if rest else ""
+        if not question:
             await bot.privmsg(ev.target, f"{ev.nick}: usage: !gemini <question>")
             return
 
         gcfg = self._cfg(bot)
         api_key = (gcfg.get("api_key") or "").strip()
-        model = (gcfg.get("model") or "gemini-1.5-flash").strip()
+        model = (gcfg.get("model") or "gemini-2.5-flash").strip()
         timeout = int(gcfg.get("timeout_seconds", 12))
-        cd = int(gcfg.get("cooldown_seconds", 6))
+        cooldown = int(gcfg.get("cooldown_seconds", 6))
         max_chars = int(gcfg.get("max_reply_chars", 360))
-        max_tokens = int(gcfg.get("max_output_tokens", 200))
-        temperature = float(gcfg.get("temperature", 0.3))
+        max_tokens = int(gcfg.get("max_output_tokens", 150))
+        temperature = float(gcfg.get("temperature", 0.2))
 
         if not api_key:
-            await bot.privmsg(ev.target, f"{ev.nick}: Gemini not configured (missing gemini.api_key).")
+            await bot.privmsg(ev.target, f"{ev.nick}: Gemini not configured.")
             return
 
-        # mild flood control in channels
         if not ev.is_private:
-            if not self._cooldown_ok(ev.target, "gemini", cd):
+            if not self._cooldown_ok(ev.target, cooldown):
                 await bot.privmsg(ev.target, f"{ev.nick}: slow down.")
                 return
 
-        # Gemini API endpoint (Generative Language API)
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-
-        # Keep the model on rails: short, direct, one paragraph.
-        system_hint = (
-            "Give a short, direct answer in 2 sentences max."
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/"
+            f"models/{model}:generateContent?key={api_key}"
         )
 
         payload = {
             "contents": [
-                {"role": "user", "parts": [{"text": f"{system_hint}\n\nQuestion: {q}"}]}
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "text": "Give a short, direct answer in no more than two sentences.\n\n"
+                                    f"{question}"
+                        }
+                    ],
+                }
             ],
             "generationConfig": {
                 "temperature": temperature,
@@ -111,28 +132,59 @@ class GeminiService:
             },
         }
 
+        log.info("Gemini request model=%s target=%s", model, ev.target)
+
         try:
-            data = await _post_json(url, payload, timeout=timeout)
-        except Exception:
-            await bot.privmsg(ev.target, f"{ev.nick}: Gemini request failed.")
+            data = await _post_json(url, payload, timeout)
+
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
+
+            log.error("Gemini HTTP %s body=%s", e.code, body[:800])
+
+            if e.code == 400:
+                await bot.privmsg(ev.target, f"{ev.nick}: Gemini bad request (model/key issue).")
+            elif e.code == 401 or e.code == 403:
+                await bot.privmsg(ev.target, f"{ev.nick}: Gemini authentication error.")
+            elif e.code == 404:
+                await bot.privmsg(ev.target, f"{ev.nick}: Gemini model not found.")
+            elif e.code == 429:
+                await bot.privmsg(ev.target, f"{ev.nick}: Gemini rate limited.")
+            else:
+                await bot.privmsg(ev.target, f"{ev.nick}: Gemini HTTP error {e.code}.")
             return
 
-        # Extract text (best-effort across response shapes)
-        answer: Optional[str] = None
-        try:
-            cands = data.get("candidates") or []
-            if cands:
-                content = (cands[0].get("content") or {})
-                parts = content.get("parts") or []
-                if parts and isinstance(parts[0], dict):
-                    answer = parts[0].get("text")
-        except Exception:
-            answer = None
+        except urllib.error.URLError as e:
+            log.error("Gemini network error: %r", e.reason)
+            await bot.privmsg(ev.target, f"{ev.nick}: Gemini network error.")
+            return
 
-        answer = _clean_one_paragraph(answer or "")
+        except ssl.SSLError as e:
+            log.error("Gemini TLS error: %r", e)
+            await bot.privmsg(ev.target, f"{ev.nick}: Gemini TLS error.")
+            return
+
+        except Exception:
+            log.exception("Gemini unexpected error")
+            await bot.privmsg(ev.target, f"{ev.nick}: Gemini internal error.")
+            return
+
+        # Parse response
+        answer = self._extract_text(data)
+
         if not answer:
-            await bot.privmsg(ev.target, f"{ev.nick}: Gemini returned no answer.")
+            log.warning("Gemini returned empty text. Raw keys=%s", list(data.keys()))
+            await bot.privmsg(ev.target, f"{ev.nick}: Gemini returned no usable text.")
             return
+
+        # Clean + truncate
+        answer = answer.replace("\n", " ").replace("\r", " ").strip()
+        while "  " in answer:
+            answer = answer.replace("  ", " ")
 
         if len(answer) > max_chars:
             answer = answer[: max_chars - 1].rstrip() + "…"
@@ -141,12 +193,20 @@ class GeminiService:
 
 
 def setup(bot):
-    # Register for help + ACL like your other modules
     if hasattr(bot, "register_command"):
-        bot.register_command("gemini", min_role="user", mutating=False, help="Ask Gemini. Usage: !gemini <question>", category="Info")
-        bot.register_command("g", min_role="user", mutating=False, help="Alias for !gemini", category="Info")
-    if getattr(bot, "acl", None) is not None and hasattr(bot.acl, "register"):
-        bot.acl.register("gemini", min_role="user", mutating=False, help="Ask Gemini. Usage: !gemini <question>", category="Info")
-        bot.acl.register("g", min_role="user", mutating=False, help="Alias for !gemini", category="Info")
+        bot.register_command(
+            "gemini",
+            min_role="user",
+            mutating=False,
+            help="Ask Gemini. Usage: !gemini <question>",
+            category="Info",
+        )
+        bot.register_command(
+            "g",
+            min_role="user",
+            mutating=False,
+            help="Alias for !gemini",
+            category="Info",
+        )
 
-    return GeminiService(bot.cfg.get("gemini", {}) if isinstance(bot.cfg, dict) else {})
+    return GeminiService(bot.cfg.get("gemini", {}))
