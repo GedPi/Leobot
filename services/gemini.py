@@ -189,7 +189,7 @@ class GeminiService:
         if len(answer) > max_chars:
             answer = answer[: max_chars - 1].rstrip() + "…"
 
-        await bot.privmsg(ev.target, f"GEMINI: {answer}")
+        await bot.privmsg(ev.target, f"{answer}")
 
 
 def setup(bot):
