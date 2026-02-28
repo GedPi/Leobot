@@ -1,0 +1,53 @@
+{
+  "server": "irc.example.net",
+  "port": 6697,
+  "use_tls": true,
+  "verify_tls": true,
+
+  "password": null,
+  "nickserv_password": null,
+
+  "nick": "Leonidas",
+  "user": "leobot",
+  "realname": "Leonidas IRC Bot",
+
+  "channels": ["#General"],
+  "command_prefix": "!",
+
+  "reconnect_min_seconds": 2,
+  "reconnect_max_seconds": 60,
+
+  "acl": {
+    "admins": [
+      { "mask": "YourNick!*@your.host", "pass_sha256": "<sha256-of-password>" }
+    ],
+    "contributors": [],
+    "users": ["*!*@example.com"],
+    "guest_allowed": {
+      "commands": ["help", "commands", "eightball", "8ball"]
+    }
+  },
+
+  "services": [
+    "services.eightball",
+    "services.gemini",
+    "services.greet",
+    "services.weather",
+    "services.wiki",
+    "services.news",
+    "services.logging",
+    "services.lastseen",
+    "services.stats",
+    "services.maintenance",
+    "services.sysmon"
+  ],
+
+  "news": {
+    "default_limit": 5,
+    "max_limit": 10,
+    "cache_ttl_seconds": 3600,
+    "cooldown_seconds": 120,
+    "line_delay_seconds": 1.2,
+    "selection_timeout_seconds": 60
+  }
+}

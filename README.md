@@ -1,31 +1,53 @@
-# Leobot (Leonidas IRC Bot)
+# Leonidas IRC Bot (Leobot)
 
-Python IRC bot with a modular service/plugin architecture.
+A modular, SQLite-backed IRC bot built in Python, with a clean separation between **core system runtime** and **pluggable services**.
 
-## Layout on server (current)
-- Runtime code: `/opt/leobot`
-- Virtualenv: `/opt/leobot/venv`
-- Config: `/etc/leobot/config.json`
-- Logs: `/var/log/leobot/bot.log`
-- State: `/var/lib/leobot/` (SQLite DB, watchlists, greetings, health snapshots, etc.)
+## Key design points
 
-The systemd unit runs as user `leobot` and allows writes only to `/var/log/leobot` and `/var/lib/leobot`.
+- **Core runtime lives in `system/`** (connection, dispatcher, ACL, help, scheduler, store).
+- **Services live in `services/`** (weather, news, greet, stats, etc.).
+- **All bot state is persisted in SQLite** at `data/leonidas.db`.
+- **Services are disabled by default** and enabled per channel via commands.
+- **Local config is not committed**: `config/config.json` is gitignored.
 
-## Development workflow (recommended)
-- Dev + git: `~/Leobot` (owned by your user)
-- Deploy target: `/opt/leobot` (owned by `leobot`)
+---
 
-### Deploy (mirror dev tree to runtime)
-```bash
-cd ~/Leobot
+## Project structure
 
-sudo rsync -a --delete \
-  --exclude '.git/' \
-  --exclude 'venv/' \
-  --exclude '__pycache__/' \
-  --exclude 'config.json' \
-  ./ /opt/leobot/
+```text
+Leobot/
+  bot.py
 
-sudo chown -R leobot:leobot /opt/leobot
-sudo systemctl restart leobot.service
-sudo systemctl --no-pager --full status leobot.service
+  config/
+    config.json              (local only, gitignored)
+    config.example.json      (committed template)
+
+  data/
+    leonidas.db              (created on first run, gitignored)
+
+  system/
+    config.py                config I/O + validation
+    logging_setup.py         logging setup
+    types.py                 shared dataclasses / protocols
+    irc_parse.py             IRC parsing + chunking helpers
+    irc_client.py            connection + send/recv loop
+    dispatcher.py            event dispatch + middleware ordering
+    scheduler.py             background job runner
+    store.py                 SQLite persistence facade
+    migrations.py            schema bootstrap + migrations
+    acl.py                   core ACL/auth middleware + commands
+    help.py                  core help/commands output
+    servicectl.py            core service enable/disable commands
+
+  services/
+    eightball.py
+    gemini.py
+    greet.py
+    weather.py
+    wiki.py
+    news.py
+    logging.py
+    lastseen.py
+    stats.py
+    maintenance.py
+    sysmon.py
