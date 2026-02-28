@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
+from typing import Iterable
 
 log = logging.getLogger("leobot.migrations")
 
@@ -13,6 +14,14 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
         (name,),
     )
     return cur.fetchone() is not None
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return {str(r[1]) for r in rows}
+    except Exception:
+        return set()
 
 
 def get_schema_version(conn: sqlite3.Connection) -> int:
@@ -32,7 +41,7 @@ def set_schema_version(conn: sqlite3.Connection, v: int) -> None:
 
 
 def migrate_v1(conn: sqlite3.Connection) -> None:
-    # Core meta + settings
+    # Core meta + settings + initial services/tables
     conn.executescript(
         """
         PRAGMA foreign_keys=ON;
@@ -149,7 +158,7 @@ def migrate_v1(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_greet_cooldowns_until ON greet_cooldowns(until_ts);
 
-        -- Weather
+        -- Weather (v1 legacy shape; upgraded in v2)
         CREATE TABLE IF NOT EXISTS weather_watches (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           city TEXT NOT NULL,
@@ -231,16 +240,203 @@ def migrate_v1(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('created_ts', ?)", (str(now),))
 
 
+def migrate_v2(conn: sqlite3.Connection) -> None:
+    """
+    Weather schema upgrade:
+      - add weather_locations cache
+      - replace weather_watches with channel-targeted due-scheduling model
+      - replace weather_alert_state fingerprint column name
+    """
+    now = int(time.time())
+
+    # Create location cache (safe to do regardless)
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS weather_locations (
+          query TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          country TEXT,
+          country_code TEXT,
+          lat REAL NOT NULL,
+          lon REAL NOT NULL,
+          created_ts INTEGER NOT NULL,
+          updated_ts INTEGER NOT NULL
+        );
+        """
+    )
+
+    # Determine if weather_watches is already v2
+    w_cols = _columns(conn, "weather_watches")
+    already_v2 = "target_channel" in w_cols and "next_check_ts" in w_cols and "interval_seconds" in w_cols
+
+    if already_v2:
+        # Ensure alert_state is v2-ish
+        a_cols = _columns(conn, "weather_alert_state")
+        if "last_fingerprint" not in a_cols:
+            # Rebuild weather_alert_state with correct column name
+            conn.executescript(
+                """
+                PRAGMA foreign_keys=OFF;
+
+                ALTER TABLE weather_alert_state RENAME TO weather_alert_state_old;
+
+                CREATE TABLE weather_alert_state (
+                  watch_id INTEGER PRIMARY KEY REFERENCES weather_watches(id) ON DELETE CASCADE,
+                  last_alert_ts INTEGER,
+                  last_fingerprint TEXT
+                );
+
+                INSERT INTO weather_alert_state(watch_id,last_alert_ts,last_fingerprint)
+                  SELECT watch_id,last_alert_ts,last_alert_fingerprint FROM weather_alert_state_old;
+
+                DROP TABLE weather_alert_state_old;
+
+                PRAGMA foreign_keys=ON;
+                """
+            )
+        return
+
+    # Rebuild weather_watches and weather_alert_state
+    conn.executescript(
+        """
+        PRAGMA foreign_keys=OFF;
+
+        ALTER TABLE weather_watches RENAME TO weather_watches_old;
+        """
+    )
+
+    # New v2 weather_watches (lat/lon nullable to allow migration from legacy rows)
+    conn.executescript(
+        """
+        CREATE TABLE weather_watches (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          target_channel TEXT NOT NULL,
+          location_query TEXT NOT NULL,
+          location_name TEXT NOT NULL,
+          country TEXT,
+          country_code TEXT,
+          lat REAL,
+          lon REAL,
+          types TEXT NOT NULL,
+          interval_seconds INTEGER NOT NULL DEFAULT 900,
+          next_check_ts INTEGER NOT NULL,
+          expires_ts INTEGER NOT NULL,
+          created_ts INTEGER NOT NULL,
+          created_by TEXT,
+          enabled INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_weather_watches_enabled_nextcheck ON weather_watches(enabled, next_check_ts);
+        CREATE INDEX IF NOT EXISTS idx_weather_watches_target_channel ON weather_watches(target_channel);
+
+        -- rebuild alert state
+        """
+    )
+
+    if _table_exists(conn, "weather_alert_state"):
+        conn.executescript("ALTER TABLE weather_alert_state RENAME TO weather_alert_state_old;")
+    else:
+        # legacy might not have it (unlikely but safe)
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS weather_alert_state_old (
+              watch_id INTEGER PRIMARY KEY,
+              last_alert_ts INTEGER,
+              last_alert_fingerprint TEXT
+            );
+            """
+        )
+
+    conn.executescript(
+        """
+        CREATE TABLE weather_alert_state (
+          watch_id INTEGER PRIMARY KEY REFERENCES weather_watches(id) ON DELETE CASCADE,
+          last_alert_ts INTEGER,
+          last_fingerprint TEXT
+        );
+        """
+    )
+
+    # Migrate legacy rows:
+    # - We don't know target channel from v1, so set target_channel='' and DISABLE them (enabled=0)
+    # - next_check_ts -> now
+    # - location_query -> city[, country]
+    # - location_name -> city[, country]
+    # - interval_seconds -> interval_minutes * 60
+    # - expires_ts/created_ts/created_by carry over
+    conn.execute(
+        """
+        INSERT INTO weather_watches(
+          id, target_channel, location_query, location_name, country, country_code, lat, lon,
+          types, interval_seconds, next_check_ts, expires_ts, created_ts, created_by, enabled
+        )
+        SELECT
+          id,
+          '' as target_channel,
+          CASE
+            WHEN country IS NOT NULL AND TRIM(country) <> '' THEN (city || ', ' || country)
+            ELSE city
+          END as location_query,
+          CASE
+            WHEN country IS NOT NULL AND TRIM(country) <> '' THEN (city || ', ' || country)
+            ELSE city
+          END as location_name,
+          country,
+          NULL as country_code,
+          lat,
+          lon,
+          types,
+          CAST(interval_minutes AS INTEGER) * 60 as interval_seconds,
+          ? as next_check_ts,
+          expires_ts,
+          created_ts,
+          created_by,
+          0 as enabled
+        FROM weather_watches_old
+        """,
+        (int(now),),
+    )
+
+    # Migrate alert state (watch_id ids should match)
+    a_cols_old = _columns(conn, "weather_alert_state_old")
+    if "last_alert_fingerprint" in a_cols_old:
+        conn.execute(
+            """
+            INSERT INTO weather_alert_state(watch_id,last_alert_ts,last_fingerprint)
+              SELECT watch_id,last_alert_ts,last_alert_fingerprint FROM weather_alert_state_old
+            """
+        )
+    elif "last_fingerprint" in a_cols_old:
+        conn.execute(
+            """
+            INSERT INTO weather_alert_state(watch_id,last_alert_ts,last_fingerprint)
+              SELECT watch_id,last_alert_ts,last_fingerprint FROM weather_alert_state_old
+            """
+        )
+
+    conn.executescript(
+        """
+        DROP TABLE weather_alert_state_old;
+        DROP TABLE weather_watches_old;
+
+        PRAGMA foreign_keys=ON;
+        """
+    )
+
+
 MIGRATIONS = {
     1: migrate_v1,
+    2: migrate_v2,
 }
 
 
 def apply_migrations(conn: sqlite3.Connection) -> None:
     current = get_schema_version(conn)
     target = max(MIGRATIONS.keys()) if MIGRATIONS else 0
+
     if current == 0:
-        log.info("Bootstrapping new database schema (v1)")
+        log.info("Bootstrapping new database schema (v1+)")
+
     if current >= target:
         return
 
