@@ -80,7 +80,7 @@ class GeminiService:
         timeout = int(gcfg.get("timeout_seconds", 12))
         cd = int(gcfg.get("cooldown_seconds", 6))
         max_chars = int(gcfg.get("max_reply_chars", 360))
-        max_tokens = int(gcfg.get("max_output_tokens", 120))
+        max_tokens = int(gcfg.get("max_output_tokens", 200))
         temperature = float(gcfg.get("temperature", 0.3))
 
         if not api_key:
@@ -98,8 +98,7 @@ class GeminiService:
 
         # Keep the model on rails: short, direct, one paragraph.
         system_hint = (
-            "Answer in ONE short paragraph. Be direct. No lists unless unavoidable. "
-            "No preamble. No disclaimers. Max ~3 sentences."
+            "Give a short, direct answer in 2 sentences max."
         )
 
         payload = {
