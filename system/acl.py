@@ -17,7 +17,9 @@ _STATUS_DIGITS = {"0", "1", "2", "3"}
 
 # Your log showed NickServ replying right around 3s.
 # Give it breathing room.
-NICKSERV_STATUS_TIMEOUT = 6.0
+NICKSERV_STATUS_TIMEOUT = 8.0
+NICKSERV_STATUS_GRACE = 0.75  # seconds
+NICKSERV_STATUS_GRACE_POLL = 0.05  # seconds
 
 # Cache NickServ STATUS results briefly to avoid races and reduce traffic.
 NICKSERV_STATUS_CACHE_TTL = 60  # seconds
@@ -362,47 +364,56 @@ class ACL:
 
         return False
 
-    async def nickserv_status(self, bot, nick: str, timeout: float = NICKSERV_STATUS_TIMEOUT) -> int | None:
-        n = (nick or "").strip()
-        if not n:
-            return None
-        key = n.lower()
+async def nickserv_status(self, bot, nick: str, timeout: float = NICKSERV_STATUS_TIMEOUT) -> int | None:
+    n = (nick or "").strip()
+    if not n:
+        return None
+    key = n.lower()
 
-        # Fast path: cache
-        cached = self._cache_get(key)
-        if cached is not None:
-            return cached
+    # Fast path: cache
+    cached = self._cache_get(key)
+    if cached is not None:
+        return cached
 
-        # If already pending, wait for it
-        fut = self._ns_pending.get(key)
-        if fut and not fut.done():
-            try:
-                return int(await asyncio.wait_for(fut, timeout=timeout))
-            except Exception:
-                # final cache check
-                cached2 = self._cache_get(key)
-                return cached2
-
-        loop = asyncio.get_running_loop()
-        fut = loop.create_future()
-        self._ns_pending[key] = fut
-
+    # If already pending, wait for it
+    fut = self._ns_pending.get(key)
+    if fut and not fut.done():
         try:
-            await bot.privmsg("NickServ", f"STATUS {n}")
+            return int(await asyncio.wait_for(fut, timeout=timeout))
         except Exception:
-            self._ns_pending.pop(key, None)
-            return None
+            # grace: allow notice to land just after timeout
+            end = time.time() + NICKSERV_STATUS_GRACE
+            while time.time() < end:
+                c = self._cache_get(key)
+                if c is not None:
+                    return c
+                await asyncio.sleep(NICKSERV_STATUS_GRACE_POLL)
+            return self._cache_get(key)
 
-        try:
-            val = await asyncio.wait_for(fut, timeout=timeout)
-            return int(val)
-        except Exception:
-            # reply may arrive just after timeout; cache covers that case
-            cached3 = self._cache_get(key)
-            return cached3
-        finally:
-            # keep pending mapping small; cache keeps the result even if late
-            self._ns_pending.pop(key, None)
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    self._ns_pending[key] = fut
+
+    try:
+        await bot.privmsg("NickServ", f"STATUS {n}")
+    except Exception:
+        self._ns_pending.pop(key, None)
+        return None
+
+    try:
+        val = await asyncio.wait_for(fut, timeout=timeout)
+        return int(val)
+    except Exception:
+        # reply may arrive just after timeout; grace polling covers that case
+        end = time.time() + NICKSERV_STATUS_GRACE
+        while time.time() < end:
+            c = self._cache_get(key)
+            if c is not None:
+                return c
+            await asyncio.sleep(NICKSERV_STATUS_GRACE_POLL)
+        return self._cache_get(key)
+    finally:
+        self._ns_pending.pop(key, None)
 
     async def _maybe_consume_nickserv_reply(self, ev: Event) -> None:
         if (ev.nick or "").strip().lower() != "nickserv":
