@@ -11,6 +11,7 @@ This file orchestrates the refactored system/* modules:
 
 Change implemented here:
   - Graceful SIGTERM/SIGINT and SIGUSR1 handling with IRC QUIT messages.
+  - Store interface validation at startup (prevents runtime contract drift).
 
 This is designed to match the repo structure you uploaded (services/* + system/*).
 """
@@ -25,7 +26,6 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
-# Ensure local packages (./services, ./system, etc.) are importable when launched by systemd.
 _BASE_DIR = str(Path(__file__).resolve().parent)
 if _BASE_DIR not in sys.path:
     sys.path.insert(0, _BASE_DIR)
@@ -52,15 +52,29 @@ class Bot:
         # Persistence
         self.store = Store(cfg.get("db_path", "./data/leonidas.db"))
 
+        # ---- STORE CONTRACT VALIDATION (added) ----
+        REQUIRED_STORE_METHODS = [
+            "get_acl_session",
+            "set_acl_session",
+            "clear_acl_session",
+            "news_list_categories",
+            "news_set_category",
+            "greet_select_target",
+            "greet_pick_greeting",
+        ]
+
+        for m in REQUIRED_STORE_METHODS:
+            if not hasattr(self.store, m):
+                raise RuntimeError(f"Store missing required method: {m}")
+        # -------------------------------------------
+
         # Core subsystems
         self.dispatcher = Dispatcher(self)
         self.scheduler = Scheduler()
         self.irc: Optional[IRCClient] = None
 
-        # Commands registry (used by Help/ACL UX)
         self.commands: dict[str, dict[str, Any]] = {}
 
-        # Core handlers
         self.acl = ACL(self.store, cfg)
         self.help = Help()
         self.servicectl = ServiceCtl()
@@ -69,17 +83,16 @@ class Bot:
         self.dispatcher.add_core_handler(self.help)
         self.dispatcher.add_core_handler(self.servicectl)
 
-        # Register core commands
         self._register_core_commands()
 
-        # Service instances added to dispatcher
         self._services: list[Any] = []
 
-        # Shutdown control
         self.stop_event = asyncio.Event()
         self.exit_requested = False
         self.quit_message = "Shutting down"
         self._shutdown_once = False
+
+    # ----- rest of file unchanged below -----
 
     # -----------------------------
     # Public helpers used by services
