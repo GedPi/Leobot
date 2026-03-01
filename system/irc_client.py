@@ -9,7 +9,6 @@ from system.irc_parse import chunk_message
 
 log = logging.getLogger("leobot.irc")
 
-
 LineHandler = Callable[[str], Awaitable[None]]
 
 
@@ -42,11 +41,13 @@ class IRCClient:
         await self.send_raw(f"USER {self.cfg['user']} 0 * :{self.cfg['realname']}")
 
     async def close(self) -> None:
+        """Best-effort close of the underlying stream."""
         try:
             if self.writer:
                 self.writer.close()
                 await self.writer.wait_closed()
         except Exception:
+            # Close is best-effort; TLS shutdown can throw on some servers.
             pass
         finally:
             self.reader = None
@@ -64,15 +65,36 @@ class IRCClient:
             await self.send_raw(f"PRIVMSG {target} :{chunk}")
 
     async def run(self, stop_event: asyncio.Event) -> None:
+        """Read loop.
+
+        During graceful shutdown, asyncio's TLS transport can raise ssl.SSLError
+        (e.g. APPLICATION_DATA_AFTER_CLOSE_NOTIFY). That is not a crash in our
+        context; it just means the peer sent data after close_notify. When we are
+        stopping, swallow and exit cleanly.
+        """
         assert self.reader is not None
+
         while not stop_event.is_set():
-            line_b = await self.reader.readline()
+            try:
+                line_b = await self.reader.readline()
+            except (ssl.SSLError, ConnectionResetError, BrokenPipeError) as e:
+                if stop_event.is_set():
+                    log.debug("Ignoring TLS/connection error during shutdown: %r", e)
+                    break
+                raise
+
             if not line_b:
+                # EOF. If we're stopping, treat as clean exit.
+                if stop_event.is_set():
+                    break
                 raise ConnectionError("Disconnected (EOF)")
+
             line = line_b.decode("utf-8", errors="ignore").rstrip("\r\n")
             log.info("<< %s", line)
+
             if line.startswith("PING "):
                 token = line.split(" ", 1)[1]
                 await self.send_raw(f"PONG {token}")
                 continue
+
             await self.on_line(line)
