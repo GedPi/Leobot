@@ -74,6 +74,16 @@ class Dispatcher:
                     except Exception:
                         log.exception("Core handler error (%s)", type(h).__name__)
 
+        # NEW: let core handlers receive NOTICE events (NickServ replies are typically NOTICE)
+        if hook == "on_notice":
+            for h in self.core_handlers:
+                fn = getattr(h, "on_notice", None)
+                if callable(fn):
+                    try:
+                        await fn(self.bot, ev)
+                    except Exception:
+                        log.exception("Core handler error in on_notice (%s)", type(h).__name__)
+
         gated_hooks = (
             "on_privmsg",
             "on_notice",
