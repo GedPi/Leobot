@@ -139,10 +139,11 @@ class Store:
             (1 if enabled else 0, now, source_id),
         )
 
-    async def news_list_categories(self, source_id: str):
-        return await self.fetchall(
-            "SELECT source_id,category,url,created_ts,updated_ts FROM news_source_categories WHERE source_id=? ORDER BY category",
-            (source_id,),
+    async def news_set_category(self, source_id: str, category: str, url: str) -> None:
+        await self.execute(
+            "INSERT INTO news_source_categories(source_id,category,url) VALUES(?,?,?) "
+            "ON CONFLICT(source_id,category) DO UPDATE SET url=excluded.url",
+            (source_id, category, url),
         )
 
     async def news_set_category(self, source_id: str, category: str, url: str) -> None:
