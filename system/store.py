@@ -260,45 +260,52 @@ class Store:
         return items[-1][0]
 
     # ---- Weather watches ----
-    async def weather_watch_create(
+
+    async def weather_watch_add(
         self,
         *,
-        channel: str,
-        name: str,
-        lat: float,
-        lon: float,
-        tz: str,
-        interval_minutes: int,
-        quiet_hours_start: int | None = None,
-        quiet_hours_end: int | None = None,
-        enabled: bool = True,
+        target_channel: str,
+        location_query: str,
+        location_name: str,
+        country: str | None = None,
+        country_code: str | None = None,
+        lat: float | None = None,
+        lon: float | None = None,
+        types_csv: str = "",
+        duration_seconds: int = 3600,
+        interval_seconds: int = 900,
         created_by: str | None = None,
-        expires_ts: int | None = None,
+        enabled: bool = True,
+        next_check_ts: int | None = None,
     ) -> int:
+        """Create a weather watch (schema v2)."""
         now = int(time.time())
+        ncheck = int(next_check_ts or now)
+        expires = now + int(duration_seconds)
+
         await self.execute(
             """
             INSERT INTO weather_watches(
-              channel,name,lat,lon,tz,interval_minutes,quiet_hours_start,quiet_hours_end,
-              enabled,created_ts,updated_ts,created_by,expires_ts,next_check_ts
+              target_channel, location_query, location_name, country, country_code, lat, lon,
+              types, interval_seconds, next_check_ts, expires_ts, created_ts, created_by, enabled
             )
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
-                channel,
-                name,
-                float(lat),
-                float(lon),
-                tz,
-                int(interval_minutes),
-                quiet_hours_start,
-                quiet_hours_end,
-                1 if enabled else 0,
-                now,
+                str(target_channel),
+                str(location_query),
+                str(location_name),
+                (str(country) if country is not None else None),
+                (str(country_code) if country_code is not None else None),
+                (float(lat) if lat is not None else None),
+                (float(lon) if lon is not None else None),
+                str(types_csv),
+                int(interval_seconds),
+                int(ncheck),
+                int(expires),
                 now,
                 created_by,
-                expires_ts,
-                now,
+                1 if enabled else 0,
             ),
         )
         row = await self.fetchone("SELECT last_insert_rowid()", ())
@@ -307,22 +314,66 @@ class Store:
     async def weather_watch_get(self, watch_id: int) -> sqlite3.Row | None:
         return await self.fetchone("SELECT * FROM weather_watches WHERE id=?", (int(watch_id),))
 
-    async def weather_watch_list(self, channel: str) -> list[sqlite3.Row]:
+    async def weather_watch_list(self, channel: str | None = None, *, target_channel: str | None = None) -> list[sqlite3.Row]:
+        """
+        List watches for a channel.
+
+        Supports both:
+          - weather_watch_list("#chan")
+          - weather_watch_list(target_channel="#chan")
+        """
+        chan = target_channel if target_channel is not None else channel
+        if not chan:
+            return []
         rows = await self.fetchall(
-            "SELECT * FROM weather_watches WHERE channel=? ORDER BY id",
-            (channel,),
+            "SELECT * FROM weather_watches WHERE target_channel=? ORDER BY id",
+            (str(chan),),
         )
         return list(rows)
 
-    async def weather_watch_set_enabled(self, watch_id: int, enabled: bool) -> None:
-        now = int(time.time())
-        await self.execute(
-            "UPDATE weather_watches SET enabled=?, updated_ts=? WHERE id=?",
-            (1 if enabled else 0, now, int(watch_id)),
-        )
+    async def weather_watch_clear(self, channel: str | None = None, *, target_channel: str | None = None) -> int:
+        """Delete all watches for a channel. Returns number of rows deleted."""
+        chan = target_channel if target_channel is not None else channel
+        if not chan:
+            return 0
+        async with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM weather_watches WHERE target_channel=?",
+                (str(chan),),
+            )
+            return int(cur.rowcount)
 
-    async def weather_watch_delete(self, watch_id: int) -> None:
-        await self.execute("DELETE FROM weather_watches WHERE id=?", (int(watch_id),))
+    async def weather_watch_delete(
+        self,
+        watch_id: int | None = None,
+        channel: str | None = None,
+        *,
+        target_channel: str | None = None,
+        watch_id_kw: int | None = None,
+    ) -> int:
+        """
+        Delete a watch by id (scoped to a channel).
+
+        Supports:
+          - weather_watch_delete(target_channel="#chan", watch_id=123)  (what weather.py uses)
+          - weather_watch_delete(123, "#chan")                          (legacy positional)
+        """
+        wid = watch_id_kw if watch_id_kw is not None else watch_id
+        chan = target_channel if target_channel is not None else channel
+        if wid is None or not chan:
+            return 0
+        async with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM weather_watches WHERE id=? AND target_channel=?",
+                (int(wid), str(chan)),
+            )
+            return int(cur.rowcount)
+
+    async def weather_watch_set_enabled(self, watch_id: int, enabled: bool) -> None:
+        await self.execute(
+            "UPDATE weather_watches SET enabled=? WHERE id=?",
+            (1 if enabled else 0, int(watch_id)),
+        )
 
     async def weather_watch_due(self, *, now_ts: int, limit: int = 10) -> list[sqlite3.Row]:
         rows = await self.fetchall(
@@ -330,7 +381,7 @@ class Store:
             SELECT * FROM weather_watches
             WHERE enabled=1
               AND next_check_ts <= ?
-              AND (expires_ts IS NULL OR expires_ts > ?)
+              AND expires_ts > ?
             ORDER BY next_check_ts ASC
             LIMIT ?
             """,
@@ -338,7 +389,7 @@ class Store:
         )
         return list(rows)
 
-    async def weather_watch_set_next_check(self, *, watch_id: int, next_check_ts: int) -> None:
+    async def weather_watch_mark_checked(self, *, watch_id: int, next_check_ts: int) -> None:
         await self.execute(
             "UPDATE weather_watches SET next_check_ts=? WHERE id=?",
             (int(next_check_ts), int(watch_id)),
