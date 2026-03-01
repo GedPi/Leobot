@@ -92,23 +92,54 @@ def _read_mem() -> Tuple[Optional[int], Optional[int]]:
         return None, None
 
 
-def _disk_lines(paths: Iterable[str]) -> list[str]:
-    out = []
-    seen = set()
-    for p in paths:
-        try:
-            p = str(p)
-            if not p:
-                continue
-            if p in seen:
-                continue
-            seen.add(p)
+def _fs_usage_for_path(path: str) -> Optional[str]:
+    """Filesystem usage (df-style) for the filesystem containing path."""
+    try:
+        usage = shutil.disk_usage(path)
+        used_pct = int(round((usage.used / usage.total) * 100.0)) if usage.total else 0
+        return f"{path} {used_pct}% ({_fmt_bytes(usage.used)}/{_fmt_bytes(usage.total)})"
+    except Exception:
+        return None
 
-            usage = shutil.disk_usage(p)
-            used_pct = int(round((usage.used / usage.total) * 100.0)) if usage.total else 0
-            out.append(f"{p} {used_pct}% ({_fmt_bytes(usage.used)}/{_fmt_bytes(usage.total)})")
-        except Exception:
+
+async def _dir_size_bytes(path: str, timeout: int = 10) -> Optional[int]:
+    """Directory size (du-style) in bytes. Uses du if available."""
+    # Prefer du because it's fast and accurate (and doesn't require walking python-side).
+    if shutil.which("du"):
+        rc, out, _ = await _run_cmd(["du", "-sb", path], timeout=timeout)
+        if rc == 0 and out.strip():
+            # output: "<bytes>\t<path>"
+            try:
+                return int(out.strip().split()[0])
+            except Exception:
+                return None
+        return None
+
+    # Fallback: walk (slower)
+    total = 0
+    try:
+        for root, dirs, files in os.walk(path):
+            for fn in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, fn))
+                except Exception:
+                    pass
+        return total
+    except Exception:
+        return None
+
+
+def _dedupe_fs_lines(lines: list[str]) -> list[str]:
+    """Deduplicate identical filesystem totals (common when multiple paths share same mount)."""
+    seen = set()
+    out = []
+    for s in lines:
+        # Deduplicate by the "(used/total)" portion
+        key = s.split("(", 1)[-1] if "(" in s else s
+        if key in seen:
             continue
+        seen.add(key)
+        out.append(s)
     return out
 
 
@@ -337,11 +368,34 @@ class SysMonService:
             return
 
         if cmd == "disk":
-            lines = _disk_lines(disk_paths)
-            if not lines:
-                await bot.privmsg(ev.target, "Disk: unknown")
+            cfg = self._cfg(bot)
+            fs_paths = cfg.get("disk_paths") or ["/"]
+            dir_paths = cfg.get("dir_sizes") or ["/opt/leobot"]
+
+            fs_lines = []
+            for p in fs_paths:
+                line = _fs_usage_for_path(str(p))
+                if line:
+                    fs_lines.append(line)
+            fs_lines = _dedupe_fs_lines(fs_lines)
+
+            dir_lines = []
+            for p in dir_paths:
+                p = str(p)
+                sz = await _dir_size_bytes(p, timeout=12)
+                if sz is not None:
+                    dir_lines.append(f"{p} {_fmt_bytes(sz)}")
+
+            msg = []
+            if fs_lines:
+                msg.append("FS: " + " | ".join(fs_lines))
+            if dir_lines:
+                msg.append("DIR: " + " | ".join(dir_lines))
+
+            if not msg:
+                await bot.privmsg(ev.target, "Disk: unavailable")
             else:
-                await bot.privmsg(ev.target, "Disk: " + " | ".join(lines))
+                await bot.privmsg(ev.target, " ; ".join(msg))
             return
 
         if cmd == "updates":
@@ -436,10 +490,23 @@ class SysMonService:
         if used is not None and total is not None:
             mem_s = f"mem {_fmt_bytes(int(used))}/{_fmt_bytes(int(total))}"
 
-        disks = _disk_lines(disk_paths)
-        disk_s = "disk ?"
-        if disks:
-            disk_s = "disk " + ", ".join(disks[:2])
+        fs_paths = cfg.get("disk_paths") or ["/"]
+        fs_lines = []
+        for p in fs_paths:
+            line = _fs_usage_for_path(str(p))
+            if line:
+                fs_lines.append(line)
+        fs_lines = _dedupe_fs_lines(fs_lines)
+
+        disk_s = "fs ?"
+        if fs_lines:
+            disk_s = "fs " + " , ".join(fs_lines[:2])
+
+        # Optional dir size (only one, keep summary short)
+        dir_paths = cfg.get("dir_sizes") or ["/opt/leobot"]
+        leobot_sz = await _dir_size_bytes(str(dir_paths[0]), timeout=8) if dir_paths else None
+        if leobot_sz is not None:
+            disk_s += f" | dir {Path(str(dir_paths[0])).name}={_fmt_bytes(leobot_sz)}"
 
         # systemd failed count
         rc, out, err = await _run_cmd(["systemctl", "--failed", "--no-legend", "--plain"], timeout=8)
