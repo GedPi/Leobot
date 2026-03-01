@@ -264,6 +264,29 @@ class Bot:
             await self.dispatcher.dispatch("on_privmsg", ev)
             return
 
+        # NOTICE (useful for posterity; same shape as PRIVMSG)
+        if cmd == "NOTICE" and len(params) >= 2:
+            target = params[0]
+            text = params[1]
+            is_private = target.lower() == (self.cfg.get("nick", "").lower())
+            reply_target = nick if is_private else target
+            channel = None if is_private else target
+
+            ev = Event(
+                nick=nick,
+                user=user,
+                host=host,
+                target=reply_target,
+                channel=channel,
+                text=text,
+                is_private=is_private,
+                raw=line,
+                cmd=cmd,
+                params=params,
+            )
+            await self.dispatcher.dispatch("on_notice", ev)
+            return
+
         # JOIN
         if cmd == "JOIN" and params:
             channel = params[0]
@@ -356,6 +379,52 @@ class Bot:
                 kicker=nick,
             )
             await self.dispatcher.dispatch("on_kick", ev)
+            return
+
+        # MODE (captures bans, ops, etc.)
+        # MODE <target> <modes> [args...]
+        if cmd == "MODE" and len(params) >= 2:
+            target = params[0]
+            mode_str = params[1]
+            mode_args = params[2:] if len(params) > 2 else []
+            detail = mode_str
+            if mode_args:
+                detail = detail + " " + " ".join(mode_args)
+
+            channel = target if target.startswith("#") else None
+            ev = Event(
+                nick=nick,
+                user=user,
+                host=host,
+                target=target,
+                channel=channel,
+                text=detail,
+                is_private=False if channel else True,
+                raw=line,
+                cmd=cmd,
+                params=params,
+            )
+            await self.dispatcher.dispatch("on_mode", ev)
+            return
+
+        # TOPIC
+        # TOPIC <channel> :<topic>
+        if cmd == "TOPIC" and len(params) >= 2:
+            channel = params[0]
+            topic = params[1]
+            ev = Event(
+                nick=nick,
+                user=user,
+                host=host,
+                target=channel,
+                channel=channel,
+                text=topic,
+                is_private=False,
+                raw=line,
+                cmd=cmd,
+                params=params,
+            )
+            await self.dispatcher.dispatch("on_topic", ev)
             return
 
     # -----------------------------

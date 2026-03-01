@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
-from typing import Iterable
 
 log = logging.getLogger("leobot.migrations")
 
@@ -76,7 +75,7 @@ def migrate_v1(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_acl_sessions_until ON acl_sessions(auth_until_ts);
 
-        -- Chat logs
+        -- Chat logs (legacy simple channel messages)
         CREATE TABLE IF NOT EXISTS messages (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           ts INTEGER NOT NULL,
@@ -242,14 +241,10 @@ def migrate_v1(conn: sqlite3.Connection) -> None:
 
 def migrate_v2(conn: sqlite3.Connection) -> None:
     """
-    Weather schema upgrade:
-      - add weather_locations cache
-      - replace weather_watches with channel-targeted due-scheduling model
-      - replace weather_alert_state fingerprint column name
+    Weather schema upgrade.
     """
     now = int(time.time())
 
-    # Create location cache (safe to do regardless)
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS weather_locations (
@@ -265,15 +260,12 @@ def migrate_v2(conn: sqlite3.Connection) -> None:
         """
     )
 
-    # Determine if weather_watches is already v2
     w_cols = _columns(conn, "weather_watches")
     already_v2 = "target_channel" in w_cols and "next_check_ts" in w_cols and "interval_seconds" in w_cols
 
     if already_v2:
-        # Ensure alert_state is v2-ish
         a_cols = _columns(conn, "weather_alert_state")
         if "last_fingerprint" not in a_cols:
-            # Rebuild weather_alert_state with correct column name
             conn.executescript(
                 """
                 PRAGMA foreign_keys=OFF;
@@ -296,7 +288,6 @@ def migrate_v2(conn: sqlite3.Connection) -> None:
             )
         return
 
-    # Rebuild weather_watches and weather_alert_state
     conn.executescript(
         """
         PRAGMA foreign_keys=OFF;
@@ -305,7 +296,6 @@ def migrate_v2(conn: sqlite3.Connection) -> None:
         """
     )
 
-    # New v2 weather_watches (lat/lon nullable to allow migration from legacy rows)
     conn.executescript(
         """
         CREATE TABLE weather_watches (
@@ -328,15 +318,12 @@ def migrate_v2(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_weather_watches_enabled_nextcheck ON weather_watches(enabled, next_check_ts);
         CREATE INDEX IF NOT EXISTS idx_weather_watches_target_channel ON weather_watches(target_channel);
-
-        -- rebuild alert state
         """
     )
 
     if _table_exists(conn, "weather_alert_state"):
         conn.executescript("ALTER TABLE weather_alert_state RENAME TO weather_alert_state_old;")
     else:
-        # legacy might not have it (unlikely but safe)
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS weather_alert_state_old (
@@ -357,13 +344,6 @@ def migrate_v2(conn: sqlite3.Connection) -> None:
         """
     )
 
-    # Migrate legacy rows:
-    # - We don't know target channel from v1, so set target_channel='' and DISABLE them (enabled=0)
-    # - next_check_ts -> now
-    # - location_query -> city[, country]
-    # - location_name -> city[, country]
-    # - interval_seconds -> interval_minutes * 60
-    # - expires_ts/created_ts/created_by carry over
     conn.execute(
         """
         INSERT INTO weather_watches(
@@ -397,7 +377,6 @@ def migrate_v2(conn: sqlite3.Connection) -> None:
         (int(now),),
     )
 
-    # Migrate alert state (watch_id ids should match)
     a_cols_old = _columns(conn, "weather_alert_state_old")
     if "last_alert_fingerprint" in a_cols_old:
         conn.execute(
@@ -424,9 +403,58 @@ def migrate_v2(conn: sqlite3.Connection) -> None:
     )
 
 
+def migrate_v3(conn: sqlite3.Connection) -> None:
+    """
+    Add canonical IRC event journal (irc_log).
+    This is the single "posterity" log that lastseen/stats will derive from.
+    """
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS irc_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts INTEGER NOT NULL,
+
+          -- NULL for global events (e.g. QUIT). For channel events, this is the channel.
+          channel TEXT,
+
+          -- Canonical event name: PRIVMSG, ACTION, NOTICE, JOIN, PART, QUIT, NICK, KICK, MODE, TOPIC, ...
+          event TEXT NOT NULL,
+
+          -- Actor (source) identity
+          actor_nick TEXT,
+          actor_user TEXT,
+          actor_host TEXT,
+          actor_userhost TEXT,
+
+          -- Target entity (victim, new nick, ban mask, mode target, etc.)
+          target TEXT,
+
+          -- Associated free text (message, quit reason, part reason, kick reason, topic text, mode args...)
+          message TEXT,
+
+          -- Human-readable rendered line (stable house format for display/export)
+          rendered TEXT NOT NULL,
+
+          -- Raw IRC line from server (verbatim)
+          raw TEXT,
+
+          -- Original IRC cmd and params (for future forensics/replay)
+          cmd TEXT,
+          params_json TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_irc_log_chan_ts ON irc_log(channel, ts);
+        CREATE INDEX IF NOT EXISTS idx_irc_log_actor_ts ON irc_log(actor_nick, ts);
+        CREATE INDEX IF NOT EXISTS idx_irc_log_target_ts ON irc_log(target, ts);
+        CREATE INDEX IF NOT EXISTS idx_irc_log_event_ts ON irc_log(event, ts);
+        """
+    )
+
+
 MIGRATIONS = {
     1: migrate_v1,
     2: migrate_v2,
+    3: migrate_v3,
 }
 
 
