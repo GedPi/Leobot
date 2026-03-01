@@ -1,53 +1,233 @@
 # Leonidas IRC Bot (Leobot)
 
-A modular, SQLite-backed IRC bot built in Python, with a clean separation between **core system runtime** and **pluggable services**.
+Leonidas is a modular, SQLite-backed IRC bot written in Python.
 
-## Key design points
+It is built around a strict separation between:
 
-- **Core runtime lives in `system/`** (connection, dispatcher, ACL, help, scheduler, store).
-- **Services live in `services/`** (weather, news, greet, stats, etc.).
-- **All bot state is persisted in SQLite** at `data/leonidas.db`.
-- **Services are disabled by default** and enabled per channel via commands.
-- **Local config is not committed**: `config/config.json` is gitignored.
+* **Core runtime** (`system/`)
+* **Pluggable services** (`services/`)
+
+The architecture is intentionally simple, deterministic, and extensible without turning into a plugin free-for-all.
 
 ---
 
-## Project structure
+## Architecture
 
-```text
+```
 Leobot/
   bot.py
 
   config/
     config.json              (local only, gitignored)
-    config.example.json      (committed template)
+    config.example.json      (template)
 
   data/
-    leonidas.db              (created on first run, gitignored)
+    leonidas.db              (created automatically)
 
-  system/
-    config.py                config I/O + validation
-    logging_setup.py         logging setup
-    types.py                 shared dataclasses / protocols
-    irc_parse.py             IRC parsing + chunking helpers
-    irc_client.py            connection + send/recv loop
-    dispatcher.py            event dispatch + middleware ordering
-    scheduler.py             background job runner
-    store.py                 SQLite persistence facade
-    migrations.py            schema bootstrap + migrations
-    acl.py                   core ACL/auth middleware + commands
-    help.py                  core help/commands output
-    servicectl.py            core service enable/disable commands
+  system/                    ← core runtime
+  services/                  ← feature modules
+```
 
-  services/
-    eightball.py
-    gemini.py
-    greet.py
-    weather.py
-    wiki.py
-    news.py
-    logging.py
-    lastseen.py
-    stats.py
-    maintenance.py
-    sysmon.py
+### Core (`system/`)
+
+Responsible for:
+
+* IRC connection and parsing
+* Event dispatch
+* Middleware ordering
+* SQLite persistence
+* Schema migrations
+* ACL / authentication
+* Help / command registry
+* Per-channel service control
+* Background scheduling
+
+The core is designed to remain stable and minimal.
+
+### Services (`services/`)
+
+Feature modules loaded from config:
+
+* `eightball`
+* `gemini`
+* `greet`
+* `weather`
+* `wiki`
+* `news`
+* `logging`
+* `lastseen`
+* `stats`
+* `sysmon`
+* `maintenance` (placeholder)
+
+Services:
+
+* Register their own commands
+* Respect ACL roles
+* Can be enabled/disabled per channel
+* Are isolated from core logic
+
+---
+
+## Design Principles
+
+* Single-process architecture
+* SQLite persistence (no external DB required)
+* Per-channel feature toggling
+* Explicit command registration
+* No hidden dynamic execution
+* Minimal blocking I/O
+* Clear separation of concerns
+
+---
+
+## Configuration
+
+Local configuration file:
+
+```
+config/config.json
+```
+
+Template:
+
+```
+config/config.example.json
+```
+
+Config is not committed to the repository.
+
+---
+
+## Database
+
+SQLite database is created automatically:
+
+```
+data/leonidas.db
+```
+
+Schema is bootstrapped via `system/migrations.py`.
+
+No external dependencies are required.
+
+---
+
+## Role System (ACL)
+
+Role hierarchy:
+
+```
+guest < user < contributor < admin
+```
+
+Features:
+
+* Mask-based role matching
+* Per-command minimum role enforcement
+* Optional daily password re-authentication for mutating commands
+* PM-only authentication flow
+
+Core commands:
+
+```
+!whoami
+!auth <password>
+```
+
+---
+
+## Service Enablement (Per Channel)
+
+Services are disabled by default per channel.
+
+Control via:
+
+```
+!service
+!services
+!service enable <service> [#channel]
+!service disable <service> [#channel]
+```
+
+Enablement state is persisted in SQLite.
+
+---
+
+## Feature Overview
+
+### Fun
+
+* `!8ball`
+* `!gemini`
+
+### Information
+
+* `!wiki`
+* `!weather`
+* `!news`
+
+### Monitoring
+
+* `!sys`
+* `!uptime`
+* `!disk`
+* `!updates`
+* `!errors`
+* `!services`
+* `!events`
+
+### Analytics
+
+* `!stats`
+* `!lastseen`
+
+### Operations
+
+* `!help`
+* `!service`
+
+---
+
+## Running
+
+1. Copy config template:
+
+   ```
+   cp config/config.example.json config/config.json
+   ```
+
+2. Edit configuration.
+
+3. Run:
+
+   ```
+   python bot.py
+   ```
+
+For production deployment, use systemd or your preferred supervisor.
+
+---
+
+## What Leonidas Is Not
+
+* Not a distributed bot cluster
+* Not a bouncer
+* Not a dynamic plugin marketplace
+* Not multi-process
+
+It is deliberately single-process, controlled, and predictable.
+
+---
+
+## Version
+
+This README reflects the first stable release of the refactored architecture (v1 baseline).
+
+---
+
+If you want, I can also produce:
+
+* A short tagline + badge section for the top
+* A minimal “enterprise-clean” README version
+* Or a more personality-driven “HairyOctopus” branded version
