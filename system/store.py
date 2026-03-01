@@ -108,52 +108,21 @@ class Store:
             (identity_key, role, int(auth_until_ts), now, now),
         )
 
-    async def prune_acl_sessions(self, now_ts: int | None = None) -> int:
-        now = int(now_ts or time.time())
-        async with self._lock:
-            cur = self._conn.execute("DELETE FROM acl_sessions WHERE auth_until_ts < ?", (now,))
-            return cur.rowcount
+    async def clear_acl_session(self, identity_key: str) -> None:
+        await self.execute("DELETE FROM acl_sessions WHERE identity_key=?", (identity_key,))
 
-    # ---- Greet selection ----
-    async def greet_select_target(self, *, nick: str, hostmask: str, userhost: str, host: str, channel: str) -> sqlite3.Row | None:
-        # Fetch enabled targets ordered by priority desc, id asc, then filter in python for AND semantics.
-        rows = await self.fetchall(
-            "SELECT * FROM greet_targets WHERE enabled=1 AND (channel IS NULL OR channel=?) ORDER BY priority DESC, id ASC",
-            (channel,),
+    # ---- News sources & categories ----
+    async def news_list_sources(self):
+        return await self.fetchall(
+            "SELECT id,name,enabled,created_ts,updated_ts FROM news_sources ORDER BY id",
+            (),
         )
-        n_l = (nick or "").strip().lower()
-        for r in rows:
-            if r["match_nick"]:
-                if r["match_nick"].strip().lower() != n_l:
-                    continue
-            if r["match_hostmask"]:
-                import fnmatch
-                if not fnmatch.fnmatch(hostmask or "", r["match_hostmask"].strip()):
-                    continue
-            if r["match_userhost"]:
-                import fnmatch
-                if not fnmatch.fnmatch(userhost or "", r["match_userhost"].strip()):
-                    continue
-            if r["match_host"]:
-                import fnmatch
-                if not fnmatch.fnmatch(host or "", r["match_host"].strip()):
-                    continue
-            return r
-        return None
-
-    async def greet_pick_greeting(self, target_id: int) -> str | None:
-        row = await self.fetchone(
-            "SELECT text FROM greetings WHERE target_id=? AND enabled=1 ORDER BY RANDOM() LIMIT 1",
-            (int(target_id),),
-        )
-        return str(row[0]) if row else None
-
-    # ---- News persistence ----
-    async def news_list_sources(self) -> list[sqlite3.Row]:
-        return await self.fetchall("SELECT id, name, enabled FROM news_sources ORDER BY name")
 
     async def news_get_source(self, source_id: str):
-        return await self.fetchone("SELECT id, name, enabled FROM news_sources WHERE id=?", (source_id,))
+        return await self.fetchone(
+            "SELECT id,name,enabled,created_ts,updated_ts FROM news_sources WHERE id=?",
+            (source_id,),
+        )
 
     async def news_upsert_source(self, source_id: str, name: str, enabled: bool = True) -> None:
         now = int(time.time())
@@ -170,148 +139,206 @@ class Store:
             (1 if enabled else 0, now, source_id),
         )
 
-    async def news_set_category(self, source_id: str, category: str, url: str) -> None:
-        await self.execute(
-            "INSERT OR REPLACE INTO news_source_categories(source_id,category,url) VALUES(?,?,?)",
-            (source_id, category, url),
-        )
-
-    async def news_list_categories(self, source_id: str) -> list[sqlite3.Row]:
+    async def news_list_categories(self, source_id: str):
         return await self.fetchall(
-            "SELECT category, url FROM news_source_categories WHERE source_id=? ORDER BY category",
+            "SELECT source_id,category,url,created_ts,updated_ts FROM news_source_categories WHERE source_id=? ORDER BY category",
             (source_id,),
         )
 
-    async def news_get_last_posted(self, channel: str, source_id: str, category: str, limit_n: int) -> int | None:
+    async def news_set_category(self, source_id: str, category: str, url: str) -> None:
+        now = int(time.time())
+        await self.execute(
+            "INSERT INTO news_source_categories(source_id,category,url,created_ts,updated_ts) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(source_id,category) DO UPDATE SET url=excluded.url, updated_ts=excluded.updated_ts",
+            (source_id, category, url, now, now),
+        )
+
+    async def news_get_last_posted(self, channel: str, source_id: str, category: str, limit: int) -> int | None:
         row = await self.fetchone(
             "SELECT last_posted_ts FROM news_posted WHERE channel=? AND source_id=? AND category=? AND limit_n=?",
-            (channel, source_id, category, int(limit_n)),
+            (channel, source_id, category, int(limit)),
         )
         return int(row[0]) if row else None
 
-    async def news_set_last_posted(self, channel: str, source_id: str, category: str, limit_n: int, ts: int | None = None) -> None:
-        t = int(ts or time.time())
+    async def news_set_last_posted(self, channel: str, source_id: str, category: str, limit: int, ts: int) -> None:
         await self.execute(
             "INSERT INTO news_posted(channel,source_id,category,limit_n,last_posted_ts) VALUES(?,?,?,?,?) "
             "ON CONFLICT(channel,source_id,category,limit_n) DO UPDATE SET last_posted_ts=excluded.last_posted_ts",
-            (channel, source_id, category, int(limit_n), t),
+            (channel, source_id, category, int(limit), int(ts)),
         )
 
-    # ---------------------------------------------------------------------
-    # Weather persistence (v2)
-    # ---------------------------------------------------------------------
+    # ---- Greet helpers ----
+    async def greet_select_target(self, *, nick: str, hostmask: str, userhost: str, host: str, channel: str) -> sqlite3.Row | None:
+        """Select the highest priority greeting target that matches this identity.
 
-    @staticmethod
-    def _norm_loc_query(q: str) -> str:
-        return " ".join((q or "").strip().split()).lower()
-
-    # ---- Weather location cache ----
-    async def weather_location_get(self, query: str) -> sqlite3.Row | None:
-        qn = self._norm_loc_query(query)
-        return await self.fetchone(
-            "SELECT query,name,country,country_code,lat,lon FROM weather_locations WHERE query=?",
-            (qn,),
+        Notes:
+        - Channel comparison is case-insensitive (so '#General' and '#general' are equivalent).
+        - match_host is intended for host-only patterns (e.g. '*.example.net').
+          Back-compat: if match_host contains '!' or '@' (looks like a mask), we match it
+          against hostmask/userhost/host so legacy/accidental patterns still work.
+        """
+        chan = (channel or "").strip()
+        rows = await self.fetchall(
+            """
+            SELECT * FROM greet_targets
+            WHERE enabled=1
+              AND (
+                channel IS NULL
+                OR channel=''
+                OR lower(channel)=lower(?)
+              )
+            ORDER BY priority DESC, id ASC
+            """,
+            (chan,),
         )
 
-    async def weather_location_upsert(
+        import fnmatch
+
+        n_l = (nick or "").strip().lower()
+        hm = (hostmask or "").strip()
+        uh = (userhost or "").strip()
+        h = (host or "").strip()
+
+        for r in rows:
+            # AND semantics across provided match_* fields
+            if r["match_nick"]:
+                if str(r["match_nick"]).strip().lower() != n_l:
+                    continue
+
+            if r["match_hostmask"]:
+                pat = str(r["match_hostmask"]).strip()
+                if not fnmatch.fnmatch(hm, pat):
+                    continue
+
+            if r["match_userhost"]:
+                pat = str(r["match_userhost"]).strip()
+                if not fnmatch.fnmatch(uh, pat):
+                    continue
+
+            if r["match_host"]:
+                pat = str(r["match_host"]).strip()
+                # Back-compat: pattern looks like a mask => match it against mask/userhost/host.
+                if ("!" in pat) or ("@" in pat):
+                    if not (fnmatch.fnmatch(hm, pat) or fnmatch.fnmatch(uh, pat) or fnmatch.fnmatch(h, pat)):
+                        continue
+                else:
+                    if not fnmatch.fnmatch(h, pat):
+                        continue
+
+            return r
+
+        return None
+
+    async def greet_pick_greeting(self, target_id: int) -> str | None:
+        # weighted random selection
+        rows = await self.fetchall(
+            "SELECT id,text,weight FROM greetings WHERE target_id=? AND enabled=1",
+            (int(target_id),),
+        )
+        if not rows:
+            return None
+
+        # deterministic-ish selection without importing random every time:
+        # sum weights, pick based on current time ticks.
+        total = 0
+        items: list[tuple[str, int]] = []
+        for r in rows:
+            w = int(r["weight"] or 1)
+            if w <= 0:
+                continue
+            total += w
+            items.append((str(r["text"]), w))
+        if total <= 0 or not items:
+            return None
+
+        pick = int(time.time() * 1000) % total
+        acc = 0
+        for txt, w in items:
+            acc += w
+            if pick < acc:
+                return txt
+        return items[-1][0]
+
+    # ---- Weather watches ----
+    async def weather_watch_create(
         self,
         *,
-        query: str,
+        channel: str,
         name: str,
         lat: float,
         lon: float,
-        country: str | None = None,
-        country_code: str | None = None,
-    ) -> None:
-        qn = self._norm_loc_query(query)
+        tz: str,
+        interval_minutes: int,
+        quiet_hours_start: int | None = None,
+        quiet_hours_end: int | None = None,
+        enabled: bool = True,
+        created_by: str | None = None,
+        expires_ts: int | None = None,
+    ) -> int:
         now = int(time.time())
         await self.execute(
-            "INSERT INTO weather_locations(query,name,country,country_code,lat,lon,created_ts,updated_ts) "
-            "VALUES(?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(query) DO UPDATE SET "
-            "name=excluded.name, country=excluded.country, country_code=excluded.country_code, "
-            "lat=excluded.lat, lon=excluded.lon, updated_ts=excluded.updated_ts",
-            (qn, name, country, country_code, float(lat), float(lon), now, now),
+            """
+            INSERT INTO weather_watches(
+              channel,name,lat,lon,tz,interval_minutes,quiet_hours_start,quiet_hours_end,
+              enabled,created_ts,updated_ts,created_by,expires_ts,next_check_ts
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                channel,
+                name,
+                float(lat),
+                float(lon),
+                tz,
+                int(interval_minutes),
+                quiet_hours_start,
+                quiet_hours_end,
+                1 if enabled else 0,
+                now,
+                now,
+                created_by,
+                expires_ts,
+                now,
+            ),
+        )
+        row = await self.fetchone("SELECT last_insert_rowid()", ())
+        return int(row[0])
+
+    async def weather_watch_get(self, watch_id: int) -> sqlite3.Row | None:
+        return await self.fetchone("SELECT * FROM weather_watches WHERE id=?", (int(watch_id),))
+
+    async def weather_watch_list(self, channel: str) -> list[sqlite3.Row]:
+        rows = await self.fetchall(
+            "SELECT * FROM weather_watches WHERE channel=? ORDER BY id",
+            (channel,),
+        )
+        return list(rows)
+
+    async def weather_watch_set_enabled(self, watch_id: int, enabled: bool) -> None:
+        now = int(time.time())
+        await self.execute(
+            "UPDATE weather_watches SET enabled=?, updated_ts=? WHERE id=?",
+            (1 if enabled else 0, now, int(watch_id)),
         )
 
-    # ---- Weather watches ----
-    async def weather_watch_add(
-        self,
-        *,
-        target_channel: str,
-        location_query: str,
-        location_name: str,
-        lat: float | None,
-        lon: float | None,
-        types_csv: str,
-        duration_seconds: int,
-        interval_seconds: int = 900,
-        created_by: str | None = None,
-        enabled: bool = True,
-        now_ts: int | None = None,
-    ) -> int:
-        now = int(now_ts or time.time())
-        expires_ts = now + int(duration_seconds)
-        next_check_ts = now  # poller will run immediately on next tick
-        async with self._lock:
-            cur = self._conn.execute(
-                "INSERT INTO weather_watches("
-                "target_channel,location_query,location_name,country,country_code,lat,lon,"
-                "types,interval_seconds,next_check_ts,expires_ts,created_ts,created_by,enabled"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    str(target_channel),
-                    str(location_query),
-                    str(location_name),
-                    None,
-                    None,
-                    lat if lat is None else float(lat),
-                    lon if lon is None else float(lon),
-                    str(types_csv),
-                    int(interval_seconds),
-                    int(next_check_ts),
-                    int(expires_ts),
-                    int(now),
-                    created_by,
-                    1 if enabled else 0,
-                ),
-            )
-            return int(cur.lastrowid)
+    async def weather_watch_delete(self, watch_id: int) -> None:
+        await self.execute("DELETE FROM weather_watches WHERE id=?", (int(watch_id),))
 
-    async def weather_watch_list(self, *, target_channel: str) -> list[sqlite3.Row]:
-        return await self.fetchall(
-            "SELECT id,target_channel,location_name,location_query,types,interval_seconds,next_check_ts,expires_ts,created_ts,created_by,enabled "
-            "FROM weather_watches WHERE target_channel=? ORDER BY id",
-            (str(target_channel),),
+    async def weather_watch_due(self, *, now_ts: int, limit: int = 10) -> list[sqlite3.Row]:
+        rows = await self.fetchall(
+            """
+            SELECT * FROM weather_watches
+            WHERE enabled=1
+              AND next_check_ts <= ?
+              AND (expires_ts IS NULL OR expires_ts > ?)
+            ORDER BY next_check_ts ASC
+            LIMIT ?
+            """,
+            (int(now_ts), int(now_ts), int(limit)),
         )
+        return list(rows)
 
-    async def weather_watch_delete(self, *, target_channel: str, watch_id: int) -> int:
-        async with self._lock:
-            cur = self._conn.execute(
-                "DELETE FROM weather_watches WHERE target_channel=? AND id=?",
-                (str(target_channel), int(watch_id)),
-            )
-            # also cascades alert state
-            return int(cur.rowcount)
-
-    async def weather_watch_clear(self, *, target_channel: str) -> int:
-        async with self._lock:
-            cur = self._conn.execute(
-                "DELETE FROM weather_watches WHERE target_channel=?",
-                (str(target_channel),),
-            )
-            return int(cur.rowcount)
-
-    async def weather_watch_due(self, *, now_ts: int | None = None, limit: int = 50) -> list[sqlite3.Row]:
-        now = int(now_ts or time.time())
-        return await self.fetchall(
-            "SELECT * FROM weather_watches "
-            "WHERE enabled=1 AND expires_ts > ? AND next_check_ts <= ? "
-            "ORDER BY next_check_ts ASC LIMIT ?",
-            (now, now, int(limit)),
-        )
-
-    async def weather_watch_mark_checked(self, *, watch_id: int, next_check_ts: int) -> None:
+    async def weather_watch_set_next_check(self, *, watch_id: int, next_check_ts: int) -> None:
         await self.execute(
             "UPDATE weather_watches SET next_check_ts=? WHERE id=?",
             (int(next_check_ts), int(watch_id)),
