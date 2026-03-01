@@ -14,9 +14,11 @@ from typing import Dict, List, Optional, Tuple
 
 log = logging.getLogger("leobot.news")
 
+UA = "Leonidas/2.0 (IRC bot; RSS reader)"
+
 
 # ----------------------------
-# Data models
+# Models
 # ----------------------------
 
 @dataclass(frozen=True)
@@ -29,23 +31,36 @@ class NewsItem:
     published_utc: Optional[datetime]
 
 
+@dataclass(frozen=True)
+class CategoryRow:
+    category: str
+    url: str
+
+
 @dataclass
 class PendingSelection:
     created_ts: float
     target: str
     limit: int
-    category: str
+    requested_category: str
+
+
+@dataclass
+class PendingCategorySelection:
+    created_ts: float
+    target: str
+    limit: int
+    source: dict
+    requested_category: str
+    categories: List[CategoryRow]
 
 
 # ----------------------------
 # Helpers: fetch + parse
 # ----------------------------
 
-UA = "Leonidas/2.0 (IRC bot; RSS reader)"
-
-
 def _fetch_url(url: str, timeout: int = 15) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
 
@@ -87,7 +102,7 @@ def _parse_rss_or_atom(xml_bytes: bytes) -> List[Tuple[str, str, Optional[dateti
     root = ET.fromstring(xml_bytes)
     out: List[Tuple[str, str, Optional[datetime]]] = []
 
-    # RSS2
+    # RSS 2.0
     channel = root.find("channel")
     if channel is not None:
         for it in channel.findall("item"):
@@ -139,12 +154,16 @@ class NewsService:
         self.line_delay = float(ncfg.get("line_delay_seconds", 1.2))
         self.selection_timeout = int(ncfg.get("selection_timeout_seconds", 60))
 
-        # cache key: (source_id, category) -> (fetched_ts, [NewsItem])
+        # cache: (source_id, category) -> (ts, items)
         self._cache: Dict[Tuple[str, str], Tuple[float, List[NewsItem]]] = {}
 
-        # pending selections: (nick, target) -> (sources list, pending selection)
-        self._pending: Dict[Tuple[str, str], Tuple[List[dict], PendingSelection]] = {}
+        # pending source selection: (nick, target) -> (sources, PendingSelection)
+        self._pending_source: Dict[Tuple[str, str], Tuple[List[dict], PendingSelection]] = {}
 
+        # pending category selection: (nick, target) -> PendingCategorySelection
+        self._pending_cat: Dict[Tuple[str, str], PendingCategorySelection] = {}
+
+        # Register commands
         bot.register_command("news", min_role="guest", mutating=False, help="Show headlines. Usage: !news [limit] [category]", category="News")
         bot.register_command("headlines", min_role="guest", mutating=False, help="Alias for !news", category="News")
 
@@ -159,7 +178,12 @@ class NewsService:
         bot.register_command("news addcat", min_role="contributor", mutating=True, help="Add/update a category URL. Usage: !news addcat <id> <category> <url>", category="News")
         bot.register_command("news delcat", min_role="contributor", mutating=True, help="Delete a category. Usage: !news delcat <id> <category>", category="News")
 
+    # ----------------------------
+    # DB-backed config helpers
+    # ----------------------------
+
     async def _allowed(self, ev) -> bool:
+        # Per-channel service enablement
         if ev.channel:
             return await self.bot.store.is_service_enabled(ev.channel, "news")
         return True
@@ -168,15 +192,26 @@ class NewsService:
         rows = await self.bot.store.news_list_sources()
         return [{"id": r["id"], "name": r["name"], "enabled": bool(r["enabled"])} for r in rows if bool(r["enabled"])]
 
-    async def _category_url(self, source_id: str, category: str) -> Optional[str]:
+    async def _list_categories(self, source_id: str) -> List[CategoryRow]:
         rows = await self.bot.store.news_list_categories(source_id)
+        out: List[CategoryRow] = []
         for r in rows:
-            if str(r["category"]).lower() == category.lower():
-                return str(r["url"])
+            out.append(CategoryRow(category=str(r["category"]), url=str(r["url"])))
+        return out
+
+    def _find_category_url(self, categories: List[CategoryRow], category: str) -> Optional[str]:
+        want = (category or "").strip().lower()
+        for r in categories:
+            if r.category.strip().lower() == want:
+                return r.url
         return None
 
+    # ----------------------------
+    # Fetch/caching
+    # ----------------------------
+
     async def _fetch_items(self, source_id: str, source_name: str, category: str, url: str) -> List[NewsItem]:
-        key = (source_id, category)
+        key = (source_id, category.lower())
         now = time.time()
         if key in self._cache:
             ts, items = self._cache[key]
@@ -189,21 +224,76 @@ class NewsService:
         self._cache[key] = (now, items)
         return items
 
-    async def _post(self, target: str, items: List[NewsItem], limit: int) -> None:
+    async def _post_items(self, target: str, items: List[NewsItem], limit: int) -> None:
         for it in items[:limit]:
             stamp = it.published_utc.strftime("%Y-%m-%d %H:%MZ ") if it.published_utc else ""
             await self.bot.privmsg(target, f"{stamp}{it.title} — {it.link}")
             await asyncio.sleep(self.line_delay)
 
-    async def _serve(self, ev, src: dict, category: str, limit: int) -> None:
-        url = await self._category_url(src["id"], category)
-        if not url:
-            await self.bot.privmsg(ev.target, f"{ev.nick}: unknown category '{category}' for {src['id']}. Use !news categories {src['id']}")
+    # ----------------------------
+    # Category resolution + prompting
+    # ----------------------------
+
+    async def _resolve_or_prompt_category(self, ev, src: dict, requested_category: str, limit: int) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Returns (category, url) if resolved.
+        Returns (None, None) if it prompted the user (or errored).
+        """
+        categories = await self._list_categories(src["id"])
+        if not categories:
+            await self.bot.privmsg(ev.target, f"{ev.nick}: no categories configured for {src['id']}. Add with !news addcat {src['id']} <category> <url>")
+            return (None, None)
+
+        # direct hit
+        url = self._find_category_url(categories, requested_category)
+        if url:
+            return (requested_category, url)
+
+        # If only one category exists: use it silently (best UX for single-feed sources)
+        if len(categories) == 1:
+            c = categories[0]
+            return (c.category, c.url)
+
+        # Try fallbacks only if present (keeps behaviour sane)
+        for fallback in ("top", "default"):
+            url2 = self._find_category_url(categories, fallback)
+            if url2:
+                return (fallback, url2)
+
+        # Otherwise: prompt category choice
+        key = (ev.nick.lower(), ev.target)
+        self._pending_cat[key] = PendingCategorySelection(
+            created_ts=time.time(),
+            target=ev.target,
+            limit=limit,
+            source=src,
+            requested_category=requested_category,
+            categories=categories,
+        )
+
+        choices = " | ".join([f"{i+1}) {c.category}" for i, c in enumerate(categories[:10])])
+        suffix = f" (+{len(categories)-10} more)" if len(categories) > 10 else ""
+        await self.bot.privmsg(
+            ev.target,
+            f"{ev.nick}: '{requested_category}' not available for {src['name']}[{src['id']}]. Pick category: {choices}{suffix} (reply 1-{min(len(categories),10)})"
+        )
+        return (None, None)
+
+    # ----------------------------
+    # Serve feed (cooldown + output)
+    # ----------------------------
+
+    async def _serve(self, ev, src: dict, requested_category: str, limit: int) -> None:
+        resolved = await self._resolve_or_prompt_category(ev, src, requested_category, limit)
+        category, url = resolved
+        if not category or not url:
             return
 
-        chan_key = ev.channel or ev.target  # persist cooldown by channel when in channel, else by nick/pm target
-        last = await self.bot.store.news_get_last_posted(chan_key, src["id"], category, limit)
+        # cooldown key: channel if in a channel, else pm target
+        chan_key = ev.channel or ev.target
         now = int(time.time())
+
+        last = await self.bot.store.news_get_last_posted(chan_key, src["id"], category, limit)
         if last and now - last < self.cooldown:
             await self.bot.privmsg(ev.target, f"{ev.nick}: cooldown active ({self.cooldown - (now - last)}s)")
             return
@@ -211,7 +301,7 @@ class NewsService:
         try:
             items = await self._fetch_items(src["id"], src["name"], category, url)
         except Exception as e:
-            log.exception("Failed to fetch news feed")
+            log.exception("Failed to fetch news feed: %s", e)
             await self.bot.privmsg(ev.target, f"{ev.nick}: failed to fetch feed ({type(e).__name__})")
             return
 
@@ -219,16 +309,39 @@ class NewsService:
             await self.bot.privmsg(ev.target, f"{ev.nick}: no items found")
             return
 
-        await self._post(ev.target, items, limit)
+        await self._post_items(ev.target, items, limit)
         await self.bot.store.news_set_last_posted(chan_key, src["id"], category, limit, ts=now)
 
+    # ----------------------------
+    # Main event handler
+    # ----------------------------
+
     async def on_privmsg(self, bot, ev):
-        # 1) pending selection flow (reply: "1")
+        # 1) pending category selection replies (reply: "1")
         key = (ev.nick.lower(), ev.target)
-        if key in self._pending:
-            sources, pending = self._pending[key]
+        if key in self._pending_cat:
+            p = self._pending_cat[key]
+            if time.time() - p.created_ts > self.selection_timeout:
+                del self._pending_cat[key]
+                await bot.privmsg(ev.target, f"{ev.nick}: selection timed out")
+                return
+
+            txt = (ev.text or "").strip()
+            if txt.isdigit():
+                idx = int(txt) - 1
+                # Only first 10 are offered (to keep it readable)
+                cats = p.categories[:10]
+                if 0 <= idx < len(cats):
+                    chosen = cats[idx]
+                    del self._pending_cat[key]
+                    await self._serve(ev, p.source, chosen.category, p.limit)
+                    return
+
+        # 2) pending source selection replies (reply: "1")
+        if key in self._pending_source:
+            sources, pending = self._pending_source[key]
             if time.time() - pending.created_ts > self.selection_timeout:
-                del self._pending[key]
+                del self._pending_source[key]
                 await bot.privmsg(ev.target, f"{ev.nick}: selection timed out")
                 return
 
@@ -237,15 +350,16 @@ class NewsService:
                 idx = int(txt) - 1
                 if 0 <= idx < len(sources):
                     src = sources[idx]
-                    del self._pending[key]
-                    await self._serve(ev, src, pending.category, pending.limit)
+                    del self._pending_source[key]
+                    await self._serve(ev, src, pending.requested_category, pending.limit)
                     return
 
-        # 2) command parsing
+        # 3) command parsing
         prefix = bot.cfg.get("command_prefix", "!")
         text = (ev.text or "").strip()
         if not text.startswith(prefix):
             return
+
         cmdline = text[len(prefix):].strip()
         if not cmdline:
             return
@@ -258,7 +372,7 @@ class NewsService:
         if not await self._allowed(ev):
             return
 
-        args = [a for a in parts[1:]]
+        args = parts[1:]
 
         # ---- management subcommands ----
         if args and args[0].lower() == "sources":
@@ -306,7 +420,7 @@ class NewsService:
                 await bot.privmsg(ev.target, f"{ev.nick}: unknown source '{sid}'")
                 return
             await bot.store.execute("DELETE FROM news_sources WHERE id=?", (sid,))
-            await bot.privmsg(ev.target, f"{ev.nick}: deleted source '{sid}' (and its categories)")
+            await bot.privmsg(ev.target, f"{ev.nick}: deleted source '{sid}'")
             return
 
         if args and args[0].lower() in ("enable", "disable"):
@@ -353,20 +467,20 @@ class NewsService:
 
         # ---- headlines ----
         limit = self.default_limit
-        category = "top"
+        requested_category = "top"
 
-        # forms supported:
+        # supported forms:
         #   !news
         #   !news 5
-        #   !news 5 sport
-        #   !news sport
+        #   !news 5 tech
+        #   !news tech
         if args:
             if args[0].isdigit():
                 limit = int(args[0])
                 if len(args) >= 2:
-                    category = args[1].lower()
+                    requested_category = args[1].lower()
             else:
-                category = args[0].lower()
+                requested_category = args[0].lower()
 
         limit = max(1, min(limit, self.max_limit))
 
@@ -375,10 +489,12 @@ class NewsService:
             await bot.privmsg(ev.target, f"{ev.nick}: no enabled news sources. Add with !news addsource ...")
             return
 
+        # If multiple sources enabled, prompt for source first.
         if len(sources) > 1:
-            self._pending[key] = (sources, PendingSelection(time.time(), ev.target, limit, category))
-            choices = " | ".join([f"{i+1}) {s['name']}[{s['id']}]" for i, s in enumerate(sources)])
-            await bot.privmsg(ev.target, f"{ev.nick}: pick source: {choices} (reply 1-{len(sources)})")
+            self._pending_source[key] = (sources, PendingSelection(time.time(), ev.target, limit, requested_category))
+            choices = " | ".join([f"{i+1}) {s['name']}[{s['id']}]" for i, s in enumerate(sources[:10])])
+            suffix = f" (+{len(sources)-10} more)" if len(sources) > 10 else ""
+            await bot.privmsg(ev.target, f"{ev.nick}: pick source: {choices}{suffix} (reply 1-{min(len(sources),10)})")
             return
 
-        await self._serve(ev, sources[0], category, limit)
+        await self._serve(ev, sources[0], requested_category, limit)
