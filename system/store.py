@@ -139,19 +139,19 @@ class Store:
             (1 if enabled else 0, now, source_id),
         )
 
+    async def news_list_categories(self, source_id: str):
+        # Table schema: (source_id, category, url)
+        return await self.fetchall(
+            "SELECT source_id, category, url FROM news_source_categories WHERE source_id=? ORDER BY category",
+            (source_id,),
+        )
+
     async def news_set_category(self, source_id: str, category: str, url: str) -> None:
+        # Table schema: (source_id, category, url)
         await self.execute(
             "INSERT INTO news_source_categories(source_id,category,url) VALUES(?,?,?) "
             "ON CONFLICT(source_id,category) DO UPDATE SET url=excluded.url",
             (source_id, category, url),
-        )
-
-    async def news_set_category(self, source_id: str, category: str, url: str) -> None:
-        now = int(time.time())
-        await self.execute(
-            "INSERT INTO news_source_categories(source_id,category,url,created_ts,updated_ts) VALUES(?,?,?,?,?) "
-            "ON CONFLICT(source_id,category) DO UPDATE SET url=excluded.url, updated_ts=excluded.updated_ts",
-            (source_id, category, url, now, now),
         )
 
     async def news_get_last_posted(self, channel: str, source_id: str, category: str, limit: int) -> int | None:
