@@ -97,10 +97,14 @@ class LoggingService:
         await self._insert(ev, "PRIVMSG", channel=ev.channel, target=None, message=clean)
 
     async def on_notice(self, bot, ev):
-        # Same policy as PRIVMSG: only channel notices (not PM notices)
-        if not ev.channel:
-            return
-        await self._insert(ev, "NOTICE", channel=ev.channel, target=None, message=(ev.text or ""))
+        # Log channel notices and global server notices.
+        await self._insert(
+            ev,
+            "NOTICE",
+            channel=ev.channel,          # None => (global)
+            target=ev.target or None,    # keep '*' or bot nick etc for forensics
+            message=(ev.text or ""),
+        )
 
     async def on_join(self, bot, ev):
         # Channel gated by dispatcher

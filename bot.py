@@ -245,9 +245,11 @@ class Bot:
         if cmd == "PRIVMSG" and len(params) >= 2:
             target = params[0]
             text = params[1]
-            is_private = target.lower() == (self.cfg.get("nick", "").lower())
-            reply_target = nick if is_private else target
-            channel = None if is_private else target
+
+            channel = target if target.startswith("#") else None
+            is_private = (target.lower() == (self.cfg.get("nick", "").lower()))
+
+            reply_target = nick if is_private else (channel or target)
 
             ev = Event(
                 nick=nick,
@@ -268,9 +270,12 @@ class Bot:
         if cmd == "NOTICE" and len(params) >= 2:
             target = params[0]
             text = params[1]
-            is_private = target.lower() == (self.cfg.get("nick", "").lower())
-            reply_target = nick if is_private else target
-            channel = None if is_private else target
+
+            channel = target if target.startswith("#") else None
+            is_private = (target.lower() == (self.cfg.get("nick", "").lower()))
+
+            # Reply target: for PM notices, reply to nick; for channel notices, reply to channel; otherwise reply nowhere (keep as target)
+            reply_target = nick if is_private else (channel or target)
 
             ev = Event(
                 nick=nick,
