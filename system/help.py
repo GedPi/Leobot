@@ -2,8 +2,38 @@ from __future__ import annotations
 
 from collections import defaultdict
 
-from system.types import Event
 from system.acl import ROLE_ORDER
+from system.types import Event
+
+
+def _split_message(s: str, *, maxlen: int = 380) -> list[str]:
+    """Split a long message into multiple IRC-safe lines."""
+    s = (s or "").strip()
+    if not s:
+        return []
+    if len(s) <= maxlen:
+        return [s]
+
+    parts = s.split(" ")
+    out: list[str] = []
+    cur = ""
+    for p in parts:
+        if not cur:
+            cur = p
+            continue
+        if len(cur) + 1 + len(p) > maxlen:
+            out.append(cur)
+            cur = p
+        else:
+            cur += " " + p
+    if cur:
+        out.append(cur)
+    return out
+
+
+async def _privmsg_split(bot, target: str, s: str, *, maxlen: int = 380) -> None:
+    for line in _split_message(s, maxlen=maxlen):
+        await bot.privmsg(target, line)
 
 
 class Help:
@@ -13,7 +43,7 @@ class Help:
         if not txt.startswith(prefix):
             return False
 
-        cmdline = txt[len(prefix):].strip()
+        cmdline = txt[len(prefix) :].strip()
         if not cmdline:
             return False
 
@@ -25,18 +55,37 @@ class Help:
 
         role = await bot.acl.effective_role(ev)
 
+        # !help <command>  OR  !help <Category>
         if cmd == "help" and len(parts) >= 2:
-            q = " ".join([p.lower() for p in parts[1:]])
+            q_raw = " ".join(parts[1:]).strip()
+            q = q_raw.lower()
+
             info = bot.commands.get(q)
-            if not info:
-                await bot.privmsg(ev.target, f"{ev.nick}: unknown command '{q}'. Try !commands")
+            if info:
+                await _privmsg_split(
+                    bot,
+                    ev.target,
+                    f"{q} — category={info['category']} | role>={info['min_role']} | mutating={info['mutating']} | {info['help'] or 'no help text'}",
+                )
                 return True
-            await bot.privmsg(
-                ev.target,
-                f"{q} — role>={info['min_role']} | mutating={info['mutating']} | {info['help'] or 'no help text'}",
-            )
+
+            # Category lookup
+            cats = defaultdict(list)
+            for name, info2 in bot.commands.items():
+                min_role = info2["min_role"]
+                if ROLE_ORDER.get(role, 0) < ROLE_ORDER.get(min_role, 0):
+                    continue
+                cats[str(info2["category"]).lower()].append(name)
+
+            if q in cats:
+                cmds = ", ".join(sorted(cats[q]))
+                await _privmsg_split(bot, ev.target, f"{ev.nick}: {q_raw} commands: {cmds}")
+                return True
+
+            await bot.privmsg(ev.target, f"{ev.nick}: unknown command/category '{q_raw}'. Try !commands")
             return True
 
+        # !commands
         cats = defaultdict(list)
         for name, info in bot.commands.items():
             min_role = info["min_role"]
@@ -44,13 +93,13 @@ class Help:
                 continue
             cats[info["category"]].append(name)
 
-        out = []
+        if not cats:
+            await bot.privmsg(ev.target, f"{ev.nick}: no commands available")
+            return True
+
+        await bot.privmsg(ev.target, f"Commands for role={role}: use !help <command> or !help <category>")
         for cat in sorted(cats.keys()):
             cmds = ", ".join(sorted(cats[cat]))
-            out.append(f"{cat}: {cmds}")
+            await _privmsg_split(bot, ev.target, f"{cat}: {cmds}")
 
-        if not out:
-            await bot.privmsg(ev.target, f"{ev.nick}: no commands available")
-        else:
-            await bot.privmsg(ev.target, f"Commands for role={role}: " + " | ".join(out))
         return True

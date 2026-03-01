@@ -3,6 +3,23 @@ from __future__ import annotations
 from system.types import Event
 
 
+def _canon_service_id(name: str) -> str:
+    n = (name or "").strip()
+    if not n:
+        return ""
+    # Accept either 'weather' or 'services.weather' / 'system.weather'
+    if "." in n:
+        n = n.split(".")[-1]
+    return n.lower()
+
+
+def _compact(items: list[str], *, limit: int = 12) -> tuple[str, int]:
+    items = [x for x in items if x]
+    if len(items) <= limit:
+        return (", ".join(items) if items else "none", 0)
+    return (", ".join(items[:limit]), len(items) - limit)
+
+
 class ServiceCtl:
     def register_commands(self, bot) -> None:
         bot.register_command(
@@ -40,7 +57,7 @@ class ServiceCtl:
         if not txt.startswith(prefix):
             return False
 
-        cmdline = txt[len(prefix):].strip()
+        cmdline = txt[len(prefix) :].strip()
         if not cmdline:
             return False
 
@@ -57,13 +74,32 @@ class ServiceCtl:
 
         if sub == "list":
             chan = ev.channel or ev.target
+
+            # Configured services (source of truth for what's "valid")
+            cfg_services = sorted(
+                {_canon_service_id(str(x)) for x in (bot.cfg.get("services", []) or []) if str(x).strip()}
+            )
+
+            # DB enablement map (explicit overrides)
             rows = await bot.store.list_service_enablement(chan)
-            if not rows:
-                await bot.privmsg(ev.target, f"{ev.nick}: services in {chan} — none enabled (default disabled).")
-                return True
-            on = [s for s, en in rows if en]
-            off = [s for s, en in rows if not en]
-            msg = f"{ev.nick}: services in {chan} — ON: {', '.join(on) if on else 'none'} | OFF: {', '.join(off) if off else 'none'}"
+            enabled_map = {str(s).lower(): bool(en) for s, en in rows}
+
+            # Union so we can show stale DB rows too
+            all_services = sorted(set(cfg_services) | set(enabled_map.keys()))
+
+            on = [s for s in all_services if enabled_map.get(s, False)]
+            off = [s for s in all_services if not enabled_map.get(s, False)]
+
+            on_s, on_more = _compact(on)
+            off_s, off_more = _compact(off)
+
+            msg = f"{ev.nick}: services in {chan} — ON: {on_s}"
+            if on_more:
+                msg += f" (+{on_more} more)"
+            msg += f" | OFF: {off_s}"
+            if off_more:
+                msg += f" (+{off_more} more)"
+
             await bot.privmsg(ev.target, msg)
             return True
 
@@ -71,9 +107,19 @@ class ServiceCtl:
             if len(parts) < 3:
                 await bot.privmsg(ev.target, f"{ev.nick}: usage: !service {sub} <service> [#channel]")
                 return True
-            svc = parts[2]
+
+            svc_in = parts[2]
+            svc = _canon_service_id(svc_in)
             chan = parts[3] if len(parts) >= 4 else (ev.channel or ev.target)
             enabled = sub == "enable"
+
+            # Validate enable operations against config
+            cfg_services = {_canon_service_id(str(x)) for x in (bot.cfg.get("services", []) or []) if str(x).strip()}
+            if enabled and svc not in cfg_services:
+                avail = ", ".join(sorted(cfg_services)) if cfg_services else "(none configured)"
+                await bot.privmsg(ev.target, f"{ev.nick}: unknown service '{svc_in}'. Available: {avail}")
+                return True
+
             await bot.store.set_service_enabled(chan, svc, enabled, updated_by=ev.nick)
             await bot.privmsg(ev.target, f"{ev.nick}: {svc} {'ENABLED' if enabled else 'DISABLED'} in {chan}")
             return True
