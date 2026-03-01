@@ -6,7 +6,6 @@ import logging
 import time
 from dataclasses import dataclass
 from fnmatch import fnmatch
-import re
 from typing import Optional
 
 from system.types import Event, Role
@@ -14,9 +13,14 @@ from system.types import Event, Role
 log = logging.getLogger("leobot.acl")
 
 ROLE_ORDER = {"guest": 0, "user": 1, "contributor": 2, "admin": 3}
-
-# Accept numeric status 0..3 in common NickServ STATUS response formats.
 _STATUS_DIGITS = {"0", "1", "2", "3"}
+
+# Your log showed NickServ replying right around 3s.
+# Give it breathing room.
+NICKSERV_STATUS_TIMEOUT = 6.0
+
+# Cache NickServ STATUS results briefly to avoid races and reduce traffic.
+NICKSERV_STATUS_CACHE_TTL = 60  # seconds
 
 
 def _sha256(s: str) -> str:
@@ -40,7 +44,6 @@ def _norm_role(s: str | None) -> Role:
     r = (s or "").strip().lower()
     if r in ("guest", "user", "contributor", "admin"):
         return r  # type: ignore[return-value]
-    # tolerate plurals/aliases
     if r == "users":
         return "user"
     if r == "contributors":
@@ -53,15 +56,8 @@ def _norm_cmd(s: str) -> str:
 
 
 def _clean_token(tok: str) -> str:
-    """
-    Normalize IRC-ish tokens for matching:
-      - lower-case
-      - strip common punctuation that appears in NickServ output: "Ged:" "Ged," etc
-    """
     t = (tok or "").strip().lower()
-    # strip leading/trailing punctuation often seen in STATUS output
-    t = t.strip(",:;.!?()[]{}<>\"'")
-    return t
+    return t.strip(",:;.!?()[]{}<>\"'")
 
 
 @dataclass(slots=True)
@@ -75,15 +71,15 @@ class ACLConfig:
 
 class ACL:
     """
-    Backwards compatible ACL (keeps !auth / session / guest allowlist) + DB ACL management commands.
+    Backwards compatible ACL + DB ACL commands.
 
-    IMPORTANT architectural detail:
-      - ACL is a CORE handler. Your bot only calls on_ready() for SERVICES.
-      - Therefore, schema creation + command registration must happen lazily from precheck()/handle_core().
-
-    CRITICAL API CONTRACTS (used elsewhere):
+    API CONTRACTS (used elsewhere):
       - help.py calls: await bot.acl.effective_role(ev)
       - dispatcher.py calls: await bot.acl.precheck(bot, ev)
+
+    NickServ:
+      - Your services reply with NOTICE (confirmed in logs).
+      - We cache parsed STATUS results to avoid timeout races.
     """
 
     def __init__(self, store, cfg: dict):
@@ -100,12 +96,15 @@ class ACL:
         # NickServ STATUS pending futures (nick_lower -> Future[int])
         self._ns_pending: dict[str, asyncio.Future] = {}
 
-        # Lazy one-time init flags
+        # NickServ STATUS cache (nick_lower -> (status:int, ts:int))
+        self._ns_cache: dict[str, tuple[int, int]] = {}
+
+        # Lazy init flags
         self._schema_ready = False
         self._commands_registered = False
         self._bootstrapped_master = False
 
-        # Store bot reference for places that only receive `ev` (e.g. help.py -> effective_role(ev))
+        # Store bot reference for callers that only provide ev (e.g. help -> effective_role(ev))
         self._bot: Optional[object] = None
 
     def _bind_bot(self, bot) -> None:
@@ -222,10 +221,6 @@ class ACL:
         self._commands_registered = True
 
     async def _lazy_init(self, bot) -> None:
-        """
-        Perform all lazy init tasks that require `bot`.
-        This is safe to call repeatedly.
-        """
         self._bind_bot(bot)
         self._ensure_commands_registered(bot)
         await self._ensure_schema()
@@ -240,7 +235,6 @@ class ACL:
         userhost = f"{ev.user}@{ev.host}" if ev.user and ev.host else ""
         host = ev.host or ""
 
-        # user (no auth) via masks
         for pat in self.cfg.users:
             pat = (pat or "").strip()
             if not pat:
@@ -274,13 +268,9 @@ class ACL:
         return _norm_role(str(row[0]))
 
     async def effective_role(self, ev: Event) -> Role:
-        """
-        Signature MUST remain `effective_role(ev)` (help.py depends on this).
-        If we have a bot bound, we ensure command registration + bootstrap has occurred.
-        """
+        # Keep signature stable for help.py.
         if self._bot is not None:
             try:
-                # best effort: ensure help visibility & bootstrap for callers that only hit help first
                 self._ensure_commands_registered(self._bot)
             except Exception:
                 pass
@@ -295,12 +285,28 @@ class ACL:
                 best = r
         return best
 
-    # ---------------- NickServ STATUS parsing ----------------
+    # ---------------- NickServ STATUS parsing + cache ----------------
+
+    def _cache_set(self, nick: str, status: int) -> None:
+        self._ns_cache[nick.lower()] = (int(status), int(time.time()))
+
+    def _cache_get(self, nick: str) -> int | None:
+        key = (nick or "").strip().lower()
+        if not key:
+            return None
+        val = self._ns_cache.get(key)
+        if not val:
+            return None
+        status, ts = val
+        if int(time.time()) - int(ts) > NICKSERV_STATUS_CACHE_TTL:
+            return None
+        return int(status)
 
     def _consume_status_line(self, text: str) -> bool:
         """
-        Extract status for any pending nick from arbitrary NickServ text.
-        We only accept numeric 0..3.
+        Extract status for any nick from arbitrary NickServ text.
+        - Always updates cache if a status is found.
+        - Completes pending futures if present.
         """
         txt = (text or "").strip()
         if not txt:
@@ -312,25 +318,34 @@ class ACL:
 
         parts = [_clean_token(p) for p in raw_parts]
 
-        # Pattern 1: "<nick> <digit>"
+        # Pattern 1: "<nick> <digit>" anywhere
         for i in range(len(parts) - 1):
             if parts[i + 1] in _STATUS_DIGITS:
                 nick_tok = parts[i]
-                fut = self._ns_pending.get(nick_tok)
-                if fut and not fut.done():
-                    fut.set_result(int(parts[i + 1]))
-                    return True
+                st = int(parts[i + 1])
+                if nick_tok:
+                    self._cache_set(nick_tok, st)
+                    fut = self._ns_pending.get(nick_tok)
+                    if fut and not fut.done():
+                        fut.set_result(st)
+                        return True
+                # Even if no pending, cache update matters.
+                return True
 
         # Pattern 2: "status <nick> <digit>"
         for i in range(len(parts) - 2):
             if parts[i] == "status" and parts[i + 2] in _STATUS_DIGITS:
                 nick_tok = parts[i + 1]
-                fut = self._ns_pending.get(nick_tok)
-                if fut and not fut.done():
-                    fut.set_result(int(parts[i + 2]))
-                    return True
+                st = int(parts[i + 2])
+                if nick_tok:
+                    self._cache_set(nick_tok, st)
+                    fut = self._ns_pending.get(nick_tok)
+                    if fut and not fut.done():
+                        fut.set_result(st)
+                        return True
+                return True
 
-        # Pattern 3: nick appears, then within next 6 tokens a digit (handles "status for nick: 3")
+        # Pattern 3: pending nick appears, then within next 6 tokens a digit
         for pending_nick, fut in list(self._ns_pending.items()):
             if not fut or fut.done():
                 continue
@@ -340,23 +355,33 @@ class ACL:
                     window = parts[idx + 1 : idx + 7]
                     for w in window:
                         if w in _STATUS_DIGITS:
-                            fut.set_result(int(w))
+                            st = int(w)
+                            self._cache_set(pending_nick, st)
+                            fut.set_result(st)
                             return True
 
         return False
 
-    async def nickserv_status(self, bot, nick: str, timeout: float = 3.0) -> int | None:
+    async def nickserv_status(self, bot, nick: str, timeout: float = NICKSERV_STATUS_TIMEOUT) -> int | None:
         n = (nick or "").strip()
         if not n:
             return None
         key = n.lower()
 
+        # Fast path: cache
+        cached = self._cache_get(key)
+        if cached is not None:
+            return cached
+
+        # If already pending, wait for it
         fut = self._ns_pending.get(key)
         if fut and not fut.done():
             try:
                 return int(await asyncio.wait_for(fut, timeout=timeout))
             except Exception:
-                return None
+                # final cache check
+                cached2 = self._cache_get(key)
+                return cached2
 
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
@@ -372,8 +397,11 @@ class ACL:
             val = await asyncio.wait_for(fut, timeout=timeout)
             return int(val)
         except Exception:
-            return None
+            # reply may arrive just after timeout; cache covers that case
+            cached3 = self._cache_get(key)
+            return cached3
         finally:
+            # keep pending mapping small; cache keeps the result even if late
             self._ns_pending.pop(key, None)
 
     async def _maybe_consume_nickserv_reply(self, ev: Event) -> None:
@@ -382,7 +410,6 @@ class ACL:
         self._consume_status_line(ev.text or "")
 
     async def on_notice(self, bot, ev: Event) -> None:
-        # If your services ever reply via NOTICE, we still accept it.
         if (ev.nick or "").strip().lower() != "nickserv":
             return
         self._consume_status_line(ev.text or "")
@@ -402,7 +429,7 @@ class ACL:
     async def handle_core(self, bot, ev: Event) -> bool:
         await self._lazy_init(bot)
 
-        # Always try to consume NickServ replies (they are PRIVMSG in your network)
+        # Always try to consume NickServ replies (PRIVMSG)
         await self._maybe_consume_nickserv_reply(ev)
 
         prefix = bot.cfg.get("command_prefix", "!")
@@ -434,13 +461,10 @@ class ACL:
 
             sub = parts[1].lower()
 
-            # Require caller to be identified for mutations (strict)
             if sub not in ("usrlist", "servlist"):
                 ok = await self._require_identified(bot, ev.nick or "", ev.target)
                 if not ok:
                     return True
-
-            # (schema already ensured by _lazy_init)
 
             if sub == "adduser":
                 if len(parts) != 4:
@@ -452,7 +476,6 @@ class ACL:
                     await bot.privmsg(ev.target, f"{ev.nick}: group must be admin|contributor|user")
                     return True
 
-                # strict: target must be identified too
                 ok = await self._require_identified(bot, nn, ev.target)
                 if not ok:
                     await bot.privmsg(ev.target, f"{ev.nick}: refusing to add {nn} because they are not identified.")
@@ -533,7 +556,7 @@ class ACL:
             await bot.privmsg(ev.target, f"{ev.nick}: unknown subcommand. Use: adduser, deluser, usrlist, addserv, delserv, servlist")
             return True
 
-        # Existing !auth behaviour remains (unchanged)
+        # Existing !auth remains unchanged
         if cmd != "auth":
             return False
 
@@ -579,7 +602,6 @@ class ACL:
         if not cmdline:
             return True
 
-        # choose longest matching registered command ("service enable" etc)
         parts = cmdline.split()
         cands = [" ".join(parts[:i]) for i in range(len(parts), 0, -1)]
 
