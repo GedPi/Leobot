@@ -14,9 +14,12 @@ log = logging.getLogger("leobot.acl")
 
 ROLE_ORDER = {"guest": 0, "user": 1, "contributor": 2, "admin": 3}
 
-# Anope NickServ STATUS commonly yields a line containing: "<nick> <0-3> [account]"
-# We parse by scanning tokens for "<nick> <0|1|2|3>" anywhere in the line.
-_STATUS_PAIR_RE = re.compile(r"^(\S+)\s+([0-3])(?:\s+\S+)?\s*$", re.IGNORECASE)
+# Accept numeric status 0..3 in common NickServ STATUS response formats.
+# We'll parse by scanning tokens for patterns:
+#   - "<nick> <0-3>"
+#   - "STATUS <nick> <0-3>"
+#   - "... <nick> ... <0-3> ..." (fallback: nick followed soon by digit)
+_STATUS_DIGITS = {"0", "1", "2", "3"}
 
 
 def _sha256(s: str) -> str:
@@ -24,18 +27,15 @@ def _sha256(s: str) -> str:
 
 
 def _identity_key(ev: Event) -> str:
-    # Stable-ish key. Prefer user@host.
     user = (ev.user or "").strip()
     host = (ev.host or "").strip()
     if user and host:
         return f"{user}@{host}".lower()
-    # fall back to nick
     return (ev.nick or "").strip().lower()
 
 
 def _utc_midnight_next(now: int | None = None) -> int:
     t = int(now or time.time())
-    # UTC midnight boundary
     return t - (t % 86400) + 86400
 
 
@@ -44,9 +44,9 @@ def _norm_role(s: str | None) -> Role:
     if r in ("guest", "user", "contributor", "admin"):
         return r  # type: ignore[return-value]
     # tolerate plurals/aliases
-    if r in ("users",):
+    if r == "users":
         return "user"
-    if r in ("contributors",):
+    if r == "contributors":
         return "contributor"
     return "guest"
 
@@ -66,24 +66,11 @@ class ACLConfig:
 
 class ACL:
     """
-    Backwards compatible ACL (keeps !auth / mask-based behaviour) + DB-backed ACL management.
+    Backwards compatible ACL (keeps !auth / session / guest allowlist) + DB ACL management commands.
 
-    New DB tables:
-      - acl_identities(ident, role, created_ts)            -- nick -> role
-      - acl_command_perms(command, min_role, updated_ts)  -- command override per role
-
-    New commands:
-      - !acl adduser <nick> <admin|contributor|user>
-      - !acl deluser <nick> <group>
-      - !acl usrlist <admin|contributor|user>
-      - !acl addserv <service> <guest|user|contributor|admin>
-      - !acl delserv <service> <group>
-      - !acl servlist
-
-    Nick authenticity:
-      - For mutating !acl operations, require NickServ STATUS == 3 for the caller.
-      - For adduser, also require STATUS == 3 for the target nick (strict: “genuine user”).
-      - Consumes NickServ replies delivered as NOTICE or PRIVMSG (network-dependent).
+    IMPORTANT architectural detail:
+      - ACL is a CORE handler. Your bot only calls on_ready() for SERVICES.
+      - Therefore, schema creation + command registration must happen lazily from precheck()/handle_core().
     """
 
     def __init__(self, store, cfg: dict):
@@ -100,10 +87,16 @@ class ACL:
         # NickServ STATUS pending futures (nick_lower -> Future[int])
         self._ns_pending: dict[str, asyncio.Future] = {}
 
-    # ---------------- schema/bootstrap ----------------
+        # Lazy one-time init flags
+        self._schema_ready = False
+        self._commands_registered = False
+        self._bootstrapped_master = False
 
-    async def on_ready(self, bot) -> None:
-        # Create tables if they don't exist (safe)
+    # ---------------- lazy init ----------------
+
+    async def _ensure_schema(self) -> None:
+        if self._schema_ready:
+            return
         await self.store.execute(
             """
             CREATE TABLE IF NOT EXISTS acl_identities (
@@ -123,9 +116,38 @@ class ACL:
             """
         )
         await self.store.execute("CREATE INDEX IF NOT EXISTS idx_acl_role ON acl_identities(role)")
+        self._schema_ready = True
 
-        # Register ACL commands for help/commands listing (core system)
-        # NOTE: bot.register_command expects bare command keys (no leading '!').
+    async def _bootstrap_master(self, bot) -> None:
+        if self._bootstrapped_master:
+            return
+        if not self.cfg.master:
+            self._bootstrapped_master = True
+            return
+
+        await self._ensure_schema()
+
+        row = await self.store.fetchone("SELECT COUNT(*) FROM acl_identities WHERE role='admin'")
+        admin_count = int(row[0]) if row else 0
+        if admin_count == 0:
+            now = int(time.time())
+            await self.store.execute(
+                "INSERT OR REPLACE INTO acl_identities(ident, role, created_ts) VALUES(?,?,?)",
+                (self.cfg.master.lower(), "admin", now),
+            )
+            try:
+                await bot.privmsg(self.cfg.master, "ACL: bootstrapped you as admin (master).")
+            except Exception:
+                pass
+
+        self._bootstrapped_master = True
+
+    def _ensure_commands_registered(self, bot) -> None:
+        if self._commands_registered:
+            return
+
+        # Register command metadata so !help / !commands can show them.
+        # This is safe to run once; bot.register_command overwrites by key.
         try:
             bot.register_command(
                 "acl",
@@ -138,14 +160,14 @@ class ACL:
                 "acl adduser",
                 min_role="admin",
                 mutating=True,
-                help="Add user to group (DB). Usage: !acl adduser <nick> <admin|contributor|user>",
+                help="Add user (DB). Usage: !acl adduser <nick> <admin|contributor|user>",
                 category="System",
             )
             bot.register_command(
                 "acl deluser",
                 min_role="admin",
                 mutating=True,
-                help="Remove user from group (DB). Usage: !acl deluser <nick> <group>",
+                help="Delete user (DB). Usage: !acl deluser <nick> <group>",
                 category="System",
             )
             bot.register_command(
@@ -159,41 +181,27 @@ class ACL:
                 "acl addserv",
                 min_role="admin",
                 mutating=True,
-                help="Set command min role (DB override). Usage: !acl addserv <service> <guest|user|contributor|admin>",
+                help="Set command min role override (DB). Usage: !acl addserv <service> <guest|user|contributor|admin>",
                 category="System",
             )
             bot.register_command(
                 "acl delserv",
                 min_role="admin",
                 mutating=True,
-                help="Remove command override. Usage: !acl delserv <service> <group>",
+                help="Delete command override (DB). Usage: !acl delserv <service> <group>",
                 category="System",
             )
             bot.register_command(
                 "acl servlist",
                 min_role="admin",
                 mutating=False,
-                help="List command overrides. Usage: !acl servlist",
+                help="List command overrides (DB). Usage: !acl servlist",
                 category="System",
             )
         except Exception:
-            # Never fail startup because of help registration.
             pass
 
-        # Bootstrap master from config as DB admin if DB has no admins yet
-        if self.cfg.master:
-            row = await self.store.fetchone("SELECT COUNT(*) FROM acl_identities WHERE role='admin'")
-            admin_count = int(row[0]) if row else 0
-            if admin_count == 0:
-                now = int(time.time())
-                await self.store.execute(
-                    "INSERT OR REPLACE INTO acl_identities(ident, role, created_ts) VALUES(?,?,?)",
-                    (self.cfg.master.lower(), "admin", now),
-                )
-                try:
-                    await bot.privmsg(self.cfg.master, "ACL: bootstrapped you as admin (master).")
-                except Exception:
-                    pass
+        self._commands_registered = True
 
     # ---------------- legacy mask role (unchanged) ----------------
 
@@ -228,6 +236,7 @@ class ACL:
         return _norm_role(role)
 
     async def db_role(self, nick: str) -> Role | None:
+        await self._ensure_schema()
         n = (nick or "").strip().lower()
         if not n:
             return None
@@ -236,27 +245,71 @@ class ACL:
             return None
         return _norm_role(str(row[0]))
 
-    async def effective_role(self, ev: Event) -> Role:
+    async def effective_role(self, bot, ev: Event) -> Role:
+        # Ensure bootstrap/registration happens early
+        self._ensure_commands_registered(bot)
+        await self._bootstrap_master(bot)
+
         base = self._mask_role(ev)
         sess = await self.session_role(ev)
-
-        # DB identity role (nick-based)
         db = await self.db_role(ev.nick or "")
 
-        # highest wins
         best = base
         for r in (sess, db):
             if r and ROLE_ORDER.get(r, 0) > ROLE_ORDER.get(best, 0):
                 best = r
         return best
 
-    # ---------------- NickServ STATUS (Anope) ----------------
+    # ---------------- NickServ STATUS parsing ----------------
+
+    def _consume_status_line(self, text: str) -> bool:
+        """
+        Extract status for any pending nick from arbitrary NickServ text.
+        We only accept numeric 0..3.
+        """
+        txt = (text or "").strip()
+        if not txt:
+            return False
+
+        parts = txt.split()
+        if len(parts) < 2:
+            return False
+
+        # Pattern 1: "<nick> <digit>"
+        for i in range(len(parts) - 1):
+            if parts[i + 1] in _STATUS_DIGITS:
+                nick_tok = parts[i].strip()
+                fut = self._ns_pending.get(nick_tok.lower())
+                if fut and not fut.done():
+                    fut.set_result(int(parts[i + 1]))
+                    return True
+
+        # Pattern 2: "STATUS <nick> <digit>"
+        for i in range(len(parts) - 2):
+            if parts[i].lower() == "status" and parts[i + 2] in _STATUS_DIGITS:
+                nick_tok = parts[i + 1].strip()
+                fut = self._ns_pending.get(nick_tok.lower())
+                if fut and not fut.done():
+                    fut.set_result(int(parts[i + 2]))
+                    return True
+
+        # Pattern 3: nick appears, then within next 6 tokens a digit
+        lowered = [p.lower() for p in parts]
+        for pending_nick, fut in list(self._ns_pending.items()):
+            if not fut or fut.done():
+                continue
+            if pending_nick in lowered:
+                idxs = [i for i, p in enumerate(lowered) if p == pending_nick]
+                for idx in idxs:
+                    window = parts[idx + 1 : idx + 7]
+                    for w in window:
+                        if w in _STATUS_DIGITS:
+                            fut.set_result(int(w))
+                            return True
+
+        return False
 
     async def nickserv_status(self, bot, nick: str, timeout: float = 3.0) -> int | None:
-        """
-        Ask NickServ STATUS <nick>. Returns 0..3 or None.
-        Consumes replies received as NOTICE or PRIVMSG.
-        """
         n = (nick or "").strip()
         if not n:
             return None
@@ -287,42 +340,13 @@ class ACL:
         finally:
             self._ns_pending.pop(key, None)
 
-    def _consume_status_line(self, text: str) -> bool:
-        txt = (text or "").strip()
-        if not txt:
-            return False
-
-        # whole-line match
-        m = _STATUS_PAIR_RE.match(txt)
-        if m:
-            nn = m.group(1)
-            st = int(m.group(2))
-            fut = self._ns_pending.get(nn.lower())
-            if fut and not fut.done():
-                fut.set_result(st)
-                return True
-            return False
-
-        # token scan for "<nick> <0-3>"
-        parts = txt.split()
-        for i in range(len(parts) - 1):
-            if parts[i + 1] in ("0", "1", "2", "3"):
-                nn = parts[i]
-                st = int(parts[i + 1])
-                fut = self._ns_pending.get(nn.lower())
-                if fut and not fut.done():
-                    fut.set_result(st)
-                    return True
-        return False
-
-    async def on_notice(self, bot, ev: Event) -> None:
+    async def _maybe_consume_nickserv_reply(self, ev: Event) -> None:
         if (ev.nick or "").strip().lower() != "nickserv":
             return
         self._consume_status_line(ev.text or "")
 
-    # IMPORTANT: We also consume PRIVMSG replies from NickServ, because you confirmed
-    # NickServ replies as /msg when you /msg it.
-    async def _maybe_consume_nickserv_privmsg(self, ev: Event) -> None:
+    async def on_notice(self, bot, ev: Event) -> None:
+        # If your services ever reply via NOTICE, we still accept it.
         if (ev.nick or "").strip().lower() != "nickserv":
             return
         self._consume_status_line(ev.text or "")
@@ -340,15 +364,15 @@ class ACL:
     # ---------------- core commands ----------------
 
     async def handle_core(self, bot, ev: Event) -> bool:
-        # Consume NickServ PRIVMSG replies even if they are not commands
-        await self._maybe_consume_nickserv_privmsg(ev)
+        # Always try to consume NickServ replies (they are PRIVMSG in your network)
+        await self._maybe_consume_nickserv_reply(ev)
 
         prefix = bot.cfg.get("command_prefix", "!")
         txt = (ev.text or "").strip()
         if not txt.startswith(prefix):
             return False
 
-        cmdline = txt[len(prefix):].strip()
+        cmdline = txt[len(prefix) :].strip()
         if not cmdline:
             return False
 
@@ -356,33 +380,30 @@ class ACL:
         cmd = parts[0].lower()
 
         if cmd == "whoami":
-            role = await self.effective_role(ev)
+            role = await self.effective_role(bot, ev)
             await bot.privmsg(ev.target, f"{ev.nick}: role={role} identity={_identity_key(ev)}")
             return True
 
-        # ---------------- !acl ... ----------------
         if cmd == "acl":
-            caller_role = await self.effective_role(ev)
-            if ROLE_ORDER.get(caller_role, 0) < ROLE_ORDER["admin"]:
+            role = await self.effective_role(bot, ev)
+            if ROLE_ORDER.get(role, 0) < ROLE_ORDER["admin"]:
                 await bot.privmsg(ev.target, f"{ev.nick}: not allowed (requires admin).")
                 return True
 
             if len(parts) < 2:
-                await bot.privmsg(
-                    ev.target,
-                    f"{ev.nick}: usage: !acl adduser|deluser|usrlist|addserv|delserv|servlist ...",
-                )
+                await bot.privmsg(ev.target, f"{ev.nick}: usage: !acl adduser|deluser|usrlist|addserv|delserv|servlist ...")
                 return True
 
             sub = parts[1].lower()
 
-            # Require the CALLER to be identified for mutating operations
+            # Require caller to be identified for mutations (strict)
             if sub not in ("usrlist", "servlist"):
                 ok = await self._require_identified(bot, ev.nick or "", ev.target)
                 if not ok:
                     return True
 
-            # !acl adduser <nick> <group>
+            await self._ensure_schema()
+
             if sub == "adduser":
                 if len(parts) != 4:
                     await bot.privmsg(ev.target, f"{ev.nick}: usage: !acl adduser <nick> <admin|contributor|user>")
@@ -393,21 +414,19 @@ class ACL:
                     await bot.privmsg(ev.target, f"{ev.nick}: group must be admin|contributor|user")
                     return True
 
-                # Strict target authenticity: target must be STATUS=3 now
+                # strict: target must be identified too
                 ok = await self._require_identified(bot, nn, ev.target)
                 if not ok:
                     await bot.privmsg(ev.target, f"{ev.nick}: refusing to add {nn} because they are not identified.")
                     return True
 
-                now = int(time.time())
                 await self.store.execute(
                     "INSERT OR REPLACE INTO acl_identities(ident, role, created_ts) VALUES(?,?,?)",
-                    (nn.lower(), rr, now),
+                    (nn.lower(), rr, int(time.time())),
                 )
                 await bot.privmsg(ev.target, f"ACL: added user {nn} -> {rr}.")
                 return True
 
-            # !acl deluser <nick> <group>
             if sub == "deluser":
                 if len(parts) < 3:
                     await bot.privmsg(ev.target, f"{ev.nick}: usage: !acl deluser <nick> <group>")
@@ -417,7 +436,6 @@ class ACL:
                 await bot.privmsg(ev.target, f"ACL: removed user {parts[2]}.")
                 return True
 
-            # !acl usrlist <group>
             if sub == "usrlist":
                 if len(parts) != 3:
                     await bot.privmsg(ev.target, f"{ev.nick}: usage: !acl usrlist <admin|contributor|user>")
@@ -426,10 +444,7 @@ class ACL:
                 if rr == "guest":
                     await bot.privmsg(ev.target, f"{ev.nick}: group must be admin|contributor|user")
                     return True
-                rows = await self.store.fetchall(
-                    "SELECT ident FROM acl_identities WHERE role=? ORDER BY ident ASC",
-                    (rr,),
-                )
+                rows = await self.store.fetchall("SELECT ident FROM acl_identities WHERE role=? ORDER BY ident ASC", (rr,))
                 users = [str(r[0]) for r in rows] if rows else []
                 if not users:
                     await bot.privmsg(ev.target, f"ACL: {rr} users: (none)")
@@ -439,30 +454,21 @@ class ACL:
                     await bot.privmsg(ev.target, f"ACL: {rr} users: " + ", ".join(show) + extra)
                 return True
 
-            # !acl addserv <service> <group>
             if sub == "addserv":
                 if len(parts) != 4:
-                    await bot.privmsg(
-                        ev.target,
-                        f"{ev.nick}: usage: !acl addserv <service> <guest|user|contributor|admin>",
-                    )
+                    await bot.privmsg(ev.target, f"{ev.nick}: usage: !acl addserv <service> <guest|user|contributor|admin>")
                     return True
                 svc = _norm_cmd(parts[2])
                 rr = _norm_role(parts[3])
-
-                # allow explicit guest
                 if parts[3].strip().lower() == "guest":
                     rr = "guest"
-
-                now = int(time.time())
                 await self.store.execute(
                     "INSERT OR REPLACE INTO acl_command_perms(command, min_role, updated_ts) VALUES(?,?,?)",
-                    (svc, rr, now),
+                    (svc, rr, int(time.time())),
                 )
                 await bot.privmsg(ev.target, f"ACL: service '{svc}' now requires {rr}.")
                 return True
 
-            # !acl delserv <service> <group>
             if sub == "delserv":
                 if len(parts) < 3:
                     await bot.privmsg(ev.target, f"{ev.nick}: usage: !acl delserv <service> <group>")
@@ -472,7 +478,6 @@ class ACL:
                 await bot.privmsg(ev.target, f"ACL: service '{svc}' override removed.")
                 return True
 
-            # !acl servlist
             if sub == "servlist":
                 rows = await self.store.fetchall(
                     "SELECT command, min_role FROM acl_command_perms ORDER BY min_role DESC, command ASC",
@@ -490,7 +495,7 @@ class ACL:
             await bot.privmsg(ev.target, f"{ev.nick}: unknown subcommand. Use: adduser, deluser, usrlist, addserv, delserv, servlist")
             return True
 
-        # ---------------- !auth <password> (unchanged) ----------------
+        # Existing !auth behaviour remains (unchanged)
         if cmd != "auth":
             return False
 
@@ -501,7 +506,6 @@ class ACL:
         password = parts[1]
         digest = _sha256(password)
 
-        # Highest match wins
         granted: Role | None = None
         for item in self.cfg.admins:
             if fnmatch(f"{ev.nick}!{ev.user}@{ev.host}", item.get("mask", "")) and item.get("pass_sha256") == digest:
@@ -523,25 +527,26 @@ class ACL:
         return True
 
     async def precheck(self, bot, ev: Event) -> bool:
-        # Also consume NickServ PRIVMSG replies here (dispatcher calls precheck for all PRIVMSG)
-        await self._maybe_consume_nickserv_privmsg(ev)
+        # Consume NickServ replies (dispatcher calls precheck for ALL PRIVMSG)
+        await self._maybe_consume_nickserv_reply(ev)
 
-        # Only gate commands.
         prefix = bot.cfg.get("command_prefix", "!")
         txt = (ev.text or "").strip()
         if not txt.startswith(prefix):
             return True
 
-        cmdline = txt[len(prefix):].strip().lower()
+        cmdline = txt[len(prefix) :].strip().lower()
         if not cmdline:
             return True
 
-        # support subcommands registered like "service enable"
-        # choose longest matching registered command
+        # ensure help visibility + master bootstrap early
+        self._ensure_commands_registered(bot)
+        await self._bootstrap_master(bot)
+        await self._ensure_schema()
+
+        # choose longest matching registered command ("service enable" etc)
         parts = cmdline.split()
-        cands = []
-        for i in range(len(parts), 0, -1):
-            cands.append(" ".join(parts[:i]))
+        cands = [" ".join(parts[:i]) for i in range(len(parts), 0, -1)]
 
         cmd = None
         info = None
@@ -554,16 +559,14 @@ class ACL:
         if cmd is None:
             return True
 
-        # allow auth/whoami/help regardless
         if cmd in ("auth", "whoami", "help", "commands"):
             return True
 
-        role = await self.effective_role(ev)
+        role = await self.effective_role(bot, ev)
 
-        # DB override wins if present
-        db_min = await self.store.fetchone("SELECT min_role FROM acl_command_perms WHERE command=?", (cmd,))
-        if db_min:
-            min_role = _norm_role(str(db_min[0]))
+        row = await self.store.fetchone("SELECT min_role FROM acl_command_perms WHERE command=?", (cmd,))
+        if row:
+            min_role = _norm_role(str(row[0]))
         else:
             min_role = _norm_role(str(info["min_role"]))
 
@@ -571,7 +574,6 @@ class ACL:
             await bot.privmsg(ev.target, f"{ev.nick}: not allowed (requires {min_role}).")
             return False
 
-        # guest allowlist (if caller is guest)
         if role == "guest" and cmd not in self.cfg.guest_allowed_cmds:
             await bot.privmsg(ev.target, f"{ev.nick}: not allowed (requires user).")
             return False
