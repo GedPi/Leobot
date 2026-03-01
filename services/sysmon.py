@@ -445,7 +445,21 @@ class SysMonService:
                 await bot.privmsg(ev.target, f"Journal errors: unavailable ({(err or out or '').strip()[:120]})")
                 return
 
-            lines = [ln for ln in (out or "").splitlines() if ln.strip()]
+            raw_lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+
+            # journalctl placeholders / noise lines that are not real entries
+            noise_prefixes = (
+                "-- No entries --",
+                "Hint:",
+                "warning:",
+            )
+
+            lines = []
+            for ln in raw_lines:
+                if any(ln.startswith(p) for p in noise_prefixes):
+                    continue
+                lines.append(ln)
+
             count = len(lines)
             if count == 0:
                 await bot.privmsg(ev.target, "Journal errors (last 1h): 0")
