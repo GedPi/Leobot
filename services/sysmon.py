@@ -431,16 +431,41 @@ class SysMonService:
             return
 
         if cmd == "errors":
-            # last 1h errors
+            # optional limit: !sys errors 3
+            n = 3
+            if len(parts) >= 2 and parts[1].isdigit():
+                n = max(1, min(10, int(parts[1])))
+
+            # Query last hour errors. Use short format for IRC.
             rc, out, err = await _run_cmd(
-                ["journalctl", "--no-pager", "-p", "err", "--since", "-1 hour"],
+                ["journalctl", "--no-pager", "-p", "err", "--since", "-1 hour", "-o", "short"],
                 timeout=10,
             )
             if rc != 0:
                 await bot.privmsg(ev.target, f"Journal errors: unavailable ({(err or out or '').strip()[:120]})")
                 return
+
             lines = [ln for ln in (out or "").splitlines() if ln.strip()]
-            await bot.privmsg(ev.target, f"Journal errors (last 1h): {len(lines)}")
+            count = len(lines)
+            if count == 0:
+                await bot.privmsg(ev.target, "Journal errors (last 1h): 0")
+                return
+
+            await bot.privmsg(ev.target, f"Journal errors (last 1h): {count}")
+
+            # Show last N errors with some structure.
+            # Example short format:
+            # "Mar 01 16:12:34 host unit[pid]: message..."
+            tail = lines[-n:]
+            for ln in tail:
+                s = ln.strip()
+                # Clip to avoid IRC line spam
+                if len(s) > 260:
+                    s = s[:259] + "…"
+                await bot.privmsg(ev.target, f"ERR: {s}")
+                if not ev.is_private:
+                    await asyncio.sleep(0.8)
+
             return
 
         if cmd == "services":
