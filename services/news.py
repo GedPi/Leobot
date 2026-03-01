@@ -15,6 +15,10 @@ from typing import Dict, List, Optional, Tuple
 log = logging.getLogger("leobot.news")
 
 
+# ----------------------------
+# Data models
+# ----------------------------
+
 @dataclass(frozen=True)
 class NewsItem:
     source_id: str
@@ -33,8 +37,15 @@ class PendingSelection:
     category: str
 
 
+# ----------------------------
+# Helpers: fetch + parse
+# ----------------------------
+
+UA = "Leonidas/2.0 (IRC bot; RSS reader)"
+
+
 def _fetch_url(url: str, timeout: int = 15) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "Leonidas/1.0 (IRC bot; RSS reader)"})
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
 
@@ -76,6 +87,7 @@ def _parse_rss_or_atom(xml_bytes: bytes) -> List[Tuple[str, str, Optional[dateti
     root = ET.fromstring(xml_bytes)
     out: List[Tuple[str, str, Optional[datetime]]] = []
 
+    # RSS2
     channel = root.find("channel")
     if channel is not None:
         for it in channel.findall("item"):
@@ -86,8 +98,10 @@ def _parse_rss_or_atom(xml_bytes: bytes) -> List[Tuple[str, str, Optional[dateti
                 out.append((title, link, pub))
         return out
 
+    # Atom
     for entry in root.findall(".//{*}entry"):
         title = _clean_title(_text(entry.find("{*}title")))
+
         link = ""
         for link_el in entry.findall("{*}link"):
             href = link_el.attrib.get("href", "")
@@ -97,12 +111,17 @@ def _parse_rss_or_atom(xml_bytes: bytes) -> List[Tuple[str, str, Optional[dateti
                 break
             if not link and href:
                 link = href
+
         pub = _parse_date(_text(entry.find("{*}published")) or _text(entry.find("{*}updated")))
         if title and link:
             out.append((title, link, pub))
 
     return out
 
+
+# ----------------------------
+# Service
+# ----------------------------
 
 def setup(bot):
     return NewsService(bot)
@@ -120,15 +139,25 @@ class NewsService:
         self.line_delay = float(ncfg.get("line_delay_seconds", 1.2))
         self.selection_timeout = int(ncfg.get("selection_timeout_seconds", 60))
 
+        # cache key: (source_id, category) -> (fetched_ts, [NewsItem])
         self._cache: Dict[Tuple[str, str], Tuple[float, List[NewsItem]]] = {}
+
+        # pending selections: (nick, target) -> (sources list, pending selection)
         self._pending: Dict[Tuple[str, str], Tuple[List[dict], PendingSelection]] = {}
 
         bot.register_command("news", min_role="guest", mutating=False, help="Show headlines. Usage: !news [limit] [category]", category="News")
         bot.register_command("headlines", min_role="guest", mutating=False, help="Alias for !news", category="News")
+
         bot.register_command("news sources", min_role="contributor", mutating=False, help="List configured sources", category="News")
         bot.register_command("news categories", min_role="contributor", mutating=False, help="List categories for a source. Usage: !news categories <id>", category="News")
+
         bot.register_command("news addsource", min_role="contributor", mutating=True, help="Add/update a source. Usage: !news addsource <id> <name>", category="News")
+        bot.register_command("news delsource", min_role="contributor", mutating=True, help="Delete a source. Usage: !news delsource <id>", category="News")
+        bot.register_command("news enable", min_role="contributor", mutating=True, help="Enable a source. Usage: !news enable <id>", category="News")
+        bot.register_command("news disable", min_role="contributor", mutating=True, help="Disable a source. Usage: !news disable <id>", category="News")
+
         bot.register_command("news addcat", min_role="contributor", mutating=True, help="Add/update a category URL. Usage: !news addcat <id> <category> <url>", category="News")
+        bot.register_command("news delcat", min_role="contributor", mutating=True, help="Delete a category. Usage: !news delcat <id> <category>", category="News")
 
     async def _allowed(self, ev) -> bool:
         if ev.channel:
@@ -172,23 +201,29 @@ class NewsService:
             await self.bot.privmsg(ev.target, f"{ev.nick}: unknown category '{category}' for {src['id']}. Use !news categories {src['id']}")
             return
 
-        chan = ev.channel or ev.target
-        last = await self.bot.store.news_get_last_posted(chan, src["id"], category, limit)
+        chan_key = ev.channel or ev.target  # persist cooldown by channel when in channel, else by nick/pm target
+        last = await self.bot.store.news_get_last_posted(chan_key, src["id"], category, limit)
         now = int(time.time())
         if last and now - last < self.cooldown:
             await self.bot.privmsg(ev.target, f"{ev.nick}: cooldown active ({self.cooldown - (now - last)}s)")
             return
 
-        items = await self._fetch_items(src["id"], src["name"], category, url)
+        try:
+            items = await self._fetch_items(src["id"], src["name"], category, url)
+        except Exception as e:
+            log.exception("Failed to fetch news feed")
+            await self.bot.privmsg(ev.target, f"{ev.nick}: failed to fetch feed ({type(e).__name__})")
+            return
+
         if not items:
             await self.bot.privmsg(ev.target, f"{ev.nick}: no items found")
             return
 
         await self._post(ev.target, items, limit)
-        await self.bot.store.news_set_last_posted(chan, src["id"], category, limit, ts=now)
+        await self.bot.store.news_set_last_posted(chan_key, src["id"], category, limit, ts=now)
 
     async def on_privmsg(self, bot, ev):
-        # pending selection flow
+        # 1) pending selection flow (reply: "1")
         key = (ev.nick.lower(), ev.target)
         if key in self._pending:
             sources, pending = self._pending[key]
@@ -206,7 +241,7 @@ class NewsService:
                     await self._serve(ev, src, pending.category, pending.limit)
                     return
 
-        # command parsing
+        # 2) command parsing
         prefix = bot.cfg.get("command_prefix", "!")
         text = (ev.text or "").strip()
         if not text.startswith(prefix):
@@ -214,6 +249,7 @@ class NewsService:
         cmdline = text[len(prefix):].strip()
         if not cmdline:
             return
+
         parts = cmdline.split()
         cmd = parts[0].lower()
         if cmd not in ("news", "headlines"):
@@ -224,13 +260,13 @@ class NewsService:
 
         args = [a for a in parts[1:]]
 
-        # management
+        # ---- management subcommands ----
         if args and args[0].lower() == "sources":
             rows = await bot.store.news_list_sources()
             if not rows:
                 await bot.privmsg(ev.target, f"{ev.nick}: no sources configured")
                 return
-            msg = ", ".join([f"{r['id']}({ 'on' if r['enabled'] else 'off' })" for r in rows])
+            msg = ", ".join([f"{r['id']}({'on' if r['enabled'] else 'off'})" for r in rows])
             await bot.privmsg(ev.target, f"{ev.nick}: sources: {msg}")
             return
 
@@ -251,26 +287,79 @@ class NewsService:
             if len(args) < 3:
                 await bot.privmsg(ev.target, f"{ev.nick}: usage: !news addsource <id> <name>")
                 return
-            sid = args[1]
-            name = " ".join(args[2:])
+            sid = args[1].strip()
+            name = " ".join(args[2:]).strip()
+            if not sid or not name:
+                await bot.privmsg(ev.target, f"{ev.nick}: usage: !news addsource <id> <name>")
+                return
             await bot.store.news_upsert_source(sid, name, enabled=True)
-            await bot.privmsg(ev.target, f"{ev.nick}: source upserted: {sid} = {name}")
+            await bot.privmsg(ev.target, f"{ev.nick}: source upserted: {sid} = {name} (enabled)")
+            return
+
+        if args and args[0].lower() == "delsource":
+            if len(args) < 2:
+                await bot.privmsg(ev.target, f"{ev.nick}: usage: !news delsource <id>")
+                return
+            sid = args[1].strip()
+            row = await bot.store.news_get_source(sid)
+            if not row:
+                await bot.privmsg(ev.target, f"{ev.nick}: unknown source '{sid}'")
+                return
+            await bot.store.execute("DELETE FROM news_sources WHERE id=?", (sid,))
+            await bot.privmsg(ev.target, f"{ev.nick}: deleted source '{sid}' (and its categories)")
+            return
+
+        if args and args[0].lower() in ("enable", "disable"):
+            if len(args) < 2:
+                await bot.privmsg(ev.target, f"{ev.nick}: usage: !news {args[0]} <id>")
+                return
+            sid = args[1].strip()
+            row = await bot.store.news_get_source(sid)
+            if not row:
+                await bot.privmsg(ev.target, f"{ev.nick}: unknown source '{sid}'")
+                return
+            en = args[0].lower() == "enable"
+            await bot.store.news_set_source_enabled(sid, enabled=en)
+            await bot.privmsg(ev.target, f"{ev.nick}: source '{sid}' set to {'on' if en else 'off'}")
             return
 
         if args and args[0].lower() == "addcat":
             if len(args) < 4:
                 await bot.privmsg(ev.target, f"{ev.nick}: usage: !news addcat <id> <category> <url>")
                 return
-            sid = args[1]
-            cat = args[2]
-            url = args[3]
+            sid = args[1].strip()
+            cat = args[2].strip().lower()
+            url = args[3].strip()
+            if not sid or not cat or not url:
+                await bot.privmsg(ev.target, f"{ev.nick}: usage: !news addcat <id> <category> <url>")
+                return
+            row = await bot.store.news_get_source(sid)
+            if not row:
+                await bot.privmsg(ev.target, f"{ev.nick}: unknown source '{sid}' (add it first with !news addsource)")
+                return
             await bot.store.news_set_category(sid, cat, url)
             await bot.privmsg(ev.target, f"{ev.nick}: category upserted: {sid}/{cat}")
             return
 
-        # headlines
+        if args and args[0].lower() == "delcat":
+            if len(args) < 3:
+                await bot.privmsg(ev.target, f"{ev.nick}: usage: !news delcat <id> <category>")
+                return
+            sid = args[1].strip()
+            cat = args[2].strip().lower()
+            await bot.store.execute("DELETE FROM news_source_categories WHERE source_id=? AND category=?", (sid, cat))
+            await bot.privmsg(ev.target, f"{ev.nick}: deleted category: {sid}/{cat}")
+            return
+
+        # ---- headlines ----
         limit = self.default_limit
         category = "top"
+
+        # forms supported:
+        #   !news
+        #   !news 5
+        #   !news 5 sport
+        #   !news sport
         if args:
             if args[0].isdigit():
                 limit = int(args[0])
