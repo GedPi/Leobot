@@ -9,7 +9,10 @@ permissions:
 
 jobs:
   bump:
+    # Don't run on the commit that this workflow itself creates/pushes
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,21 +25,27 @@ jobs:
         run: |
           set -euo pipefail
 
-          msg="$(git log -1 --pretty=%s)"
-          msg_lc="$(echo "$msg" | tr '[:upper:]' '[:lower:]')"
+          # Use the commit that triggered the workflow (not "whatever HEAD is later")
+          sha="${GITHUB_SHA}"
+          subject="$(git show -s --format=%s "$sha")"
+          body="$(git show -s --format=%b "$sha")"
 
+          # Normalize
+          s="$(echo "$subject" | tr '[:upper:]' '[:lower:]' | sed -E 's/^[[:space:]]+//')"
+
+          # Accept: "major", "major:", "major -", "major: blah", etc.
           bump=""
-          if [[ "$msg_lc" == major:* ]]; then bump="major"; fi
-          if [[ "$msg_lc" == minor:* ]]; then bump="minor"; fi
-          if [[ "$msg_lc" == patch:* ]]; then bump="patch"; fi
+          if [[ "$s" =~ ^major([[:space:]]|:|$) ]]; then bump="major"; fi
+          if [[ "$s" =~ ^minor([[:space:]]|:|$) ]]; then bump="minor"; fi
+          if [[ "$s" =~ ^patch([[:space:]]|:|$) ]]; then bump="patch"; fi
 
-          echo "commit_subject=$msg" >> "$GITHUB_OUTPUT"
+          echo "commit_subject=$subject" >> "$GITHUB_OUTPUT"
           echo "bump=$bump" >> "$GITHUB_OUTPUT"
 
-      - name: Stop if no bump prefix
+      - name: Stop if no bump keyword
         if: steps.bump.outputs.bump == ''
         run: |
-          echo "No major:/minor:/patch: prefix on last commit; skipping."
+          echo "No major/minor/patch keyword at start of commit Summary; skipping."
           exit 0
 
       - name: Bump VERSION
@@ -46,11 +55,11 @@ jobs:
           set -euo pipefail
 
           test -f VERSION || { echo "VERSION file missing"; exit 1; }
-          v="$(cat VERSION | tr -d ' \t\r\n')"
+          v="$(tr -d ' \t\r\n' < VERSION)"
           IFS='.' read -r major minor patch <<< "$v"
 
           re='^[0-9]+$'
-          [[ "$major" =~ $re && "$minor" =~ $re && "$patch" =~ $re ]] || { echo "Bad VERSION: $v"; exit 1; }
+          [[ "${major:-}" =~ $re && "${minor:-}" =~ $re && "${patch:-}" =~ $re ]] || { echo "Bad VERSION: $v"; exit 1; }
 
           bump="${{ steps.bump.outputs.bump }}"
           if [[ "$bump" == "major" ]]; then
