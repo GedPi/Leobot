@@ -467,11 +467,149 @@ def migrate_v4(conn: sqlite3.Connection) -> None:
         """
     )
 
+def migrate_v5(conn: sqlite3.Connection) -> None:
+    """
+    Greet pools: allow multiple targets to share a greeting set.
+
+    - Introduce greet_pools
+    - Add greet_targets.pool_id
+    - Re-home greetings from target_id -> pool_id
+    """
+    now = int(time.time())
+
+    # If already migrated, no-op.
+    if _table_exists(conn, "greet_pools"):
+        tcols = _columns(conn, "greet_targets")
+        gcols = _columns(conn, "greetings")
+        if "pool_id" in tcols and "pool_id" in gcols:
+            return
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS greet_pools (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          created_ts INTEGER NOT NULL,
+          updated_ts INTEGER NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_greet_pools_name ON greet_pools(name);
+        """
+    )
+
+    # Add pool_id to greet_targets (nullable; we'll backfill).
+    tcols = _columns(conn, "greet_targets")
+    if "pool_id" not in tcols:
+        conn.execute("ALTER TABLE greet_targets ADD COLUMN pool_id INTEGER")
+
+    # If greetings already has pool_id we can just backfill targets if needed.
+    gcols = _columns(conn, "greetings")
+    if "pool_id" in gcols:
+        rows = conn.execute(
+            "SELECT id, match_nick FROM greet_targets WHERE pool_id IS NULL ORDER BY id"
+        ).fetchall()
+        for tid, match_nick in rows:
+            tid_i = int(tid)
+            nick = (match_nick or "").strip()
+            name = f"nick:{nick}" if nick else f"target:{tid_i}"
+            existing = conn.execute("SELECT 1 FROM greet_pools WHERE name=? LIMIT 1", (name,)).fetchone()
+            if existing:
+                name = f"{name}#{tid_i}"
+            conn.execute(
+                "INSERT INTO greet_pools(name, created_ts, updated_ts) VALUES(?,?,?)",
+                (name, now, now),
+            )
+            pid = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            conn.execute("UPDATE greet_targets SET pool_id=?, updated_ts=? WHERE id=?", (pid, now, tid_i))
+        return
+
+    # Migrate greetings table from target_id -> pool_id
+    conn.executescript(
+        """
+        PRAGMA foreign_keys=OFF;
+        ALTER TABLE greetings RENAME TO greetings_old;
+
+        CREATE TABLE greetings (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          pool_id INTEGER NOT NULL REFERENCES greet_pools(id) ON DELETE CASCADE,
+          text TEXT NOT NULL,
+          weight INTEGER NOT NULL DEFAULT 1,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          created_ts INTEGER NOT NULL,
+          updated_ts INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_greetings_pool_enabled ON greetings(pool_id, enabled);
+        """
+    )
+
+    # Create one pool per existing target and attach it.
+    tgt_rows = conn.execute("SELECT id, match_nick FROM greet_targets ORDER BY id").fetchall()
+
+    tgt_to_pool: dict[int, int] = {}
+    for tid, match_nick in tgt_rows:
+        tid_i = int(tid)
+        nick = (match_nick or "").strip()
+        name = f"nick:{nick}" if nick else f"target:{tid_i}"
+        existing = conn.execute("SELECT 1 FROM greet_pools WHERE name=? LIMIT 1", (name,)).fetchone()
+        if existing:
+            name = f"{name}#{tid_i}"
+        conn.execute(
+            "INSERT INTO greet_pools(name, created_ts, updated_ts) VALUES(?,?,?)",
+            (name, now, now),
+        )
+        pid = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        tgt_to_pool[tid_i] = pid
+        conn.execute("UPDATE greet_targets SET pool_id=?, updated_ts=? WHERE id=?", (pid, now, tid_i))
+
+    # Move greetings across
+    old_rows = conn.execute(
+        "SELECT id, target_id, text, weight, enabled, created_ts, updated_ts FROM greetings_old ORDER BY id"
+    ).fetchall()
+
+    for gid, target_id, text, weight, enabled, cts, uts in old_rows:
+        tid_i = int(target_id)
+        pid = tgt_to_pool.get(tid_i)
+        if not pid:
+            name = f"target:{tid_i}"
+            existing = conn.execute("SELECT 1 FROM greet_pools WHERE name=? LIMIT 1", (name,)).fetchone()
+            if existing:
+                name = f"{name}#{tid_i}"
+            conn.execute(
+                "INSERT INTO greet_pools(name, created_ts, updated_ts) VALUES(?,?,?)",
+                (name, now, now),
+            )
+            pid = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            tgt_to_pool[tid_i] = pid
+            conn.execute("UPDATE greet_targets SET pool_id=?, updated_ts=? WHERE id=?", (pid, now, tid_i))
+
+        conn.execute(
+            """
+            INSERT INTO greetings(id, pool_id, text, weight, enabled, created_ts, updated_ts)
+            VALUES(?,?,?,?,?,?,?)
+            """,
+            (
+                int(gid),
+                int(pid),
+                text,
+                int(weight) if weight is not None else 1,
+                int(enabled) if enabled is not None else 1,
+                int(cts) if cts is not None else now,
+                int(uts) if uts is not None else now,
+            ),
+        )
+
+    conn.executescript(
+        """
+        DROP TABLE greetings_old;
+        PRAGMA foreign_keys=ON;
+        """
+    )
+
 MIGRATIONS = {
     1: migrate_v1,
     2: migrate_v2,
     3: migrate_v3,
     4: migrate_v4,
+    5: migrate_v5,
 }
 
 

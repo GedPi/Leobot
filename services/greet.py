@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fnmatch
 import logging
 import time
 from dataclasses import dataclass
@@ -48,29 +47,42 @@ def setup(bot):
 
 class GreetService:
     """
-    Join greetings (DB-backed).
+    Join greetings (DB-backed) with **pools**.
 
-    Tables:
+    Concept:
       - greet_targets: match rules (AND semantics across provided match_* fields)
-      - greetings: greetings tied to a target_id
+      - greet_pools: reusable sets of greetings
+      - greetings: greetings tied to a pool_id
       - greet_cooldowns: persistent cooldown keys
+
+    Why pools:
+      - A single pool can be shared by multiple targets (e.g. two users share the same greeting set)
+      - You can keep per-user pools, plus generic pools you attach to many.
 
     Enable per channel:
       !service enable greet #Channel
 
     Commands:
-      !greet list
-      !greet greets <target_id>
-      !greet addnick <nick> <greeting...>
-      !greet addhost <host pattern> <greeting...>     (matches host, user@host, or nick!user@host via fnmatch)
-      !greet addmask <hostmask pattern> <greeting...> (matches full hostmask via fnmatch)
-      !greet deltarget <id>
-      !greet delgreet <id>
-      !greet enable <id> | !greet disable <id>
-      !greet setpri <id> <priority>
-      !greet setchan <id> <#channel|any>
-      !greet setcd <id> <seconds|0>
-      !greet test
+      Targets:
+        !greet list
+        !greet greets <target_id>                (lists greetings in that target's pool)
+        !greet addnick <nick> <greeting...>
+        !greet addhost <host pattern> <greeting...>
+        !greet addmask <hostmask pattern> <greeting...>
+        !greet deltarget <id>
+        !greet enable <id> | !greet disable <id>
+        !greet setpri <id> <priority>
+        !greet setchan <id> <#channel|any>
+        !greet setcd <id> <seconds|0>
+        !greet test
+
+      Pools:
+        !greet pools
+        !greet pooladd <name>
+        !greet poolset <target_id> <pool_id>
+        !greet poolgreets <pool_id>
+        !greet pooladdgreet <pool_id> <greeting...>
+        !greet pooldel <pool_id>                 (only if no targets reference it)
     """
 
     def __init__(self, bot):
@@ -81,9 +93,9 @@ class GreetService:
         self.default_chan_cooldown = int(cfg.get("cooldown_per_channel_seconds", 3))
         self.max_list = int(cfg.get("max_list", 15))
 
-        # Register command families
         bot.register_command("greet", min_role="contributor", mutating=False, help="Manage join greetings. Usage: !greet <subcmd>", category="Greet")
         bot.register_command("greet test", min_role="contributor", mutating=False, help="Test greet matching for your current identity.", category="Greet")
+        bot.register_command("greet pools", min_role="contributor", mutating=False, help="List greeting pools.", category="Greet")
 
     # ----------------------------
     # Cooldowns (DB persisted)
@@ -108,15 +120,10 @@ class GreetService:
         nl = _lower(nick)
         cl = _lower(channel)
 
-        # Keying strategy:
-        # - per-nick global (prevents spam across channels)
-        # - per-channel short (netsplits / mass rejoin)
-        # - per-target+nick (optional override when target has cooldown_seconds)
         nick_key = f"nick:{nl}"
         chan_key = f"chan:{cl}"
         tgt_key = f"tgt:{int(target_id)}:{nl}"
 
-        # check
         if now < await self._cooldown_get(nick_key):
             return False
         if now < await self._cooldown_get(chan_key):
@@ -125,7 +132,6 @@ class GreetService:
             if now < await self._cooldown_get(tgt_key):
                 return False
 
-        # set
         await self._cooldown_set(nick_key, now + self.default_nick_cooldown)
         await self._cooldown_set(chan_key, now + self.default_chan_cooldown)
         if target_cd and target_cd > 0:
@@ -147,7 +153,41 @@ class GreetService:
         )
 
     async def _pick_greeting(self, target_id: int) -> Optional[str]:
+        # Store resolves target -> pool internally
         return await self.bot.store.greet_pick_greeting(int(target_id))
+
+    # ----------------------------
+    # Pools helpers
+    # ----------------------------
+
+    async def _create_pool(self, name: str) -> int:
+        now = _now()
+        await self.bot.store.execute(
+            "INSERT INTO greet_pools(name, created_ts, updated_ts) VALUES(?,?,?)",
+            (name, now, now),
+        )
+        row = await self.bot.store.fetchone("SELECT last_insert_rowid()", ())
+        return int(row[0])
+
+    async def _ensure_pool_for_target(self, target_id: int) -> Optional[int]:
+        row = await self.bot.store.fetchone("SELECT pool_id, match_nick FROM greet_targets WHERE id=?", (int(target_id),))
+        if not row:
+            return None
+        pool_id = row[0]
+        if pool_id is not None:
+            return int(pool_id)
+
+        match_nick = (row[1] or "").strip()
+        base = f"nick:{match_nick}" if match_nick else f"target:{int(target_id)}"
+        existing = await self.bot.store.fetchone("SELECT 1 FROM greet_pools WHERE name=? LIMIT 1", (base,))
+        name = f"{base}#{int(target_id)}" if existing else base
+
+        pid = await self._create_pool(name)
+        await self.bot.store.execute(
+            "UPDATE greet_targets SET pool_id=?, updated_ts=? WHERE id=?",
+            (pid, _now(), int(target_id)),
+        )
+        return pid
 
     # ----------------------------
     # IRC hooks
@@ -207,7 +247,6 @@ class GreetService:
         if parts[0].lower() != "greet":
             return
 
-        # simple subcommand router
         sub = parts[1].lower() if len(parts) >= 2 else "help"
         args = parts[2:]
 
@@ -222,7 +261,7 @@ class GreetService:
             greet = await self._pick_greeting(int(target["id"]))
             await bot.privmsg(
                 ev.target,
-                f"{ev.nick}: matched target id={target['id']} pri={target['priority']} chan={target['channel'] or 'any'} greet={greet!r}",
+                f"{ev.nick}: matched target id={target['id']} pool={target.get('pool_id')} pri={target['priority']} chan={target['channel'] or 'any'} greet={greet!r}",
             )
             return
 
@@ -230,7 +269,8 @@ class GreetService:
         if sub == "list":
             rows = await bot.store.fetchall(
                 """
-                SELECT id, enabled, priority, channel, match_nick, match_hostmask, match_userhost, match_host, cooldown_seconds
+                SELECT id, enabled, priority, channel, match_nick, match_hostmask, match_userhost, match_host,
+                       cooldown_seconds, pool_id
                 FROM greet_targets
                 ORDER BY enabled DESC, priority DESC, id ASC
                 LIMIT ?
@@ -249,6 +289,8 @@ class GreetService:
                 chan = r["channel"] or "any"
                 cd = r["cooldown_seconds"]
                 cd_s = f" cd={int(cd)}" if cd is not None else ""
+                pool = r["pool_id"]
+                pool_s = f" pool={int(pool)}" if pool is not None else " pool=?"
                 m = []
                 if r["match_nick"]:
                     m.append(f"nick={r['match_nick']}")
@@ -259,7 +301,7 @@ class GreetService:
                 if r["match_host"]:
                     m.append(f"host={r['match_host']}")
                 mtxt = " ".join(m) if m else "(no match?)"
-                bits.append(f"{mid}) {en} pri={pri} chan={chan}{cd_s} {mtxt}")
+                bits.append(f"{mid}) {en} pri={pri} chan={chan}{cd_s}{pool_s} {mtxt}")
 
             await bot.privmsg(ev.target, "GREET: " + " | ".join(bits))
             return
@@ -270,27 +312,156 @@ class GreetService:
                 await bot.privmsg(ev.target, f"{ev.nick}: usage: !greet greets <target_id>")
                 return
             tid = int(args[0])
+            pid = await self._ensure_pool_for_target(tid)
+            if pid is None:
+                await bot.privmsg(ev.target, f"{ev.nick}: unknown target {tid}")
+                return
+
             rows = await bot.store.fetchall(
-                "SELECT id, enabled, weight, text FROM greetings WHERE target_id=? ORDER BY id ASC",
-                (tid,),
+                "SELECT id, enabled, weight, text FROM greetings WHERE pool_id=? ORDER BY id ASC",
+                (int(pid),),
             )
             if not rows:
-                await bot.privmsg(ev.target, f"{ev.nick}: no greetings for target {tid}")
+                await bot.privmsg(ev.target, f"{ev.nick}: no greetings for target {tid} (pool {pid})")
                 return
             out = []
             for r in rows[:10]:
                 out.append(f"{int(r['id'])}) {'on' if int(r['enabled'])==1 else 'off'} w={int(r['weight'])} {r['text']!r}")
             more = f" (+{len(rows)-10} more)" if len(rows) > 10 else ""
-            await bot.privmsg(ev.target, f"{ev.nick}: greetings for {tid}: " + " | ".join(out) + more)
+            await bot.privmsg(ev.target, f"{ev.nick}: greetings for target {tid} (pool {pid}): " + " | ".join(out) + more)
+            return
+
+        # ---- pools: list ----
+        if sub == "pools":
+            rows = await bot.store.fetchall(
+                """
+                SELECT
+                  p.id,
+                  p.name,
+                  (SELECT COUNT(1) FROM greet_targets t WHERE t.pool_id=p.id) AS targets_n,
+                  (SELECT COUNT(1) FROM greetings g WHERE g.pool_id=p.id) AS greets_n
+                FROM greet_pools p
+                ORDER BY p.id ASC
+                LIMIT ?
+                """,
+                (int(self.max_list),),
+            )
+            if not rows:
+                await bot.privmsg(ev.target, f"{ev.nick}: no greet pools.")
+                return
+            bits = []
+            for r in rows:
+                bits.append(f"{int(r['id'])}) {r['name']} (targets={int(r['targets_n'])} greets={int(r['greets_n'])})")
+            await bot.privmsg(ev.target, "POOLS: " + " | ".join(bits))
+            return
+
+        # ---- pooladd <name> ----
+        if sub == "pooladd":
+            if len(args) < 1:
+                await bot.privmsg(ev.target, f"{ev.nick}: usage: !greet pooladd <name>")
+                return
+            name = _norm(" ".join(args))
+            if not name:
+                await bot.privmsg(ev.target, f"{ev.nick}: usage: !greet pooladd <name>")
+                return
+            exists = await bot.store.fetchone("SELECT id FROM greet_pools WHERE name=? LIMIT 1", (name,))
+            if exists:
+                await bot.privmsg(ev.target, f"{ev.nick}: pool already exists: id={int(exists[0])} name={name!r}")
+                return
+            pid = await self._create_pool(name)
+            await bot.privmsg(ev.target, f"{ev.nick}: created pool {pid} name={name!r}")
+            return
+
+        # ---- poolset <target_id> <pool_id> ----
+        if sub == "poolset":
+            if len(args) != 2 or (not args[0].isdigit()) or (not args[1].isdigit()):
+                await bot.privmsg(ev.target, f"{ev.nick}: usage: !greet poolset <target_id> <pool_id>")
+                return
+            tid = int(args[0])
+            pid = int(args[1])
+
+            trow = await bot.store.fetchone("SELECT id FROM greet_targets WHERE id=? LIMIT 1", (tid,))
+            if not trow:
+                await bot.privmsg(ev.target, f"{ev.nick}: unknown target {tid}")
+                return
+            prow = await bot.store.fetchone("SELECT id FROM greet_pools WHERE id=? LIMIT 1", (pid,))
+            if not prow:
+                await bot.privmsg(ev.target, f"{ev.nick}: unknown pool {pid}")
+                return
+
+            await bot.store.execute("UPDATE greet_targets SET pool_id=?, updated_ts=? WHERE id=?", (pid, _now(), tid))
+            await bot.privmsg(ev.target, f"{ev.nick}: target {tid} now uses pool {pid}")
+            return
+
+        # ---- poolgreets <pool_id> ----
+        if sub == "poolgreets":
+            if len(args) != 1 or not args[0].isdigit():
+                await bot.privmsg(ev.target, f"{ev.nick}: usage: !greet poolgreets <pool_id>")
+                return
+            pid = int(args[0])
+            prow = await bot.store.fetchone("SELECT name FROM greet_pools WHERE id=? LIMIT 1", (pid,))
+            if not prow:
+                await bot.privmsg(ev.target, f"{ev.nick}: unknown pool {pid}")
+                return
+
+            rows = await bot.store.fetchall(
+                "SELECT id, enabled, weight, text FROM greetings WHERE pool_id=? ORDER BY id ASC",
+                (pid,),
+            )
+            if not rows:
+                await bot.privmsg(ev.target, f"{ev.nick}: no greetings for pool {pid} ({prow[0]!s})")
+                return
+            out = []
+            for r in rows[:10]:
+                out.append(f"{int(r['id'])}) {'on' if int(r['enabled'])==1 else 'off'} w={int(r['weight'])} {r['text']!r}")
+            more = f" (+{len(rows)-10} more)" if len(rows) > 10 else ""
+            await bot.privmsg(ev.target, f"{ev.nick}: greetings for pool {pid} ({prow[0]!s}): " + " | ".join(out) + more)
+            return
+
+        # ---- pooladdgreet <pool_id> <greeting...> ----
+        if sub == "pooladdgreet":
+            if len(args) < 2 or (not args[0].isdigit()):
+                await bot.privmsg(ev.target, f"{ev.nick}: usage: !greet pooladdgreet <pool_id> <greeting...>")
+                return
+            pid = int(args[0])
+            greet_txt = _norm(" ".join(args[1:]))
+            prow = await bot.store.fetchone("SELECT id FROM greet_pools WHERE id=? LIMIT 1", (pid,))
+            if not prow:
+                await bot.privmsg(ev.target, f"{ev.nick}: unknown pool {pid}")
+                return
+            now = _now()
+            await bot.store.execute(
+                "INSERT INTO greetings(pool_id, text, weight, enabled, created_ts, updated_ts) VALUES(?, ?, 1, 1, ?, ?)",
+                (pid, greet_txt, now, now),
+            )
+            row = await bot.store.fetchone("SELECT last_insert_rowid()", ())
+            await bot.privmsg(ev.target, f"{ev.nick}: added greeting {int(row[0])} to pool {pid}.")
+            return
+
+        # ---- pooldel <pool_id> ----
+        if sub == "pooldel":
+            if len(args) != 1 or not args[0].isdigit():
+                await bot.privmsg(ev.target, f"{ev.nick}: usage: !greet pooldel <pool_id>")
+                return
+            pid = int(args[0])
+            prow = await bot.store.fetchone("SELECT name FROM greet_pools WHERE id=? LIMIT 1", (pid,))
+            if not prow:
+                await bot.privmsg(ev.target, f"{ev.nick}: unknown pool {pid}")
+                return
+            tcnt = await bot.store.fetchone("SELECT COUNT(1) FROM greet_targets WHERE pool_id=?", (pid,))
+            if tcnt and int(tcnt[0]) > 0:
+                await bot.privmsg(ev.target, f"{ev.nick}: pool {pid} is still referenced by {int(tcnt[0])} target(s). Use !greet poolset first.")
+                return
+            await bot.store.execute("DELETE FROM greet_pools WHERE id=?", (pid,))
+            await bot.privmsg(ev.target, f"{ev.nick}: deleted pool {pid} ({prow[0]!s}).")
             return
 
         # ---- helpers for adding targets/greetings ----
         async def _upsert_target(*, match_nick=None, match_hostmask=None, match_userhost=None, match_host=None, channel=None, priority=0, cooldown_seconds=None) -> int:
             now = _now()
-            # We don't have a natural UNIQUE constraint; do "find existing" by exact match set.
             row = await bot.store.fetchone(
                 """
-                SELECT id FROM greet_targets
+                SELECT id, pool_id FROM greet_targets
                 WHERE
                   COALESCE(match_nick,'')=COALESCE(?, '')
                   AND COALESCE(match_hostmask,'')=COALESCE(?, '')
@@ -317,15 +488,16 @@ class GreetService:
                     """,
                     (int(priority), cooldown_seconds, now, tid),
                 )
+                await self._ensure_pool_for_target(tid)
                 return tid
 
             await bot.store.execute(
                 """
                 INSERT INTO greet_targets(
                   enabled, priority, match_nick, match_hostmask, match_userhost, match_host,
-                  channel, cooldown_seconds, created_ts, updated_ts
+                  channel, cooldown_seconds, created_ts, updated_ts, pool_id
                 )
-                VALUES(1,?,?,?,?,?,?,?,?,?)
+                VALUES(1,?,?,?,?,?,?,?,?,?,?,NULL)
                 """,
                 (
                     int(priority),
@@ -340,16 +512,18 @@ class GreetService:
                 ),
             )
             row2 = await bot.store.fetchone("SELECT last_insert_rowid()", ())
-            return int(row2[0])
+            tid = int(row2[0])
+            await self._ensure_pool_for_target(tid)
+            return tid
 
-        async def _add_greeting(target_id: int, text: str) -> int:
+        async def _add_greeting_to_target(target_id: int, text: str) -> int:
             now = _now()
+            pid = await self._ensure_pool_for_target(int(target_id))
+            if pid is None:
+                raise RuntimeError("target not found")
             await bot.store.execute(
-                """
-                INSERT INTO greetings(target_id, text, weight, enabled, created_ts, updated_ts)
-                VALUES(?, ?, 1, 1, ?, ?)
-                """,
-                (int(target_id), text, now, now),
+                "INSERT INTO greetings(pool_id, text, weight, enabled, created_ts, updated_ts) VALUES(?, ?, 1, 1, ?, ?)",
+                (int(pid), text, now, now),
             )
             row = await bot.store.fetchone("SELECT last_insert_rowid()", ())
             return int(row[0])
@@ -365,7 +539,7 @@ class GreetService:
                 await bot.privmsg(ev.target, f"{ev.nick}: usage: !greet addnick <nick> <greeting...>")
                 return
             tid = await _upsert_target(match_nick=nick)
-            gid = await _add_greeting(tid, greet_txt)
+            gid = await _add_greeting_to_target(tid, greet_txt)
             await bot.privmsg(ev.target, f"{ev.nick}: added target {tid} (nick={nick}), greeting {gid}.")
             return
 
@@ -377,7 +551,7 @@ class GreetService:
             pat = _norm(args[0])
             greet_txt = _norm(" ".join(args[1:]))
             tid = await _upsert_target(match_host=pat)
-            gid = await _add_greeting(tid, greet_txt)
+            gid = await _add_greeting_to_target(tid, greet_txt)
             await bot.privmsg(ev.target, f"{ev.nick}: added target {tid} (host={pat}), greeting {gid}.")
             return
 
@@ -389,7 +563,7 @@ class GreetService:
             pat = _norm(args[0])
             greet_txt = _norm(" ".join(args[1:]))
             tid = await _upsert_target(match_hostmask=pat)
-            gid = await _add_greeting(tid, greet_txt)
+            gid = await _add_greeting_to_target(tid, greet_txt)
             await bot.privmsg(ev.target, f"{ev.nick}: added target {tid} (mask={pat}), greeting {gid}.")
             return
 
@@ -466,16 +640,15 @@ class GreetService:
             except Exception:
                 await bot.privmsg(ev.target, f"{ev.nick}: seconds must be an integer")
                 return
-            if sec <= 0:
-                sec_val = None
-            else:
-                sec_val = sec
+            sec_val = None if sec <= 0 else sec
             await bot.store.execute("UPDATE greet_targets SET cooldown_seconds=?, updated_ts=? WHERE id=?", (sec_val, _now(), tid))
             await bot.privmsg(ev.target, f"{ev.nick}: target {tid} cooldown set to {sec_val or 0}s.")
             return
 
-        # fallback help
         await bot.privmsg(
             ev.target,
-            f"{ev.nick}: usage: !greet list | greets <tid> | addnick <nick> <greet> | addhost <pat> <greet> | addmask <pat> <greet> | deltarget <tid> | delgreet <gid> | enable/disable <tid> | setpri <tid> <pri> | setchan <tid> <#chan|any> | setcd <tid> <sec|0> | test",
+            f"{ev.nick}: usage: "
+            "targets: list | greets <tid> | addnick <nick> <greet> | addhost <pat> <greet> | addmask <pat> <greet> | "
+            "deltarget <tid> | delgreet <gid> | enable/disable <tid> | setpri <tid> <pri> | setchan <tid> <#chan|any> | setcd <tid> <sec|0> | test | "
+            "pools: pools | pooladd <name> | poolset <tid> <pid> | poolgreets <pid> | pooladdgreet <pid> <greet> | pooldel <pid>",
         )
