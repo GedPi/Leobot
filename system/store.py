@@ -100,7 +100,6 @@ class Store:
         return [(str(r[0]), bool(r[1])) for r in rows]
 
     # ---- ACL sessions ----
-    # Your deployed system/acl.py expects these to exist.
     async def get_acl_session(self, identity_key: str):
         return await self.fetchone(
             "SELECT role, auth_until_ts FROM acl_sessions WHERE identity_key=?",
@@ -147,11 +146,23 @@ class Store:
         )
 
     async def news_set_category(self, source_id: str, category: str, url: str) -> None:
-        now = int(time.time())
+        """
+        Upsert category URL for a source.
+
+        NOTE: Some older schemas don't have created_ts/updated_ts on news_source_categories.
+        We deliberately only depend on (source_id, category, url) to stay compatible.
+        """
         await self.execute(
-            "INSERT INTO news_source_categories(source_id,category,url,created_ts,updated_ts) VALUES(?,?,?,?,?) "
-            "ON CONFLICT(source_id,category) DO UPDATE SET url=excluded.url, updated_ts=excluded.updated_ts",
-            (source_id, category, url, now, now),
+            "INSERT INTO news_source_categories(source_id,category,url) VALUES(?,?,?) "
+            "ON CONFLICT(source_id,category) DO UPDATE SET url=excluded.url",
+            (source_id, category, url),
+        )
+
+    async def news_list_categories(self, source_id: str):
+        """List categories for a source (used by services/news.py)."""
+        return await self.fetchall(
+            "SELECT category, url FROM news_source_categories WHERE source_id=? ORDER BY category ASC",
+            (source_id,),
         )
 
     async def news_get_last_posted(self, channel: str, source_id: str, category: str, limit: int) -> int | None:
@@ -168,7 +179,7 @@ class Store:
             (channel, source_id, category, int(limit), int(ts)),
         )
 
-    # ---- Greet helpers (pool approach) ----
+    # ---- Greet helpers (pool approach handled in greet.py + migrations; store keeps target selection) ----
     async def greet_select_target(
         self,
         *,
@@ -232,10 +243,25 @@ class Store:
         return None
 
     async def greet_pick_greeting(self, target_id: int) -> str | None:
-        rows = await self.fetchall(
-            "SELECT id,text,weight FROM greetings WHERE target_id=? AND enabled=1",
-            (int(target_id),),
-        )
+        # NOTE: If you're running greet pools, greet.py should be resolving to pool_id and storing greetings by pool.
+        # This method is kept for compatibility; if your DB has greetings.pool_id instead of target_id,
+        # greet.py should not call this path.
+        cols = await self._table_columns("greetings")
+
+        if "pool_id" in cols:
+            row = await self.fetchone("SELECT pool_id FROM greet_targets WHERE id=?", (int(target_id),))
+            if not row or row[0] is None:
+                return None
+            rows = await self.fetchall(
+                "SELECT id,text,weight FROM greetings WHERE pool_id=? AND enabled=1",
+                (int(row[0]),),
+            )
+        else:
+            rows = await self.fetchall(
+                "SELECT id,text,weight FROM greetings WHERE target_id=? AND enabled=1",
+                (int(target_id),),
+            )
+
         if not rows:
             return None
 
@@ -257,6 +283,14 @@ class Store:
             if pick < acc:
                 return txt
         return items[-1][0]
+
+    async def _table_columns(self, table: str) -> set[str]:
+        async with self._lock:
+            try:
+                rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+                return {str(r[1]) for r in rows}
+            except Exception:
+                return set()
 
     # ---- Weather watches ----
     async def weather_watch_add(
