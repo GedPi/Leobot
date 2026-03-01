@@ -450,11 +450,28 @@ def migrate_v3(conn: sqlite3.Connection) -> None:
         """
     )
 
+def migrate_v4(conn: sqlite3.Connection) -> None:
+    # Sysmon: persistent event log for alerts / forensic trail
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS sys_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts INTEGER NOT NULL,
+          level TEXT NOT NULL,          -- INFO/WARN/ERROR
+          source TEXT NOT NULL,         -- e.g. systemd, sshd, sysmon
+          kind TEXT NOT NULL,           -- e.g. failed_units, service_down, auth_fail
+          message TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_sys_events_ts ON sys_events(ts);
+        CREATE INDEX IF NOT EXISTS idx_sys_events_kind_ts ON sys_events(kind, ts);
+        """
+    )
 
 MIGRATIONS = {
     1: migrate_v1,
     2: migrate_v2,
     3: migrate_v3,
+    4: migrate_v4,
 }
 
 
