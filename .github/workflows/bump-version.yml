@@ -1,0 +1,88 @@
+name: bump-version
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decide bump (major/minor/patch)
+        id: bump
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          msg="$(git log -1 --pretty=%s)"
+          msg_lc="$(echo "$msg" | tr '[:upper:]' '[:lower:]')"
+
+          bump=""
+          if [[ "$msg_lc" == major:* ]]; then bump="major"; fi
+          if [[ "$msg_lc" == minor:* ]]; then bump="minor"; fi
+          if [[ "$msg_lc" == patch:* ]]; then bump="patch"; fi
+
+          echo "commit_subject=$msg" >> "$GITHUB_OUTPUT"
+          echo "bump=$bump" >> "$GITHUB_OUTPUT"
+
+      - name: Stop if no bump prefix
+        if: steps.bump.outputs.bump == ''
+        run: |
+          echo "No major:/minor:/patch: prefix on last commit; skipping."
+          exit 0
+
+      - name: Bump VERSION
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f VERSION || { echo "VERSION file missing"; exit 1; }
+          v="$(cat VERSION | tr -d ' \t\r\n')"
+          IFS='.' read -r major minor patch <<< "$v"
+
+          re='^[0-9]+$'
+          [[ "$major" =~ $re && "$minor" =~ $re && "$patch" =~ $re ]] || { echo "Bad VERSION: $v"; exit 1; }
+
+          bump="${{ steps.bump.outputs.bump }}"
+          if [[ "$bump" == "major" ]]; then
+            major=$((major+1)); minor=0; patch=0
+          elif [[ "$bump" == "minor" ]]; then
+            minor=$((minor+1)); patch=0
+          else
+            patch=$((patch+1))
+          fi
+
+          new="${major}.${minor}.${patch}"
+          echo "$new" > VERSION
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+
+      - name: Commit VERSION bump
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add VERSION
+          git commit -m "chore: bump version to v${{ steps.ver.outputs.new }}"
+
+      - name: Tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          git tag -a "v${{ steps.ver.outputs.new }}" -m "v${{ steps.ver.outputs.new }}"
+
+      - name: Push commit + tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push origin main
+          git push origin "v${{ steps.ver.outputs.new }}"
