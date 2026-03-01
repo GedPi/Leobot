@@ -15,11 +15,12 @@ log = logging.getLogger("leobot.acl")
 ROLE_ORDER = {"guest": 0, "user": 1, "contributor": 2, "admin": 3}
 _STATUS_DIGITS = {"0", "1", "2", "3"}
 
-# Your log showed NickServ replying right around 3s.
-# Give it breathing room.
+# NickServ on your network can reply right on the boundary; don't be cute with 3s.
 NICKSERV_STATUS_TIMEOUT = 8.0
-NICKSERV_STATUS_GRACE = 0.75  # seconds
-NICKSERV_STATUS_GRACE_POLL = 0.05  # seconds
+
+# Grace window to catch replies that land just after timeout (scheduler slice / jitter).
+NICKSERV_STATUS_GRACE = 0.75
+NICKSERV_STATUS_GRACE_POLL = 0.05
 
 # Cache NickServ STATUS results briefly to avoid races and reduce traffic.
 NICKSERV_STATUS_CACHE_TTL = 60  # seconds
@@ -78,10 +79,6 @@ class ACL:
     API CONTRACTS (used elsewhere):
       - help.py calls: await bot.acl.effective_role(ev)
       - dispatcher.py calls: await bot.acl.precheck(bot, ev)
-
-    NickServ:
-      - Your services reply with NOTICE (confirmed in logs).
-      - We cache parsed STATUS results to avoid timeout races.
     """
 
     def __init__(self, store, cfg: dict):
@@ -106,7 +103,7 @@ class ACL:
         self._commands_registered = False
         self._bootstrapped_master = False
 
-        # Store bot reference for callers that only provide ev (e.g. help -> effective_role(ev))
+        # Store bot reference for callers that only provide ev (help -> effective_role(ev))
         self._bot: Optional[object] = None
 
     def _bind_bot(self, bot) -> None:
@@ -228,7 +225,7 @@ class ACL:
         await self._ensure_schema()
         await self._bootstrap_master(bot)
 
-    # ---------------- legacy mask role (unchanged) ----------------
+    # ---------------- role resolution ----------------
 
     def _mask_role(self, ev: Event) -> Role:
         hostmask = ""
@@ -247,7 +244,6 @@ class ACL:
                 return "user"
             if host and fnmatch(host, pat):
                 return "user"
-
         return "guest"
 
     async def session_role(self, ev: Event) -> Role | None:
@@ -287,7 +283,7 @@ class ACL:
                 best = r
         return best
 
-    # ---------------- NickServ STATUS parsing + cache ----------------
+    # ---------------- NickServ STATUS cache/parsing ----------------
 
     def _cache_set(self, nick: str, status: int) -> None:
         self._ns_cache[nick.lower()] = (int(status), int(time.time()))
@@ -305,11 +301,6 @@ class ACL:
         return int(status)
 
     def _consume_status_line(self, text: str) -> bool:
-        """
-        Extract status for any nick from arbitrary NickServ text.
-        - Always updates cache if a status is found.
-        - Completes pending futures if present.
-        """
         txt = (text or "").strip()
         if not txt:
             return False
@@ -330,8 +321,6 @@ class ACL:
                     fut = self._ns_pending.get(nick_tok)
                     if fut and not fut.done():
                         fut.set_result(st)
-                        return True
-                # Even if no pending, cache update matters.
                 return True
 
         # Pattern 2: "status <nick> <digit>"
@@ -344,7 +333,6 @@ class ACL:
                     fut = self._ns_pending.get(nick_tok)
                     if fut and not fut.done():
                         fut.set_result(st)
-                        return True
                 return True
 
         # Pattern 3: pending nick appears, then within next 6 tokens a digit
@@ -364,24 +352,45 @@ class ACL:
 
         return False
 
-async def nickserv_status(self, bot, nick: str, timeout: float = NICKSERV_STATUS_TIMEOUT) -> int | None:
-    n = (nick or "").strip()
-    if not n:
-        return None
-    key = n.lower()
+    async def nickserv_status(self, bot, nick: str, timeout: float = NICKSERV_STATUS_TIMEOUT) -> int | None:
+        n = (nick or "").strip()
+        if not n:
+            return None
+        key = n.lower()
 
-    # Fast path: cache
-    cached = self._cache_get(key)
-    if cached is not None:
-        return cached
+        # Fast path: cache
+        cached = self._cache_get(key)
+        if cached is not None:
+            return cached
 
-    # If already pending, wait for it
-    fut = self._ns_pending.get(key)
-    if fut and not fut.done():
+        # If already pending, wait for it
+        fut = self._ns_pending.get(key)
+        if fut and not fut.done():
+            try:
+                return int(await asyncio.wait_for(fut, timeout=timeout))
+            except Exception:
+                end = time.time() + NICKSERV_STATUS_GRACE
+                while time.time() < end:
+                    c = self._cache_get(key)
+                    if c is not None:
+                        return c
+                    await asyncio.sleep(NICKSERV_STATUS_GRACE_POLL)
+                return self._cache_get(key)
+
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._ns_pending[key] = fut
+
         try:
-            return int(await asyncio.wait_for(fut, timeout=timeout))
+            await bot.privmsg("NickServ", f"STATUS {n}")
         except Exception:
-            # grace: allow notice to land just after timeout
+            self._ns_pending.pop(key, None)
+            return None
+
+        try:
+            val = await asyncio.wait_for(fut, timeout=timeout)
+            return int(val)
+        except Exception:
             end = time.time() + NICKSERV_STATUS_GRACE
             while time.time() < end:
                 c = self._cache_get(key)
@@ -389,31 +398,8 @@ async def nickserv_status(self, bot, nick: str, timeout: float = NICKSERV_STATUS
                     return c
                 await asyncio.sleep(NICKSERV_STATUS_GRACE_POLL)
             return self._cache_get(key)
-
-    loop = asyncio.get_running_loop()
-    fut = loop.create_future()
-    self._ns_pending[key] = fut
-
-    try:
-        await bot.privmsg("NickServ", f"STATUS {n}")
-    except Exception:
-        self._ns_pending.pop(key, None)
-        return None
-
-    try:
-        val = await asyncio.wait_for(fut, timeout=timeout)
-        return int(val)
-    except Exception:
-        # reply may arrive just after timeout; grace polling covers that case
-        end = time.time() + NICKSERV_STATUS_GRACE
-        while time.time() < end:
-            c = self._cache_get(key)
-            if c is not None:
-                return c
-            await asyncio.sleep(NICKSERV_STATUS_GRACE_POLL)
-        return self._cache_get(key)
-    finally:
-        self._ns_pending.pop(key, None)
+        finally:
+            self._ns_pending.pop(key, None)
 
     async def _maybe_consume_nickserv_reply(self, ev: Event) -> None:
         if (ev.nick or "").strip().lower() != "nickserv":
@@ -440,7 +426,7 @@ async def nickserv_status(self, bot, nick: str, timeout: float = NICKSERV_STATUS
     async def handle_core(self, bot, ev: Event) -> bool:
         await self._lazy_init(bot)
 
-        # Always try to consume NickServ replies (PRIVMSG)
+        # Consume NickServ PRIVMSG replies if they come that way (your NOTICE is handled via on_notice)
         await self._maybe_consume_nickserv_reply(ev)
 
         prefix = bot.cfg.get("command_prefix", "!")
@@ -448,7 +434,7 @@ async def nickserv_status(self, bot, nick: str, timeout: float = NICKSERV_STATUS
         if not txt.startswith(prefix):
             return False
 
-        cmdline = txt[len(prefix) :].strip()
+        cmdline = txt[len(prefix):].strip()
         if not cmdline:
             return False
 
@@ -567,7 +553,6 @@ async def nickserv_status(self, bot, nick: str, timeout: float = NICKSERV_STATUS
             await bot.privmsg(ev.target, f"{ev.nick}: unknown subcommand. Use: adduser, deluser, usrlist, addserv, delserv, servlist")
             return True
 
-        # Existing !auth remains unchanged
         if cmd != "auth":
             return False
 
@@ -601,7 +586,7 @@ async def nickserv_status(self, bot, nick: str, timeout: float = NICKSERV_STATUS
     async def precheck(self, bot, ev: Event) -> bool:
         await self._lazy_init(bot)
 
-        # Consume NickServ replies (dispatcher calls precheck for ALL PRIVMSG)
+        # Consume NickServ PRIVMSG replies (NOTICE handled via on_notice)
         await self._maybe_consume_nickserv_reply(ev)
 
         prefix = bot.cfg.get("command_prefix", "!")
@@ -609,7 +594,7 @@ async def nickserv_status(self, bot, nick: str, timeout: float = NICKSERV_STATUS
         if not txt.startswith(prefix):
             return True
 
-        cmdline = txt[len(prefix) :].strip().lower()
+        cmdline = txt[len(prefix):].strip().lower()
         if not cmdline:
             return True
 
