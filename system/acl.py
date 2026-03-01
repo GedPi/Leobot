@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from fnmatch import fnmatch
 import re
+from typing import Optional
 
 from system.types import Event, Role
 
@@ -15,10 +16,6 @@ log = logging.getLogger("leobot.acl")
 ROLE_ORDER = {"guest": 0, "user": 1, "contributor": 2, "admin": 3}
 
 # Accept numeric status 0..3 in common NickServ STATUS response formats.
-# We'll parse by scanning tokens for patterns:
-#   - "<nick> <0-3>"
-#   - "STATUS <nick> <0-3>"
-#   - "... <nick> ... <0-3> ..." (fallback: nick followed soon by digit)
 _STATUS_DIGITS = {"0", "1", "2", "3"}
 
 
@@ -55,6 +52,18 @@ def _norm_cmd(s: str) -> str:
     return (s or "").strip().lower().lstrip("!")
 
 
+def _clean_token(tok: str) -> str:
+    """
+    Normalize IRC-ish tokens for matching:
+      - lower-case
+      - strip common punctuation that appears in NickServ output: "Ged:" "Ged," etc
+    """
+    t = (tok or "").strip().lower()
+    # strip leading/trailing punctuation often seen in STATUS output
+    t = t.strip(",:;.!?()[]{}<>\"'")
+    return t
+
+
 @dataclass(slots=True)
 class ACLConfig:
     admins: list[dict]
@@ -71,6 +80,10 @@ class ACL:
     IMPORTANT architectural detail:
       - ACL is a CORE handler. Your bot only calls on_ready() for SERVICES.
       - Therefore, schema creation + command registration must happen lazily from precheck()/handle_core().
+
+    CRITICAL API CONTRACTS (used elsewhere):
+      - help.py calls: await bot.acl.effective_role(ev)
+      - dispatcher.py calls: await bot.acl.precheck(bot, ev)
     """
 
     def __init__(self, store, cfg: dict):
@@ -91,6 +104,13 @@ class ACL:
         self._schema_ready = False
         self._commands_registered = False
         self._bootstrapped_master = False
+
+        # Store bot reference for places that only receive `ev` (e.g. help.py -> effective_role(ev))
+        self._bot: Optional[object] = None
+
+    def _bind_bot(self, bot) -> None:
+        if self._bot is None:
+            self._bot = bot
 
     # ---------------- lazy init ----------------
 
@@ -146,8 +166,6 @@ class ACL:
         if self._commands_registered:
             return
 
-        # Register command metadata so !help / !commands can show them.
-        # This is safe to run once; bot.register_command overwrites by key.
         try:
             bot.register_command(
                 "acl",
@@ -203,6 +221,16 @@ class ACL:
 
         self._commands_registered = True
 
+    async def _lazy_init(self, bot) -> None:
+        """
+        Perform all lazy init tasks that require `bot`.
+        This is safe to call repeatedly.
+        """
+        self._bind_bot(bot)
+        self._ensure_commands_registered(bot)
+        await self._ensure_schema()
+        await self._bootstrap_master(bot)
+
     # ---------------- legacy mask role (unchanged) ----------------
 
     def _mask_role(self, ev: Event) -> Role:
@@ -245,10 +273,17 @@ class ACL:
             return None
         return _norm_role(str(row[0]))
 
-    async def effective_role(self, bot, ev: Event) -> Role:
-        # Ensure bootstrap/registration happens early
-        self._ensure_commands_registered(bot)
-        await self._bootstrap_master(bot)
+    async def effective_role(self, ev: Event) -> Role:
+        """
+        Signature MUST remain `effective_role(ev)` (help.py depends on this).
+        If we have a bot bound, we ensure command registration + bootstrap has occurred.
+        """
+        if self._bot is not None:
+            try:
+                # best effort: ensure help visibility & bootstrap for callers that only hit help first
+                self._ensure_commands_registered(self._bot)
+            except Exception:
+                pass
 
         base = self._mask_role(ev)
         sess = await self.session_role(ev)
@@ -271,35 +306,36 @@ class ACL:
         if not txt:
             return False
 
-        parts = txt.split()
-        if len(parts) < 2:
+        raw_parts = txt.split()
+        if len(raw_parts) < 2:
             return False
+
+        parts = [_clean_token(p) for p in raw_parts]
 
         # Pattern 1: "<nick> <digit>"
         for i in range(len(parts) - 1):
             if parts[i + 1] in _STATUS_DIGITS:
-                nick_tok = parts[i].strip()
-                fut = self._ns_pending.get(nick_tok.lower())
+                nick_tok = parts[i]
+                fut = self._ns_pending.get(nick_tok)
                 if fut and not fut.done():
                     fut.set_result(int(parts[i + 1]))
                     return True
 
-        # Pattern 2: "STATUS <nick> <digit>"
+        # Pattern 2: "status <nick> <digit>"
         for i in range(len(parts) - 2):
-            if parts[i].lower() == "status" and parts[i + 2] in _STATUS_DIGITS:
-                nick_tok = parts[i + 1].strip()
-                fut = self._ns_pending.get(nick_tok.lower())
+            if parts[i] == "status" and parts[i + 2] in _STATUS_DIGITS:
+                nick_tok = parts[i + 1]
+                fut = self._ns_pending.get(nick_tok)
                 if fut and not fut.done():
                     fut.set_result(int(parts[i + 2]))
                     return True
 
-        # Pattern 3: nick appears, then within next 6 tokens a digit
-        lowered = [p.lower() for p in parts]
+        # Pattern 3: nick appears, then within next 6 tokens a digit (handles "status for nick: 3")
         for pending_nick, fut in list(self._ns_pending.items()):
             if not fut or fut.done():
                 continue
-            if pending_nick in lowered:
-                idxs = [i for i, p in enumerate(lowered) if p == pending_nick]
+            if pending_nick in parts:
+                idxs = [i for i, p in enumerate(parts) if p == pending_nick]
                 for idx in idxs:
                     window = parts[idx + 1 : idx + 7]
                     for w in window:
@@ -364,6 +400,8 @@ class ACL:
     # ---------------- core commands ----------------
 
     async def handle_core(self, bot, ev: Event) -> bool:
+        await self._lazy_init(bot)
+
         # Always try to consume NickServ replies (they are PRIVMSG in your network)
         await self._maybe_consume_nickserv_reply(ev)
 
@@ -380,12 +418,12 @@ class ACL:
         cmd = parts[0].lower()
 
         if cmd == "whoami":
-            role = await self.effective_role(bot, ev)
+            role = await self.effective_role(ev)
             await bot.privmsg(ev.target, f"{ev.nick}: role={role} identity={_identity_key(ev)}")
             return True
 
         if cmd == "acl":
-            role = await self.effective_role(bot, ev)
+            role = await self.effective_role(ev)
             if ROLE_ORDER.get(role, 0) < ROLE_ORDER["admin"]:
                 await bot.privmsg(ev.target, f"{ev.nick}: not allowed (requires admin).")
                 return True
@@ -402,7 +440,7 @@ class ACL:
                 if not ok:
                     return True
 
-            await self._ensure_schema()
+            # (schema already ensured by _lazy_init)
 
             if sub == "adduser":
                 if len(parts) != 4:
@@ -527,6 +565,8 @@ class ACL:
         return True
 
     async def precheck(self, bot, ev: Event) -> bool:
+        await self._lazy_init(bot)
+
         # Consume NickServ replies (dispatcher calls precheck for ALL PRIVMSG)
         await self._maybe_consume_nickserv_reply(ev)
 
@@ -538,11 +578,6 @@ class ACL:
         cmdline = txt[len(prefix) :].strip().lower()
         if not cmdline:
             return True
-
-        # ensure help visibility + master bootstrap early
-        self._ensure_commands_registered(bot)
-        await self._bootstrap_master(bot)
-        await self._ensure_schema()
 
         # choose longest matching registered command ("service enable" etc)
         parts = cmdline.split()
@@ -562,7 +597,7 @@ class ACL:
         if cmd in ("auth", "whoami", "help", "commands"):
             return True
 
-        role = await self.effective_role(bot, ev)
+        role = await self.effective_role(ev)
 
         row = await self.store.fetchone("SELECT min_role FROM acl_command_perms WHERE command=?", (cmd,))
         if row:
