@@ -604,12 +604,36 @@ def migrate_v5(conn: sqlite3.Connection) -> None:
         """
     )
 
+
+def migrate_v6(conn: sqlite3.Connection) -> None:
+    """DB-backed ACL identities + per-command permission overrides."""
+    conn.executescript(
+        """
+        -- ACL identities (nick-based for now)
+        CREATE TABLE IF NOT EXISTS acl_identities (
+            ident TEXT PRIMARY KEY,          -- lowercased nick
+            role TEXT NOT NULL,              -- guest|user|contributor|admin
+            created_ts INTEGER NOT NULL
+        );
+
+        -- Per-command minimum role overrides
+        CREATE TABLE IF NOT EXISTS acl_command_perms (
+            command TEXT PRIMARY KEY,        -- command key as registered (supports subcommands)
+            min_role TEXT NOT NULL,          -- guest|user|contributor|admin
+            updated_ts INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_acl_identities_role ON acl_identities(role);
+        """
+    )
+
 MIGRATIONS = {
     1: migrate_v1,
     2: migrate_v2,
     3: migrate_v3,
     4: migrate_v4,
     5: migrate_v5,
+    6: migrate_v6,
 }
 
 

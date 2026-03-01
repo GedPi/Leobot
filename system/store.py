@@ -117,6 +117,80 @@ class Store:
     async def clear_acl_session(self, identity_key: str) -> None:
         await self.execute("DELETE FROM acl_sessions WHERE identity_key=?", (identity_key,))
 
+    async def prune_acl_sessions(self) -> int:
+        """Remove expired ACL sessions. Returns number of rows deleted."""
+        now = int(time.time())
+        async with self._lock:
+            cur = self._conn.execute("DELETE FROM acl_sessions WHERE auth_until_ts<=?", (now,))
+            return int(cur.rowcount or 0)
+
+    # ---- DB-backed ACL identities + per-command permissions ----
+    async def acl_count_admins(self) -> int:
+        row = await self.fetchone("SELECT COUNT(*) FROM acl_identities WHERE role='admin'", ())
+        return int(row[0]) if row else 0
+
+    async def acl_get_identity_role(self, ident: str) -> str | None:
+        ident_l = (ident or "").strip().lower()
+        if not ident_l:
+            return None
+        row = await self.fetchone("SELECT role FROM acl_identities WHERE ident=?", (ident_l,))
+        return str(row[0]) if row else None
+
+    async def acl_set_identity_role(self, ident: str, role: str) -> None:
+        ident_l = (ident or "").strip().lower()
+        if not ident_l:
+            return
+        now = int(time.time())
+        await self.execute(
+            "INSERT INTO acl_identities(ident,role,created_ts) VALUES(?,?,?) "
+            "ON CONFLICT(ident) DO UPDATE SET role=excluded.role",
+            (ident_l, role, now),
+        )
+
+    async def acl_del_identity(self, ident: str) -> None:
+        ident_l = (ident or "").strip().lower()
+        if not ident_l:
+            return
+        await self.execute("DELETE FROM acl_identities WHERE ident=?", (ident_l,))
+
+    async def acl_list_identities(self, role: str) -> list[str]:
+        rows = await self.fetchall(
+            "SELECT ident FROM acl_identities WHERE role=? ORDER BY ident ASC",
+            (role,),
+        )
+        return [str(r[0]) for r in rows] if rows else []
+
+    async def acl_get_command_min_role(self, command: str) -> str | None:
+        cmd = (command or "").strip().lower()
+        if not cmd:
+            return None
+        row = await self.fetchone("SELECT min_role FROM acl_command_perms WHERE command=?", (cmd,))
+        return str(row[0]) if row else None
+
+    async def acl_set_command_min_role(self, command: str, min_role: str) -> None:
+        cmd = (command or "").strip().lower()
+        if not cmd:
+            return
+        now = int(time.time())
+        await self.execute(
+            "INSERT INTO acl_command_perms(command,min_role,updated_ts) VALUES(?,?,?) "
+            "ON CONFLICT(command) DO UPDATE SET min_role=excluded.min_role, updated_ts=excluded.updated_ts",
+            (cmd, min_role, now),
+        )
+
+    async def acl_del_command_min_role(self, command: str) -> None:
+        cmd = (command or "").strip().lower()
+        if not cmd:
+            return
+        await self.execute("DELETE FROM acl_command_perms WHERE command=?", (cmd,))
+
+    async def acl_list_command_perms(self) -> list[tuple[str, str]]:
+        rows = await self.fetchall(
+            "SELECT command, min_role FROM acl_command_perms ORDER BY min_role DESC, command ASC",
+            (),
+        )
+        return [(str(r[0]), str(r[1])) for r in rows] if rows else []
+
     # ---- News sources & categories ----
     async def news_list_sources(self):
         return await self.fetchall(
