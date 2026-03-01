@@ -65,13 +65,18 @@ def _parse_window(args: list[str], now_ts: int) -> Tuple[Window, list[str]]:
         start, end = _utc_day_bounds_for_date(tok)
         return Window(f"{tok} UTC", start, end), args[1:]
 
-    # not a window token
     return Window("last 24h", now_ts - 86400, now_ts + 1), args
+
+
+def _parse_channel_override(args: list[str]) -> Tuple[Optional[str], list[str]]:
+    if args and args[0].startswith("#"):
+        return args[0], args[1:]
+    return None, args
 
 
 class StatsService:
     """
-    !stats [nick] [window]
+    !stats [me|nick|top] [N] [#channel] [window]
 
     window:
       - (default) last 24h
@@ -90,7 +95,7 @@ class StatsService:
             "stats",
             min_role="user",
             mutating=False,
-            help="Usage: !stats [nick] [today|24h|7d|all|YYYY-MM-DD]. Default=24h.",
+            help="Usage: !stats [me|nick|top] [N] [#channel] [today|24h|7d|all|YYYY-MM-DD]. Default=24h.",
             category="Utility",
         )
 
@@ -111,28 +116,50 @@ class StatsService:
         args = parts[1:]
         now = int(time.time())
 
-        # Decide if first arg is a window token/date or a nick
+        # Subcommands
+        if args and args[0].lower() == "top":
+            await self._cmd_top(bot, ev, args[1:], now)
+            return
+
+        # "me" explicit
+        if args and args[0].lower() == "me":
+            args = args[1:]
+            chan_override, args = _parse_channel_override(args)
+            window, _ = _parse_window(args, now)
+            await self._report_nick(bot, ev, ev.nick, chan_override or ev.channel, window, now)
+            return
+
+        # Otherwise: maybe channel override, maybe nick, maybe window
+        chan_override, args2 = _parse_channel_override(args)
+
+        # If first token is a window, it applies to "self"
+        window, rem = _parse_window(args2, now)
+        if rem != args2:
+            await self._report_nick(bot, ev, ev.nick, chan_override or ev.channel, window, now)
+            return
+
+        # Else if token exists, treat it as nick then parse window
         nick = ev.nick
-        window = None
+        rest = args2
+        if rest:
+            nick = rest[0]
+            rest = rest[1:]
 
-        if args:
-            # Try parse window first
-            w, rem = _parse_window(args, now)
-            if rem != args:
-                # first token was window
-                window = w
-                args = rem
-            else:
-                # first token wasn't a window; treat as nick, then parse window from the remainder
-                nick = args[0]
-                args = args[1:]
-                w2, rem2 = _parse_window(args, now)
-                window = w2
-                args = rem2
-        else:
-            window = Window("last 24h", now - 86400, now + 1)
+        window2, _ = _parse_window(rest, now)
+        await self._report_nick(bot, ev, nick, chan_override or ev.channel, window2, now)
 
-        # Build WHERE fragments
+    async def _cmd_top(self, bot, ev, args: list[str], now: int) -> None:
+        # Parse N
+        n = 10
+        if args and args[0].isdigit():
+            n = max(1, min(50, int(args[0])))
+            args = args[1:]
+
+        chan_override, args = _parse_channel_override(args)
+        channel = chan_override or ev.channel
+
+        window, _ = _parse_window(args, now)
+
         where_time = ""
         params_time = []
         if window.start_ts is not None:
@@ -142,9 +169,52 @@ class StatsService:
             where_time += " AND ts < ?"
             params_time.append(int(window.end_ts))
 
-        chan_param = ev.channel
+        rows = await bot.store.fetchall(
+            f"""
+            SELECT actor_nick,
+                   SUM(CASE WHEN event='PRIVMSG' THEN 1 ELSE 0 END) AS msgs,
+                   SUM(CASE WHEN event='ACTION' THEN 1 ELSE 0 END) AS actions
+            FROM irc_log
+            WHERE channel IS NOT NULL AND lower(channel)=lower(?)
+              AND actor_nick IS NOT NULL
+              AND event IN ('PRIVMSG','ACTION')
+              {where_time}
+            GROUP BY lower(actor_nick)
+            ORDER BY msgs DESC, actions DESC
+            LIMIT ?
+            """,
+            (channel, *params_time, int(n)),
+        )
 
-        # Channel-scoped aggregates
+        if not rows:
+            await bot.privmsg(ev.target, f"{ev.nick}: no data for {channel} ({window.label}).")
+            return
+
+        # Build compact leaderboard
+        parts = []
+        rank = 1
+        for r in rows:
+            nick = r[0]
+            msgs = int(r[1] or 0)
+            actions = int(r[2] or 0)
+            if actions:
+                parts.append(f"{rank}) {nick} {msgs} msgs (+{actions} act)")
+            else:
+                parts.append(f"{rank}) {nick} {msgs} msgs")
+            rank += 1
+
+        await bot.privmsg(ev.target, f"{ev.nick}: top {len(rows)} in {channel} ({window.label}): " + " | ".join(parts))
+
+    async def _report_nick(self, bot, ev, nick: str, channel: str, window: Window, now: int) -> None:
+        where_time = ""
+        params_time = []
+        if window.start_ts is not None:
+            where_time += " AND ts >= ?"
+            params_time.append(int(window.start_ts))
+        if window.end_ts is not None:
+            where_time += " AND ts < ?"
+            params_time.append(int(window.end_ts))
+
         row = await bot.store.fetchone(
             f"""
             SELECT
@@ -162,7 +232,7 @@ class StatsService:
               AND actor_nick IS NOT NULL AND lower(actor_nick)=lower(?)
               {where_time}
             """,
-            (chan_param, nick, *params_time),
+            (channel, nick, *params_time),
         )
 
         msgs = int(row[0] or 0)
@@ -175,7 +245,6 @@ class StatsService:
         topics = int(row[7] or 0)
         links = int(row[8] or 0)
 
-        # Word count (only PRIVMSG/ACTION)
         rows = await bot.store.fetchall(
             f"""
             SELECT message
@@ -186,13 +255,12 @@ class StatsService:
               {where_time}
             ORDER BY ts ASC
             """,
-            (chan_param, nick, *params_time),
+            (channel, nick, *params_time),
         )
         words = 0
         for r in rows:
             words += _count_words(r[0] or "")
 
-        # Global events in same window
         g = await bot.store.fetchone(
             f"""
             SELECT
@@ -211,7 +279,7 @@ class StatsService:
         await bot.privmsg(
             ev.target,
             (
-                f"{ev.nick}: {nick} in {ev.channel} ({window.label}): "
+                f"{ev.nick}: {nick} in {channel} ({window.label}): "
                 f"msgs={msgs} words={words} links={links} actions={actions} notices={notices} "
                 f"joins={joins} parts={parts_n} kicks={kicks} modes={modes} topics={topics} "
                 f"(global: quits={quits} nickchanges={nickchanges})"
