@@ -171,11 +171,11 @@ class WeatherService:
 
         self._cooldown: dict[tuple[str, str], float] = {}
         self._mem_cache: dict[tuple, tuple[float, Any]] = {}
-
-        # Interactive disambiguation for !weather (similar to the news picker)
+        # Interactive disambiguation for !weather (nick+target scoped)
         self._pending_pick: dict[tuple[str, str], _PendingWeatherPick] = {}
         self.pick_timeout_s = int(self.cfg.get("selection_timeout_seconds", 45))
         self.geocode_max_results = int(self.cfg.get("geocode_max_results", 8))
+
 
         # polling behaviour
         self.poll_tick_s = float(self.cfg.get("poll_tick_seconds", 60))
@@ -224,7 +224,7 @@ class WeatherService:
     # Open-Meteo API
     # ----------------------------
     def _split_location_query(self, raw: str) -> tuple[str, str | None]:
-        """Split 'City, Region' into (City, Region). Only first comma is treated as separator."""
+        """Split 'City, Region' into (City, Region). Only the first comma is treated as separator."""
         s = _norm_space(raw)
         if "," not in s:
             return (s, None)
@@ -234,10 +234,10 @@ class WeatherService:
         return (a, b or None)
 
     async def _geocode_candidates(self, query: str, lang: str = "en", *, count: int | None = None) -> list[_ResolvedLocation]:
+        """Return multiple geocoding candidates for disambiguation."""
         q = _norm_space(query)
         if not q:
             return []
-
         if count is None:
             count = self.geocode_max_results
         count = max(1, min(20, int(count)))
@@ -268,7 +268,6 @@ class WeatherService:
                 cc = str(g.get("country_code") or "")
                 admin1 = str(g.get("admin1") or "")
 
-                # Display name consistent with your existing output
                 disp = name
                 if admin1:
                     disp += f", {admin1}"
@@ -296,6 +295,82 @@ class WeatherService:
         self._cache_set(key, out, self.cache_ttl_s)
         return out
 
+    async def _maybe_handle_pick(self, bot, ev, text: str) -> bool:
+        """Handle a bare numeric reply after we offered a disambiguation menu."""
+        msg = (text or "").strip()
+        if not msg.isdigit():
+            return False
+
+        key = (ev.nick.lower(), ev.target)
+        pending = self._pending_pick.get(key)
+        if not pending:
+            return False
+
+        if (time.time() - pending.created_ts) > self.pick_timeout_s:
+            self._pending_pick.pop(key, None)
+            await bot.privmsg(ev.target, f"{ev.nick}: weather selection timed out. Run !weather {pending.query} again.")
+            return True
+
+        choice = int(msg)
+        if choice < 1 or choice > len(pending.candidates):
+            await bot.privmsg(ev.target, f"{ev.nick}: invalid selection. Choose 1-{len(pending.candidates)}.")
+            return True
+
+        loc = pending.candidates[choice - 1]
+        self._pending_pick.pop(key, None)
+
+        data = await self._forecast(loc.lat, loc.lon)
+        line1, line2 = self._format_two_line_weather(ev.nick, loc.name, data)
+        await bot.privmsg(ev.target, line1)
+        await bot.privmsg(ev.target, line2)
+        return True
+
+    async def _resolve_or_prompt_pick(self, bot, ev, loc_raw: str, *, lang: str) -> _ResolvedLocation | None:
+        """Resolve a location. If ambiguous (and no region provided), prompt with a numbered list."""
+        loc_raw = _norm_space(loc_raw)
+        if not loc_raw:
+            await bot.privmsg(ev.target, f"{ev.nick}: usage: !weather <location>")
+            return None
+
+        city, region = self._split_location_query(loc_raw)
+
+        # If region provided, try to resolve directly without prompting.
+        if region:
+            candidates = await self._geocode_candidates(city, lang=lang, count=self.geocode_max_results)
+            if not candidates:
+                await bot.privmsg(ev.target, f"{ev.nick}: location not found: {loc_raw}")
+                return None
+            rlc = region.lower()
+            filtered = [
+                c for c in candidates
+                if (c.admin1 or "").lower() == rlc
+                or rlc in (c.admin1 or "").lower()
+                or rlc in (c.name or "").lower()
+            ]
+            return filtered[0] if filtered else candidates[0]
+
+        # No region -> if multiple candidates, offer menu.
+        candidates = await self._geocode_candidates(city, lang=lang, count=self.geocode_max_results)
+        if not candidates:
+            await bot.privmsg(ev.target, f"{ev.nick}: location not found: {loc_raw}")
+            return None
+
+        if len(candidates) == 1:
+            return candidates[0]
+
+        shown = candidates[:6]
+        menu = " ".join([f"[{i}] {c.name}" for i, c in enumerate(shown, start=1)])
+        await bot.privmsg(ev.target, f"{ev.nick}: multiple matches for '{city}'. Reply with number: {menu}")
+
+        self._pending_pick[(ev.nick.lower(), ev.target)] = _PendingWeatherPick(
+            created_ts=time.time(),
+            target=ev.target,
+            nick_lc=ev.nick.lower(),
+            query=city,
+            candidates=shown,
+        )
+        return None
+
     async def _geocode(self, bot, query: str, lang: str = "en") -> _ResolvedLocation | None:
         q = _norm_space(query)
         if not q:
@@ -303,7 +378,7 @@ class WeatherService:
 
         city, region = self._split_location_query(q)
 
-        # 1) DB cache if available (preferred) — only for non-region queries
+        # 1) DB cache if available (preferred) — only safe for non-region queries
         try:
             if region is None and getattr(bot, "store", None) is not None and hasattr(bot.store, "weather_location_get"):
                 row = await bot.store.weather_location_get(q)
@@ -318,28 +393,28 @@ class WeatherService:
                         lon=float(row["lon"]),
                     )
         except Exception:
-            # Don't hard-fail on cache issues.
             pass
 
-        # 2) mem cache (safe for full query string)
+        # 2) mem cache (keyed by full query string)
         key = ("geo", lang.lower(), q.lower())
         cached = self._cache_get(key)
         if cached:
             return cached
 
-        # 3) fetch candidates
-        candidates = await self._geocode_candidates(city if region else q, lang=lang, count=(self.geocode_max_results if region else 1))
-        if not candidates:
-            return None
-
-        out = candidates[0]
+        # If region is provided, fetch multiple candidates and filter. Otherwise keep old behaviour (count=1).
         if region:
+            candidates = await self._geocode_candidates(city, lang=lang, count=self.geocode_max_results)
+            if not candidates:
+                return None
             rlc = region.lower()
-            filtered = [c for c in candidates if (c.admin1 or "").lower() == rlc or rlc in (c.admin1 or "").lower() or rlc in (c.name or "").lower()]
-            if filtered:
-                out = filtered[0]
-
-            # Ensure the cached object has the *full* query string
+            filtered = [
+                c for c in candidates
+                if (c.admin1 or "").lower() == rlc
+                or rlc in (c.admin1 or "").lower()
+                or rlc in (c.name or "").lower()
+            ]
+            out = filtered[0] if filtered else candidates[0]
+            # Ensure query stored is the full user query string
             out = _ResolvedLocation(
                 query=q,
                 name=out.name,
@@ -349,10 +424,52 @@ class WeatherService:
                 lat=out.lat,
                 lon=out.lon,
             )
+        else:
+            url = (
+                "https://geocoding-api.open-meteo.com/v1/search?"
+                + urllib.parse.urlencode(
+                    {
+                        "name": q,
+                        "count": "1",
+                        "language": lang.lower(),
+                        "format": "json",
+                    }
+                )
+            )
+            data = await _get_json(url, timeout=12)
+            res = (data.get("results") or [])
+            if not res:
+                return None
+            g = res[0]
+
+            name = str(g.get("name") or q)
+            country = str(g.get("country") or "")
+            cc = str(g.get("country_code") or "")
+            admin1 = str(g.get("admin1") or "")
+
+            disp = name
+            if admin1:
+                disp += f", {admin1}"
+            if country and cc:
+                disp += f", {country} ({cc})"
+            elif cc:
+                disp += f" ({cc})"
+            elif country:
+                disp += f" ({country})"
+
+            out = _ResolvedLocation(
+                query=q,
+                name=disp,
+                country=country,
+                country_code=cc,
+                admin1=admin1,
+                lat=float(g.get("latitude")),
+                lon=float(g.get("longitude")),
+            )
 
         self._cache_set(key, out, self.cache_ttl_s)
 
-        # 4) persist to DB cache if available (non-region queries only)
+        # 3) persist to DB cache if available (non-region queries only)
         try:
             if region is None and getattr(bot, "store", None) is not None and hasattr(bot.store, "weather_location_upsert"):
                 await bot.store.weather_location_upsert(
@@ -367,7 +484,6 @@ class WeatherService:
             pass
 
         return out
-
     async def _forecast(self, lat: float, lon: float) -> dict:
         key = ("fc", round(lat, 4), round(lon, 4))
         cached = self._cache_get(key)
@@ -412,24 +528,6 @@ class WeatherService:
         cur = data.get("current") or {}
         hourly = data.get("hourly") or {}
 
-        # Align hourly window to "now"
-        times = hourly.get("time") or []
-        cur_time = str(cur.get("time") or "")
-
-        def _hour_index() -> int:
-            if not times or not cur_time:
-                return 0
-            try:
-                return times.index(cur_time)
-            except ValueError:
-                # Fall forward to first hour >= current time (ISO strings are comparable here)
-                for i, t in enumerate(times):
-                    if str(t) >= cur_time:
-                        return i
-                return 0
-
-        idx0 = _hour_index()
-
         code = cur.get("weather_code")
         cond = WEATHER_CODE.get(code, "Unknown")
 
@@ -440,6 +538,24 @@ class WeatherService:
         wind = cur.get("wind_speed_10m")
         gust = cur.get("wind_gusts_10m")
 
+        # Align hourly window to 'now' (Open-Meteo current.time)
+        times = hourly.get("time") or []
+        cur_time = str(cur.get("time") or "")
+
+        def _hour_index() -> int:
+            if not times or not cur_time:
+                return 0
+            try:
+                return times.index(cur_time)
+            except ValueError:
+                for i, t_ in enumerate(times):
+                    if str(t_) >= cur_time:
+                        return i
+                return 0
+
+        idx0 = _hour_index()
+
+        # precip probability "now": use aligned hourly slot
         pprob = hourly.get("precipitation_probability") or []
         p0 = pprob[idx0] if idx0 < len(pprob) else (pprob[0] if pprob else None)
 
@@ -449,6 +565,7 @@ class WeatherService:
             bits1.append(f"at {float(t):.0f}°C")
         if feels is not None:
             bits1.append(f"(feels {float(feels):.0f}°C)")
+        # winds
         wbit = []
         if wind is not None:
             wbit.append(f"winds {float(wind):.0f}km/h")
@@ -456,6 +573,7 @@ class WeatherService:
             wbit.append(f"gusting {float(gust):.0f}km/h")
         if wbit:
             bits1.append("with " + " ".join(wbit))
+        # parenthetical metrics
         meta = []
         if hum is not None:
             meta.append(f"humidity {int(float(hum))}%")
@@ -467,43 +585,45 @@ class WeatherService:
             bits1.append(f"({', '.join(meta)})")
         line1 = " ".join(bits1) + "."
 
-        # ---- line 2 (next 12 hours from now) ----
+        # ---- line 2 (next 12 hours) ----
         temps = hourly.get("temperature_2m") or []
         codes = hourly.get("weather_code") or []
         gusts = hourly.get("wind_gusts_10m") or []
         winds = hourly.get("wind_speed_10m") or []
+        # Start the 12h window from the current hour
+        temps = temps[idx0: idx0 + 12]
+        codes = codes[idx0: idx0 + 12] if codes else []
+        gusts = gusts[idx0: idx0 + 12] if gusts else []
+        winds = winds[idx0: idx0 + 12] if winds else []
+        pprob = pprob[idx0: idx0 + 12] if pprob else []
 
-        temps12 = temps[idx0: idx0 + 12]
-        codes12 = codes[idx0: idx0 + 12] if codes else []
-        gusts12 = gusts[idx0: idx0 + 12] if gusts else []
-        winds12 = winds[idx0: idx0 + 12] if winds else []
-        probs12_src = pprob[idx0: idx0 + 12] if pprob else []
 
-        n = len(temps12)
+        n = min(12, len(temps))
         if n <= 0:
             return (line1, "Next 12 hours: forecast unavailable.")
 
-        t_start = float(temps12[0])
-        t_end = float(temps12[n - 1])
+        t_start = float(temps[0])
+        t_end = float(temps[n - 1])
         trend = "increase" if t_end > t_start + 0.25 else "decrease" if t_end < t_start - 0.25 else "stay around"
 
-        conds12 = [WEATHER_CODE.get(c, "") for c in codes12[:n]]
+        conds12 = [WEATHER_CODE.get(codes[i], "") for i in range(min(n, len(codes)))]
         leaning = _mode_str(conds12) or "Unknown"
 
-        probs12 = [int(float(x)) for x in probs12_src[:n] if x is not None]
+        probs12 = [int(float(pprob[i])) for i in range(min(n, len(pprob))) if pprob[i] is not None]
         prob_peak = max(probs12) if probs12 else None
         prob_end = probs12[-1] if probs12 else None
 
+        # winds peaking
         gust_peak = None
         wind_peak = None
-        if gusts12:
+        if gusts:
             try:
-                gust_peak = int(max(float(g) for g in gusts12[:n] if g is not None))
+                gust_peak = int(max(float(g) for g in gusts[:n] if g is not None))
             except Exception:
                 gust_peak = None
-        if winds12:
+        if winds:
             try:
-                wind_peak = int(max(float(w) for w in winds12[:n] if w is not None))
+                wind_peak = int(max(float(w) for w in winds[:n] if w is not None))
             except Exception:
                 wind_peak = None
 
@@ -513,6 +633,7 @@ class WeatherService:
             f"with conditions leaning {leaning}",
         ]
         if prob_peak is not None and prob_end is not None:
+            # match your older style: "should decrease to around" if end < peak
             if prob_end < prob_peak:
                 line2_parts.append(f"and precipitation probability should decrease to around {prob_end}% (peak {prob_peak}%)")
             else:
@@ -638,76 +759,10 @@ class WeatherService:
     # ----------------------------
     # Commands
     # ----------------------------
-    async def _maybe_handle_pick(self, bot, ev, text: str) -> bool:
-        msg = (text or "").strip()
-        if not msg.isdigit():
-            return False
-
-        key = (ev.nick.lower(), ev.target)
-        pending = self._pending_pick.get(key)
-        if not pending:
-            return False
-
-        if (time.time() - pending.created_ts) > self.pick_timeout_s:
-            self._pending_pick.pop(key, None)
-            await bot.privmsg(ev.target, f"{ev.nick}: weather selection timed out. Run !weather {pending.query} again.")
-            return True
-
-        choice = int(msg)
-        if choice < 1 or choice > len(pending.candidates):
-            await bot.privmsg(ev.target, f"{ev.nick}: invalid selection. Choose 1-{len(pending.candidates)}.")
-            return True
-
-        loc = pending.candidates[choice - 1]
-        self._pending_pick.pop(key, None)
-
-        data = await self._forecast(loc.lat, loc.lon)
-        line1, line2 = self._format_two_line_weather(ev.nick, loc.name, data)
-        await bot.privmsg(ev.target, line1)
-        await bot.privmsg(ev.target, line2)
-        return True
-
-    async def _resolve_or_prompt_pick(self, bot, ev, loc_raw: str, *, lang: str) -> _ResolvedLocation | None:
-        loc_raw = _norm_space(loc_raw)
-        if not loc_raw:
-            await bot.privmsg(ev.target, f"{ev.nick}: usage: !weather <location>")
-            return None
-
-        city, region = self._split_location_query(loc_raw)
-        if region:
-            # Explicit region hint: resolve directly
-            loc = await self._geocode(bot, loc_raw, lang=lang)
-            if not loc:
-                await bot.privmsg(ev.target, f"{ev.nick}: location not found: {loc_raw}")
-            return loc
-
-        # No region hint → fetch multiple candidates and prompt if ambiguous
-        candidates = await self._geocode_candidates(city, lang=lang, count=self.geocode_max_results)
-        if not candidates:
-            await bot.privmsg(ev.target, f"{ev.nick}: location not found: {loc_raw}")
-            return None
-
-        if len(candidates) == 1:
-            return candidates[0]
-
-        shown = candidates[:6]
-        menu = " ".join([f"[{i}] {c.name}" for i, c in enumerate(shown, start=1)])
-        await bot.privmsg(ev.target, f"{ev.nick}: multiple matches for '{city}'. Reply with number: {menu}")
-
-        key = (ev.nick.lower(), ev.target)
-        self._pending_pick[key] = _PendingWeatherPick(
-            created_ts=time.time(),
-            target=ev.target,
-            nick_lc=ev.nick.lower(),
-            query=city,
-            candidates=shown,
-        )
-        return None
-
     async def on_privmsg(self, bot, ev) -> None:
         text = (ev.text or "").strip()
 
-        # Interactive disambiguation (user replies "1", "2", ...)
+        # Interactive disambiguation replies: user replies "1", "2", ... with no command prefix
         if await self._maybe_handle_pick(bot, ev, text):
             return
 
@@ -812,63 +867,47 @@ class WeatherService:
             return
 
         if ev.is_private:
-            await bot.privmsg(ev.target, f"{ev.nick}: warn add only makes sense in a channel.")
+            await bot.privmsg(ev.target, f"{ev.nick}: warn add must be run in a channel (target is the channel).")
             return
 
-        # Parse from raw cmdline to allow spaces in location.
-        # cmdline: "weather warn add <location> <types> <duration>"
-        raw = cmdline.split(None, 4)
-        if len(raw) < 5:
-            await bot.privmsg(ev.target, f"{ev.nick}: invalid syntax.")
-            return
-        rest = raw[4].strip()
+        duration_raw = parts[-1]
+        types_raw = parts[-2]
+        location_raw = _norm_space(" ".join(parts[3:-2]))
 
-        # Expect last two tokens to be types and duration; location is the remainder.
-        toks = rest.split()
-        if len(toks) < 3:
-            await bot.privmsg(ev.target, f"{ev.nick}: usage: !weather warn add <location> <type(s)> <duration>")
+        dur_s = _parse_duration(duration_raw)
+        if dur_s is None:
+            await bot.privmsg(ev.target, f"{ev.nick}: duration must be like 15m, 2h, 3d.")
             return
-        duration_raw = toks[-1]
-        types_raw = toks[-2]
-        location_raw = " ".join(toks[:-2]).strip()
+
+        types = _parse_types(types_raw)
+        if types is None:
+            await bot.privmsg(ev.target, f"{ev.nick}: invalid type(s). Use: {', '.join(sorted(VALID_TYPES))} (comma-separated).")
+            return
+
         if not location_raw:
             await bot.privmsg(ev.target, f"{ev.nick}: location required.")
             return
 
-        types = _parse_types(types_raw)
-        if not types:
-            await bot.privmsg(ev.target, f"{ev.nick}: invalid types. Use comma-separated: {','.join(sorted(VALID_TYPES))} (or 'any').")
-            return
-
-        duration_s = _parse_duration(duration_raw)
-        if duration_s is None:
-            await bot.privmsg(ev.target, f"{ev.nick}: invalid duration. Use e.g. 15m, 2h, 3d.")
-            return
-
-        expires_ts = _now_ts() + duration_s
         lang = str(self.cfg.get("lang") or "en").lower()
         loc = await self._geocode(bot, location_raw, lang=lang)
         if not loc:
             await bot.privmsg(ev.target, f"{ev.nick}: location not found: {location_raw}")
             return
 
-        interval_s = int(self.default_interval_s)
-        enabled = 1
-        wid = await bot.store.weather_watch_add(
+        watch_id = await bot.store.weather_watch_add(
             target_channel=ev.target,
-            created_by=ev.nick,
-            location_query=location_raw,
+            location_query=loc.query,
             location_name=loc.name,
             lat=loc.lat,
             lon=loc.lon,
             types=",".join(types),
-            interval_s=interval_s,
-            enabled=enabled,
-            expires_ts=expires_ts,
+            created_by=ev.nick,
+            created_ts=_now_ts(),
+            expires_ts=_now_ts() + dur_s,
+            interval_seconds=int(self.default_interval_s),
+            enabled=1,
         )
-
-        mins = duration_s // 60
-        await bot.privmsg(ev.target, f"WEATHER WARN: added watch #{wid} for {loc.name} [{','.join(types)}] (expires {mins}m).")
+        await bot.privmsg(ev.target, f"WEATHER WARN: added watch #{watch_id} for {loc.name} [{','.join(types)}] ({duration_raw}).")
 
     async def _handle_del(self, bot, ev, parts: list[str]) -> None:
         # !weather del <id> or !weather warn del <id>
@@ -888,173 +927,206 @@ class WeatherService:
         await bot.privmsg(ev.target, f"WEATHER WARN: deleted watch #{wid}.")
 
     async def _handle_watch(self, bot, ev, cmdline: str) -> None:
-        # !weather watch <location(s)> <channel>
-        # Example:
-        #   !weather watch London;Paris #General
-        # Default types: any
-        # Duration: default 24h
+        # !weather watch <city1,city2,...> <#channel>
+        # Default type list is "any". Duration is long-lived unless pruned/disabled externally.
         if ev.is_private:
-            await bot.privmsg(ev.target, f"{ev.nick}: watch only makes sense in a channel.")
+            await bot.privmsg(ev.target, f"{ev.nick}: watch must be run in a channel.")
             return
 
-        raw = cmdline.split(None, 2)
-        if len(raw) < 3:
-            await bot.privmsg(ev.target, f"{ev.nick}: usage: !weather watch <location(s)> <channel>")
+        parts = cmdline.split()
+        if len(parts) < 3:
+            await bot.privmsg(ev.target, f"{ev.nick}: usage: !weather watch <city1,city2,...> <#channel>")
             return
 
-        rest = raw[2].strip()
-        toks = rest.split()
-        if len(toks) < 2:
-            await bot.privmsg(ev.target, f"{ev.nick}: usage: !weather watch <location(s)> <channel>")
+        cities_raw = " ".join(parts[2:-1]).strip()
+        target_ch = parts[-1].strip()
+        if not target_ch.startswith("#"):
+            await bot.privmsg(ev.target, f"{ev.nick}: target must be a channel like #General.")
             return
 
-        channel = toks[-1].strip()
-        locs_raw = " ".join(toks[:-1]).strip()
-        if not channel.startswith("#"):
-            await bot.privmsg(ev.target, f"{ev.nick}: channel must start with #.")
+        cities = [c.strip() for c in cities_raw.split(",") if c.strip()]
+        if not cities:
+            await bot.privmsg(ev.target, f"{ev.nick}: at least one city required.")
             return
-
-        # split multiple locations by semicolon
-        loc_list = [s.strip() for s in locs_raw.split(";") if s.strip()]
-        if not loc_list:
-            await bot.privmsg(ev.target, f"{ev.nick}: at least one location required.")
-            return
-
-        # defaults
-        types = sorted(VALID_TYPES)
-        duration_s = 24 * 3600
-        expires_ts = _now_ts() + duration_s
-        interval_s = int(self.default_interval_s)
-        enabled = 1
 
         lang = str(self.cfg.get("lang") or "en").lower()
         added = 0
-        for loc_q in loc_list[:10]:
-            loc = await self._geocode(bot, loc_q, lang=lang)
+        for city in cities[:10]:
+            loc = await self._geocode(bot, city, lang=lang)
             if not loc:
-                await bot.privmsg(ev.target, f"WEATHER WARN: location not found: {loc_q}")
                 continue
             await bot.store.weather_watch_add(
-                target_channel=channel,
-                created_by=ev.nick,
-                location_query=loc_q,
+                target_channel=target_ch,
+                location_query=loc.query,
                 location_name=loc.name,
                 lat=loc.lat,
                 lon=loc.lon,
-                types=",".join(types),
-                interval_s=interval_s,
-                enabled=enabled,
-                expires_ts=expires_ts,
+                types=",".join(sorted(VALID_TYPES)),
+                created_by=ev.nick,
+                created_ts=_now_ts(),
+                expires_ts=_now_ts() + (7 * 86400),
+                interval_seconds=int(self.default_interval_s),
+                enabled=1,
             )
             added += 1
 
-        await bot.privmsg(ev.target, f"WEATHER WARN: added {added} watch(es) in {channel} (expires 1440m).")
+        await bot.privmsg(ev.target, f"WEATHER WATCH: added {added} location(s) into {target_ch} for 7d (types=any).")
 
     # ----------------------------
-    # Scheduler integration
+    # Scheduler integration (poll/prune)
     # ----------------------------
-    async def start(self, bot) -> None:
-        # Called by bot when service starts
-        self._bot = bot
-        self._task_poll = asyncio.create_task(self._poll_loop(bot))
-        self._task_prune = asyncio.create_task(self._prune_loop(bot))
-
-    async def stop(self, bot) -> None:
-        for t in (getattr(self, "_task_poll", None), getattr(self, "_task_prune", None)):
-            if t:
-                t.cancel()
-
-    async def _poll_loop(self, bot) -> None:
-        while True:
-            try:
-                await asyncio.sleep(self.poll_tick_s)
-                await self._poll_once(bot)
-            except asyncio.CancelledError:
-                return
-            except Exception:
-                # don't crash service loop
-                continue
-
-    async def _prune_loop(self, bot) -> None:
-        while True:
-            try:
-                await asyncio.sleep(self.prune_tick_s)
-                await self._prune_once(bot)
-            except asyncio.CancelledError:
-                return
-            except Exception:
-                continue
-
-    async def _prune_once(self, bot) -> None:
-        # disable/expire old watches
+    async def job_poll(self, bot) -> None:
+        """
+        Check any watches that are due, and emit alerts.
+        """
         now = _now_ts()
         try:
-            await bot.store.weather_watch_disable_expired(now)
+            due = await bot.store.weather_watch_due(now_ts=now)
         except Exception:
-            pass
-
-        # prune dedupe table (if you keep one)
-        try:
-            if hasattr(bot.store, "weather_alert_prune"):
-                await bot.store.weather_alert_prune(now - (7 * 86400))
-        except Exception:
-            pass
-
-    async def _poll_once(self, bot) -> None:
-        # poll enabled watches and emit alerts
-        rows = await bot.store.weather_watch_due(_now_ts())
-        if not rows:
             return
 
-        now = _now_ts()
-        for r in rows:
+        if not due:
+            return
+
+        for w in due:
             try:
-                # skip expired/disabled defensively
-                if int(r["enabled"]) != 1:
-                    continue
-                if int(r["expires_ts"]) <= now:
+                wid = int(w["id"])
+                target_ch = str(w["target_channel"])
+                enabled = int(w["enabled"])
+                expires_ts = int(w["expires_ts"])
+                if enabled != 1 or expires_ts <= now:
+                    await bot.store.weather_watch_mark_checked(watch_id=wid, next_check_ts=now + int(w["interval_seconds"]))
                     continue
 
-                lat = float(r["lat"])
-                lon = float(r["lon"])
-
+                lat = float(w["lat"])
+                lon = float(w["lon"])
                 data = await self._forecast(lat, lon)
-                hit = self._evaluate_watch(r, data)
+                hit = self._evaluate_watch(w, data)
                 if not hit:
-                    await bot.store.weather_watch_touch(int(r["id"]), now)
+                    await bot.store.weather_watch_mark_checked(watch_id=wid, next_check_ts=now + int(w["interval_seconds"]))
                     continue
 
                 triggered, msg, fp = hit
                 if not triggered:
-                    await bot.store.weather_watch_touch(int(r["id"]), now)
+                    await bot.store.weather_watch_mark_checked(watch_id=wid, next_check_ts=now + int(w["interval_seconds"]))
                     continue
 
-                # dedupe based on alert_min_gap_s and fingerprint if DB supports it
-                ok = True
-                try:
-                    if hasattr(bot.store, "weather_alert_can_emit"):
-                        ok = await bot.store.weather_alert_can_emit(
-                            watch_id=int(r["id"]),
-                            fingerprint=fp,
-                            now_ts=now,
-                            min_gap_s=int(self.alert_min_gap_s),
-                        )
-                except Exception:
-                    ok = True
+                ok_to_send = True
 
-                if ok:
-                    await bot.privmsg(str(r["target_channel"]), msg)
+                # attempt DB-level dedupe/rate-limit if supported
+                try:
+                    if hasattr(bot.store, "weather_alert_get"):
+                        st = await bot.store.weather_alert_get(watch_id=wid)
+                        if st:
+                            last_ts = int(st.get("last_alert_ts") or 0)
+                            last_fp = str(st.get("last_fingerprint") or "")
+                            if fp == last_fp and (now - last_ts) < int(self.alert_min_gap_s):
+                                ok_to_send = False
+                            elif (now - last_ts) < int(self.alert_min_gap_s) and last_fp:
+                                # still rate-limit even if fingerprint differs
+                                ok_to_send = False
+                except Exception:
+                    pass
+
+                if ok_to_send:
+                    await bot.privmsg(target_ch, msg)
                     try:
-                        if hasattr(bot.store, "weather_alert_record"):
-                            await bot.store.weather_alert_record(int(r["id"]), fp, now)
+                        await bot.store.weather_alert_set(watch_id=wid, last_alert_ts=now, last_fingerprint=fp)
                     except Exception:
                         pass
 
-                await bot.store.weather_watch_touch(int(r["id"]), now)
+                await bot.store.weather_watch_mark_checked(watch_id=wid, next_check_ts=now + int(w["interval_seconds"]))
+
             except Exception:
-                # never crash poll loop on one bad row
+                # keep poll loop robust
                 try:
-                    await bot.store.weather_watch_touch(int(r["id"]), _now_ts())
+                    wid = int(w.get("id") or 0)
+                    if wid:
+                        await bot.store.weather_watch_mark_checked(watch_id=wid, next_check_ts=now + int(w.get("interval_seconds") or self.default_interval_s))
                 except Exception:
                     pass
-                continue
+
+    async def job_prune(self, bot) -> None:
+        """
+        Remove expired/disabled watches (and cascading alert state).
+        """
+        try:
+            await bot.store.weather_watch_prune_expired(now_ts=_now_ts())
+        except Exception:
+            return
+
+
+def setup(bot):
+    # Register commands into core help/ACL registry (depending on what your bot exposes)
+    if hasattr(bot, "register_command"):
+        bot.register_command(
+            "weather",
+            min_role="guest",
+            mutating=False,
+            help="Weather lookup. Usage: !weather <location>",
+            category="Weather",
+        )
+        bot.register_command(
+            "weather warn add",
+            min_role="user",
+            mutating=True,
+            help="Add warning watch in current channel. Usage: !weather warn add <location> <type(s)> <duration>",
+            category="Weather",
+        )
+        bot.register_command(
+            "weather warn list",
+            min_role="user",
+            mutating=False,
+            help="List warning watches in current channel. Usage: !weather warn list",
+            category="Weather",
+        )
+        bot.register_command(
+            "weather del",
+            min_role="user",
+            mutating=True,
+            help="Delete a watch in current channel. Usage: !weather del <id>",
+            category="Weather",
+        )
+        bot.register_command(
+            "weather warn clear",
+            min_role="user",
+            mutating=True,
+            help="Clear watches in current channel. Usage: !weather warn clear",
+            category="Weather",
+        )
+        bot.register_command(
+            "weather watch",
+            min_role="contributor",
+            mutating=True,
+            help="Proactive extreme weather announcements into a channel. Usage: !weather watch <city1,city2,...> <#channel>",
+            category="Weather",
+        )
+
+    if getattr(bot, "acl", None) is not None and hasattr(bot.acl, "register"):
+        bot.acl.register("weather", min_role="guest", mutating=False, help="Weather lookup. Usage: !weather <location>", category="Weather")
+        bot.acl.register("weather warn add", min_role="user", mutating=True, help="Add warning watch. Usage: !weather warn add <location> <type(s)> <duration>", category="Weather")
+        bot.acl.register("weather warn list", min_role="user", mutating=False, help="List warning watches. Usage: !weather warn list", category="Weather")
+        bot.acl.register("weather del", min_role="user", mutating=True, help="Delete a watch. Usage: !weather del <id>", category="Weather")
+        bot.acl.register("weather warn clear", min_role="user", mutating=True, help="Clear watches. Usage: !weather warn clear", category="Weather")
+        bot.acl.register("weather watch", min_role="contributor", mutating=True, help="Proactive watches. Usage: !weather watch <city1,city2,...> <#channel>", category="Weather")
+
+    svc = WeatherService(bot.cfg.get("weather", {}) if isinstance(getattr(bot, "cfg", None), dict) else {})
+
+    # Register scheduler jobs
+    if getattr(bot, "scheduler", None) is not None and hasattr(bot.scheduler, "register_interval"):
+        bot.scheduler.register_interval(
+            "weather:poll",
+            svc.poll_tick_s,
+            lambda: svc.job_poll(bot),
+            jitter_seconds=1.0,
+            run_on_start=False,
+        )
+        bot.scheduler.register_interval(
+            "weather:prune",
+            svc.prune_tick_s,
+            lambda: svc.job_prune(bot),
+            jitter_seconds=2.0,
+            run_on_start=False,
+        )
+
+    return svc
