@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+# Handles !help and !commands: shows command help or lists commands by category filtered by caller role.
+
 from collections import defaultdict
 
 from system.acl import ROLE_ORDER
 from system.types import Event
 
 
+# Splits string into chunks of at most maxlen characters on word boundaries for IRC.
 def _split_message(s: str, *, maxlen: int = 380) -> list[str]:
-    """Split a long message into multiple IRC-safe lines."""
     s = (s or "").strip()
     if not s:
         return []
@@ -31,11 +33,13 @@ def _split_message(s: str, *, maxlen: int = 380) -> list[str]:
     return out
 
 
+# Sends message to target in chunks via _split_message to avoid truncation.
 async def _privmsg_split(bot, target: str, s: str, *, maxlen: int = 380) -> None:
     for line in _split_message(s, maxlen=maxlen):
         await bot.privmsg(target, line)
 
 
+# Core handler for !help and !commands; filters visible commands by effective_role and shows category list or single-command help.
 class Help:
     async def handle_core(self, bot, ev: Event) -> bool:
         prefix = bot.cfg.get("command_prefix", "!")
@@ -55,7 +59,6 @@ class Help:
 
         role = await bot.acl.effective_role(ev)
 
-        # !help <command>  OR  !help <Category>
         if cmd == "help" and len(parts) >= 2:
             q_raw = " ".join(parts[1:]).strip()
             q = q_raw.lower()
@@ -85,7 +88,6 @@ class Help:
             await bot.privmsg(ev.target, f"{ev.nick}: unknown command/category '{q_raw}'. Try !commands")
             return True
 
-        # !commands
         cats = defaultdict(list)
         for name, info in bot.commands.items():
             min_role = info["min_role"]

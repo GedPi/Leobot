@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# Loads and validates bot config from JSON; applies defaults for optional keys (tls, db_path, acl, etc.).
+
 import json
 from pathlib import Path
 
@@ -25,6 +27,7 @@ def load_config(path: Path | None = None) -> dict:
     return cfg
 
 
+# Ensures required keys exist and channels/services/acl have correct types; raises ConfigError on failure.
 def validate_config(cfg: dict) -> None:
     required = ["server", "port", "nick", "user", "realname", "channels", "services"]
     for k in required:
@@ -42,6 +45,7 @@ def validate_config(cfg: dict) -> None:
         raise ConfigError("Config 'acl' must be an object")
 
 
+# Fills in default values for use_tls, db_path, command_prefix, acl.guest_allowed, etc. if missing.
 def apply_defaults(cfg: dict) -> None:
     cfg.setdefault("use_tls", True)
     cfg.setdefault("verify_tls", True)

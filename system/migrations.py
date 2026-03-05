@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# Schema versioning: meta table stores current version; apply_migrations runs migrate_v1..vN in order.
+
 import logging
 import sqlite3
 import time
@@ -23,6 +25,7 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
         return set()
 
 
+# Reads schema_version from meta table; returns 0 if meta or key missing.
 def get_schema_version(conn: sqlite3.Connection) -> int:
     if not _table_exists(conn, "meta"):
         return 0
@@ -39,8 +42,8 @@ def set_schema_version(conn: sqlite3.Connection, v: int) -> None:
     conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?)", (str(v),))
 
 
+# Bootstrap: meta, settings, service_enablement, acl_sessions, messages, seen, nick_changes, stats_daily, etc.
 def migrate_v1(conn: sqlite3.Connection) -> None:
-    # Core meta + settings + initial services/tables
     conn.executescript(
         """
         PRAGMA foreign_keys=ON;
@@ -239,10 +242,8 @@ def migrate_v1(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('created_ts', ?)", (str(now),))
 
 
+# Weather schema upgrade: weather_locations, weather_watches/weather_alert_state v2 shape.
 def migrate_v2(conn: sqlite3.Connection) -> None:
-    """
-    Weather schema upgrade.
-    """
     now = int(time.time())
 
     conn.executescript(
@@ -403,11 +404,8 @@ def migrate_v2(conn: sqlite3.Connection) -> None:
     )
 
 
+# Adds irc_log table for canonical IRC event journal (lastseen/stats derive from it).
 def migrate_v3(conn: sqlite3.Connection) -> None:
-    """
-    Add canonical IRC event journal (irc_log).
-    This is the single "posterity" log that lastseen/stats will derive from.
-    """
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS irc_log (
@@ -450,8 +448,8 @@ def migrate_v3(conn: sqlite3.Connection) -> None:
         """
     )
 
+# Adds sys_events table for sysmon alert and forensic log.
 def migrate_v4(conn: sqlite3.Connection) -> None:
-    # Sysmon: persistent event log for alerts / forensic trail
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS sys_events (
@@ -467,23 +465,14 @@ def migrate_v4(conn: sqlite3.Connection) -> None:
         """
     )
 
+# Greet pools: greet_pools table, greet_targets.pool_id, greetings moved from target_id to pool_id.
 def migrate_v5(conn: sqlite3.Connection) -> None:
-    """
-    Greet pools: allow multiple targets to share a greeting set.
-
-    - Introduce greet_pools
-    - Add greet_targets.pool_id
-    - Re-home greetings from target_id -> pool_id
-    """
     now = int(time.time())
-
-    # If already migrated, no-op.
     if _table_exists(conn, "greet_pools"):
         tcols = _columns(conn, "greet_targets")
         gcols = _columns(conn, "greetings")
         if "pool_id" in tcols and "pool_id" in gcols:
             return
-
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS greet_pools (
@@ -496,12 +485,10 @@ def migrate_v5(conn: sqlite3.Connection) -> None:
         """
     )
 
-    # Add pool_id to greet_targets (nullable; we'll backfill).
     tcols = _columns(conn, "greet_targets")
     if "pool_id" not in tcols:
         conn.execute("ALTER TABLE greet_targets ADD COLUMN pool_id INTEGER")
 
-    # If greetings already has pool_id we can just backfill targets if needed.
     gcols = _columns(conn, "greetings")
     if "pool_id" in gcols:
         rows = conn.execute(
@@ -522,7 +509,6 @@ def migrate_v5(conn: sqlite3.Connection) -> None:
             conn.execute("UPDATE greet_targets SET pool_id=?, updated_ts=? WHERE id=?", (pid, now, tid_i))
         return
 
-    # Migrate greetings table from target_id -> pool_id
     conn.executescript(
         """
         PRAGMA foreign_keys=OFF;
@@ -541,7 +527,6 @@ def migrate_v5(conn: sqlite3.Connection) -> None:
         """
     )
 
-    # Create one pool per existing target and attach it.
     tgt_rows = conn.execute("SELECT id, match_nick FROM greet_targets ORDER BY id").fetchall()
 
     tgt_to_pool: dict[int, int] = {}
@@ -560,7 +545,6 @@ def migrate_v5(conn: sqlite3.Connection) -> None:
         tgt_to_pool[tid_i] = pid
         conn.execute("UPDATE greet_targets SET pool_id=?, updated_ts=? WHERE id=?", (pid, now, tid_i))
 
-    # Move greetings across
     old_rows = conn.execute(
         "SELECT id, target_id, text, weight, enabled, created_ts, updated_ts FROM greetings_old ORDER BY id"
     ).fetchall()
@@ -605,8 +589,8 @@ def migrate_v5(conn: sqlite3.Connection) -> None:
     )
 
 
+# ACL identities (nick->role) and acl_command_perms (command->min_role) tables.
 def migrate_v6(conn: sqlite3.Connection) -> None:
-    """DB-backed ACL identities + per-command permission overrides."""
     conn.executescript(
         """
         -- ACL identities (nick-based for now)
@@ -627,6 +611,25 @@ def migrate_v6(conn: sqlite3.Connection) -> None:
         """
     )
 
+
+# acl_policies table for per-channel, per-service capability min_role overrides.
+def migrate_v7(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS acl_policies (
+            channel TEXT NOT NULL,
+            service_id TEXT NOT NULL,
+            capability TEXT NOT NULL,
+            min_role TEXT NOT NULL,
+            updated_ts INTEGER NOT NULL,
+            PRIMARY KEY(channel, service_id, capability)
+        );
+        CREATE INDEX IF NOT EXISTS idx_acl_policies_channel ON acl_policies(channel);
+        CREATE INDEX IF NOT EXISTS idx_acl_policies_service ON acl_policies(service_id);
+        """
+    )
+
+
 MIGRATIONS = {
     1: migrate_v1,
     2: migrate_v2,
@@ -634,9 +637,11 @@ MIGRATIONS = {
     4: migrate_v4,
     5: migrate_v5,
     6: migrate_v6,
+    7: migrate_v7,
 }
 
 
+# Runs migrate_vN for each version from current+1 to latest; updates meta schema_version and commits.
 def apply_migrations(conn: sqlite3.Connection) -> None:
     current = get_schema_version(conn)
     target = max(MIGRATIONS.keys()) if MIGRATIONS else 0

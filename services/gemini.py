@@ -254,9 +254,4 @@ def setup(bot):
             category="Info",
         )
 
-    # If legacy ACL registry still exists, register there too (harmless).
-    if getattr(bot, "acl", None) is not None and hasattr(bot.acl, "register"):
-        bot.acl.register("gemini", min_role="user", mutating=False, help="Ask Gemini. Usage: !gemini <question>", category="Info")
-        bot.acl.register("g", min_role="user", mutating=False, help="Alias for !gemini", category="Info")
-
     return GeminiService()

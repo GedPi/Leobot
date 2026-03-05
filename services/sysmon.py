@@ -595,15 +595,4 @@ def setup(bot):
                              help="Tail sysmon events. Usage: !events [N]",
                              category="System")
 
-    # Legacy ACL registry (harmless)
-    if getattr(bot, "acl", None) is not None and hasattr(bot.acl, "register"):
-        bot.acl.register("sys", min_role="user", mutating=False, help="Server health summary. Usage: !sys [subcmd]", category="System")
-        bot.acl.register("uptime", min_role="user", mutating=False, help="Show system uptime. Usage: !uptime", category="System")
-        bot.acl.register("disk", min_role="user", mutating=False, help="Show disk usage. Usage: !disk", category="System")
-        bot.acl.register("updates", min_role="user", mutating=False, help="Show pending package updates. Usage: !updates", category="System")
-        bot.acl.register("failed", min_role="user", mutating=False, help="Show failed systemd units. Usage: !failed", category="System")
-        bot.acl.register("errors", min_role="user", mutating=False, help="Show recent journal errors count. Usage: !errors", category="System")
-        bot.acl.register("services", min_role="user", mutating=False, help="Show watched services state. Usage: !services", category="System")
-        bot.acl.register("events", min_role="user", mutating=False, help="Tail sysmon events. Usage: !events [N]", category="System")
-
     return SysMonService()

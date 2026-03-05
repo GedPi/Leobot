@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# Repeating background jobs: register_interval adds a job, start/stop run them with optional jitter and run_on_start.
+
 import asyncio
 import logging
 import random
@@ -22,12 +24,14 @@ class Job:
     run_on_start: bool = False
 
 
+# Holds named jobs; start() launches a task per job, stop() cancels and drains them.
 class Scheduler:
     def __init__(self):
         self._jobs: Dict[str, Job] = {}
         self._tasks: Dict[str, asyncio.Task] = {}
         self._stop = asyncio.Event()
 
+    # Registers a job to run every seconds (with optional jitter and run_on_start); name must be unique.
     def register_interval(
         self,
         name: str,
@@ -55,6 +59,7 @@ class Scheduler:
     def list_jobs(self) -> list[str]:
         return sorted(self._jobs.keys())
 
+    # Creates a task per registered job and clears stop event; no-op if already started.
     async def start(self) -> None:
         if self._tasks:
             return
@@ -63,6 +68,7 @@ class Scheduler:
             self._tasks[name] = asyncio.create_task(self._runner(job), name=f"job:{name}")
         log.info("Scheduler started (%d jobs)", len(self._tasks))
 
+    # Sets stop event, cancels all job tasks and waits for them to finish.
     async def stop(self) -> None:
         self._stop.set()
         for t in list(self._tasks.values()):

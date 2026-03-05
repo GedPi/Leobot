@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# Routes IRC events to core handlers (ACL, Help, ServiceCtl) then to services; enforces ACL precheck and per-channel service enablement.
+
 import logging
 from typing import Any
 
@@ -8,11 +10,12 @@ from system.types import Event
 log = logging.getLogger("leobot.dispatch")
 
 
+# Holds core_handlers and services; dispatch() runs ACL precheck for PRIVMSG, then core handle_core, then each service hook with enablement gating.
 class Dispatcher:
     def __init__(self, bot):
         self.bot = bot
         self.services: list[Any] = []
-        self.core_handlers: list[Any] = []  # objects with handle_core(bot, ev)->bool
+        self.core_handlers: list[Any] = []
 
     def add_service(self, svc: Any) -> None:
         self.services.append(svc)
@@ -20,17 +23,15 @@ class Dispatcher:
     def add_core_handler(self, h: Any) -> None:
         self.core_handlers.append(h)
 
+    # Returns the service instance whose service_id is "logging", or None; used to tee PRIVMSG to logs when a core handler consumes the event.
     def _find_logging_service(self) -> Any | None:
         for svc in self.services:
             if getattr(svc, "service_id", None) == "logging":
                 return svc
         return None
 
+    # Sends a copy of the event to the logging service when a core handler has already handled the message, so commands are still logged.
     async def _tee_to_logging(self, hook: str, ev: Event) -> None:
-        """
-        Ensure canonical logging gets a copy of events even when core handlers
-        short-circuit dispatch (commands).
-        """
         if hook != "on_privmsg":
             return
         if not ev.channel:
@@ -41,8 +42,6 @@ class Dispatcher:
         fn = getattr(svc, "on_privmsg", None)
         if not callable(fn):
             return
-
-        # respect per-channel enablement for logging
         try:
             if not await self.bot.store.is_service_enabled(ev.channel, "logging"):
                 return
@@ -54,27 +53,24 @@ class Dispatcher:
         except Exception:
             log.exception("Logging tee failed")
 
+    # For on_privmsg runs ACL precheck then core handle_core; for on_notice runs core on_notice; then invokes each service hook for the event, skipping services disabled for ev.channel.
     async def dispatch(self, hook: str, ev: Event) -> None:
-        # ACL precheck for PRIVMSG commands
         if hook == "on_privmsg" and getattr(self.bot, "acl", None) is not None:
             ok = await self.bot.acl.precheck(self.bot, ev)
             if not ok:
                 return
 
-            # core handlers first (auth/help/service ctl etc)
             for h in self.core_handlers:
                 fn = getattr(h, "handle_core", None)
                 if callable(fn):
                     try:
                         handled = await fn(self.bot, ev)
                         if handled:
-                            # core handled it; still tee the event to logging for posterity
                             await self._tee_to_logging(hook, ev)
                             return
                     except Exception:
                         log.exception("Core handler error (%s)", type(h).__name__)
 
-        # NEW: let core handlers receive NOTICE events (NickServ replies are typically NOTICE)
         if hook == "on_notice":
             for h in self.core_handlers:
                 fn = getattr(h, "on_notice", None)
@@ -101,7 +97,6 @@ class Dispatcher:
             if not callable(fn):
                 continue
 
-            # Per-channel enablement gating (disabled by default)
             if ev.channel and hook in gated_hooks:
                 sid = getattr(svc, "service_id", None)
                 if not sid:

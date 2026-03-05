@@ -629,16 +629,6 @@ def setup(bot):
         bot.register_command("wikimon lang", min_role="contributor", mutating=True, help="Set default wiki language. Usage: !wikimon lang <code>", category="Wiki")
         bot.register_command("wikimon interval", min_role="user", mutating=True, help="Change watch interval. Usage: !wikimon interval <id> <15m|2h|1d>", category="Wiki")
 
-    if getattr(bot, "acl", None) is not None and hasattr(bot.acl, "register"):
-        bot.acl.register("wiki", min_role="guest", mutating=False, help="Wikipedia lookup. Usage: !wiki <query>", category="Wiki")
-        bot.acl.register("wikicheck", min_role="guest", mutating=False, help="Check a Wikipedia title exists. Usage: !wikicheck <query>", category="Wiki")
-        bot.acl.register("wikimon", min_role="user", mutating=False, help="List wiki watches. Usage: !wikimon [list]", category="Wiki")
-        bot.acl.register("wikimon add", min_role="user", mutating=True, help="Add a wiki watch. Usage: !wikimon add <title> [15m|2h|1d]", category="Wiki")
-        bot.acl.register("wikimon del", min_role="user", mutating=True, help="Delete a wiki watch. Usage: !wikimon del <id>", category="Wiki")
-        bot.acl.register("wikimon clear", min_role="contributor", mutating=True, help="Clear all wiki watches.", category="Wiki")
-        bot.acl.register("wikimon lang", min_role="contributor", mutating=True, help="Set default wiki language. Usage: !wikimon lang <code>", category="Wiki")
-        bot.acl.register("wikimon interval", min_role="user", mutating=True, help="Change watch interval. Usage: !wikimon interval <id> <15m|2h|1d>", category="Wiki")
-
     svc = WikiService(bot.cfg.get("wiki", {}) if isinstance(getattr(bot, "cfg", None), dict) else {})
 
     # Register scheduler job

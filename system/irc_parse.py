@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# IRC line parsing: prefix/cmd/params and nick!user@host; message chunking for PRIVMSG length limits.
+
 from dataclasses import dataclass
 from typing import Optional
 
@@ -11,8 +13,8 @@ class ParsedLine:
     params: list[str]
 
 
+# Splits IRC prefix into (nick, user, host); if no ! or @ returns (prefix, None, None).
 def parse_prefix(prefix: str) -> tuple[str, Optional[str], Optional[str]]:
-    # nick!user@host
     if "!" in prefix and "@" in prefix:
         nick, rest = prefix.split("!", 1)
         user, host = rest.split("@", 1)
@@ -20,8 +22,8 @@ def parse_prefix(prefix: str) -> tuple[str, Optional[str], Optional[str]]:
     return prefix, None, None
 
 
+# Parses raw IRC line into prefix, cmd and params; trailing after : is last param; returns None if empty or invalid.
 def parse_line(line: str) -> ParsedLine | None:
-    # Returns cmd + params (with trailing appended as last param)
     if not line:
         return None
 
@@ -51,6 +53,7 @@ def parse_line(line: str) -> ParsedLine | None:
     return ParsedLine(prefix=prefix, cmd=cmd, params=params)
 
 
+# Yields message in chunks of at most limit chars (replacing CR/LF with space) for IRC message limits.
 def chunk_message(msg: str, limit: int = 380):
     msg = (msg or "").replace("\r", " ").replace("\n", " ")
     while len(msg) > limit:

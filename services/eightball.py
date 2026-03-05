@@ -81,9 +81,4 @@ def setup(bot):
             category="Fun",
         )
 
-    # Legacy ACL registry (harmless if still present)
-    if getattr(bot, "acl", None) is not None and hasattr(bot.acl, "register"):
-        bot.acl.register("8ball", min_role="guest", mutating=False, help="Magic 8-ball. Usage: !8ball <question>", category="Fun")
-        bot.acl.register("eightball", min_role="guest", mutating=False, help="Alias for !8ball", category="Fun")
-
     return EightBallService()

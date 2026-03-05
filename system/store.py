@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# SQLite persistence: applies migrations, exposes async execute/fetch; provides settings, service enablement,
+# ACL sessions/identities/command_perms/policies, and service-specific tables (news, greet, etc.).
+
 import asyncio
 import logging
 import sqlite3
@@ -12,6 +15,7 @@ from system.migrations import apply_migrations
 log = logging.getLogger("leobot.store")
 
 
+# Single DB connection with asyncio lock; all access via execute/fetchone/fetchall or typed helpers.
 class Store:
     def __init__(self, db_path: str):
         self.db_path = str(db_path)
@@ -19,12 +23,10 @@ class Store:
         self._conn = sqlite3.connect(
             self.db_path,
             check_same_thread=False,
-            isolation_level=None,  # autocommit; we manage transactions explicitly when needed
+            isolation_level=None,
         )
         self._conn.row_factory = sqlite3.Row
         self._lock = asyncio.Lock()
-
-        # sane pragmas
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA synchronous=NORMAL")
@@ -32,6 +34,7 @@ class Store:
 
         apply_migrations(self._conn)
 
+    # Closes the DB connection; safe to call from shutdown.
     async def close(self) -> None:
         async with self._lock:
             try:
@@ -39,25 +42,28 @@ class Store:
             except Exception:
                 pass
 
+    # Runs a single SQL statement with params under the store lock; no return value.
     async def execute(self, sql: str, params: Iterable[Any] = ()) -> None:
         async with self._lock:
             self._conn.execute(sql, tuple(params))
 
+    # Runs a statement once per row in seq under the store lock.
     async def executemany(self, sql: str, seq: Iterable[Iterable[Any]]) -> None:
         async with self._lock:
             self._conn.executemany(sql, [tuple(x) for x in seq])
 
+    # Executes query and returns one row (or None) under the store lock.
     async def fetchone(self, sql: str, params: Iterable[Any] = ()):
         async with self._lock:
             cur = self._conn.execute(sql, tuple(params))
             return cur.fetchone()
 
+    # Executes query and returns all rows under the store lock.
     async def fetchall(self, sql: str, params: Iterable[Any] = ()):
         async with self._lock:
             cur = self._conn.execute(sql, tuple(params))
             return cur.fetchall()
 
-    # ---- settings ----
     async def get_setting(self, key: str, default: str | None = None) -> str | None:
         row = await self.fetchone("SELECT value FROM settings WHERE key=?", (key,))
         return row[0] if row else default
@@ -70,7 +76,6 @@ class Store:
             (key, value, now),
         )
 
-    # ---- service enablement ----
     async def is_service_enabled(self, channel: str, service: str) -> bool:
         row = await self.fetchone(
             "SELECT enabled FROM service_enablement WHERE channel=? AND service=?",
@@ -99,7 +104,6 @@ class Store:
         )
         return [(str(r[0]), bool(r[1])) for r in rows]
 
-    # ---- ACL sessions ----
     async def get_acl_session(self, identity_key: str):
         return await self.fetchone(
             "SELECT role, auth_until_ts FROM acl_sessions WHERE identity_key=?",
@@ -117,14 +121,13 @@ class Store:
     async def clear_acl_session(self, identity_key: str) -> None:
         await self.execute("DELETE FROM acl_sessions WHERE identity_key=?", (identity_key,))
 
+    # Deletes acl_sessions with auth_until_ts <= now; returns number of rows deleted.
     async def prune_acl_sessions(self) -> int:
-        """Remove expired ACL sessions. Returns number of rows deleted."""
         now = int(time.time())
         async with self._lock:
             cur = self._conn.execute("DELETE FROM acl_sessions WHERE auth_until_ts<=?", (now,))
             return int(cur.rowcount or 0)
 
-    # ---- DB-backed ACL identities + per-command permissions ----
     async def acl_count_admins(self) -> int:
         row = await self.fetchone("SELECT COUNT(*) FROM acl_identities WHERE role='admin'", ())
         return int(row[0]) if row else 0
@@ -191,7 +194,47 @@ class Store:
         )
         return [(str(r[0]), str(r[1])) for r in rows] if rows else []
 
-    # ---- News sources & categories ----
+    async def acl_get_policy(self, channel: str, service_id: str, capability: str) -> str | None:
+        if not channel or not service_id or not capability:
+            return None
+        row = await self.fetchone(
+            "SELECT min_role FROM acl_policies WHERE channel=? AND service_id=? AND capability=?",
+            (channel, service_id.strip().lower(), capability.strip().lower()),
+        )
+        return str(row[0]) if row else None
+
+    async def acl_set_policy(self, channel: str, service_id: str, capability: str, min_role: str) -> None:
+        if not channel or not service_id or not capability:
+            return
+        now = int(time.time())
+        ch, sid, cap = channel, service_id.strip().lower(), capability.strip().lower()
+        await self.execute(
+            "INSERT INTO acl_policies(channel, service_id, capability, min_role, updated_ts) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(channel, service_id, capability) DO UPDATE SET min_role=excluded.min_role, updated_ts=excluded.updated_ts",
+            (ch, sid, cap, (min_role or "user").strip().lower(), now),
+        )
+
+    async def acl_del_policy(self, channel: str, service_id: str, capability: str) -> None:
+        if not channel or not service_id or not capability:
+            return
+        await self.execute(
+            "DELETE FROM acl_policies WHERE channel=? AND service_id=? AND capability=?",
+            (channel, service_id.strip().lower(), capability.strip().lower()),
+        )
+
+    async def acl_list_policies(self, channel: str | None = None) -> list[tuple[str, str, str, str]]:
+        if channel is not None and channel != "":
+            rows = await self.fetchall(
+                "SELECT channel, service_id, capability, min_role FROM acl_policies WHERE channel=? ORDER BY service_id, capability",
+                (channel,),
+            )
+        else:
+            rows = await self.fetchall(
+                "SELECT channel, service_id, capability, min_role FROM acl_policies ORDER BY channel, service_id, capability",
+                (),
+            )
+        return [(str(r[0]), str(r[1]), str(r[2]), str(r[3])) for r in rows] if rows else []
+
     async def news_list_sources(self):
         return await self.fetchall(
             "SELECT id,name,enabled,created_ts,updated_ts FROM news_sources ORDER BY id",

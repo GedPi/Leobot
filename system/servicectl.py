@@ -1,18 +1,21 @@
 from __future__ import annotations
 
+# Per-channel service enablement: !service list|enable|disable; registers commands and handles them in handle_core.
+
 from system.types import Event
 
 
+# Normalizes service name to lowercase id (e.g. "services.weather" -> "weather").
 def _canon_service_id(name: str) -> str:
     n = (name or "").strip()
     if not n:
         return ""
-    # Accept either 'weather' or 'services.weather' / 'system.weather'
     if "." in n:
         n = n.split(".")[-1]
     return n.lower()
 
 
+# Returns (comma-joined first limit items, number of remaining) for display.
 def _compact(items: list[str], *, limit: int = 12) -> tuple[str, int]:
     items = [x for x in items if x]
     if len(items) <= limit:
@@ -20,6 +23,7 @@ def _compact(items: list[str], *, limit: int = 12) -> tuple[str, int]:
     return (", ".join(items[:limit]), len(items) - limit)
 
 
+# Registers !service and !services and handles list/enable/disable using Store service_enablement.
 class ServiceCtl:
     def register_commands(self, bot) -> None:
         bot.register_command(
@@ -51,6 +55,7 @@ class ServiceCtl:
             category="System",
         )
 
+    # Handles !service list (show on/off per channel) and !service enable|disable <service> [#channel]; uses config services as valid set.
     async def handle_core(self, bot, ev: Event) -> bool:
         prefix = bot.cfg.get("command_prefix", "!")
         txt = (ev.text or "").strip()
@@ -74,17 +79,11 @@ class ServiceCtl:
 
         if sub == "list":
             chan = ev.channel or ev.target
-
-            # Configured services (source of truth for what's "valid")
             cfg_services = sorted(
                 {_canon_service_id(str(x)) for x in (bot.cfg.get("services", []) or []) if str(x).strip()}
             )
-
-            # DB enablement map (explicit overrides)
             rows = await bot.store.list_service_enablement(chan)
             enabled_map = {str(s).lower(): bool(en) for s, en in rows}
-
-            # Union so we can show stale DB rows too
             all_services = sorted(set(cfg_services) | set(enabled_map.keys()))
 
             on = [s for s in all_services if enabled_map.get(s, False)]
@@ -112,8 +111,6 @@ class ServiceCtl:
             svc = _canon_service_id(svc_in)
             chan = parts[3] if len(parts) >= 4 else (ev.channel or ev.target)
             enabled = sub == "enable"
-
-            # Validate enable operations against config
             cfg_services = {_canon_service_id(str(x)) for x in (bot.cfg.get("services", []) or []) if str(x).strip()}
             if enabled and svc not in cfg_services:
                 avail = ", ".join(sorted(cfg_services)) if cfg_services else "(none configured)"

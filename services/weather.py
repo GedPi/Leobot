@@ -1102,14 +1102,6 @@ def setup(bot):
             category="Weather",
         )
 
-    if getattr(bot, "acl", None) is not None and hasattr(bot.acl, "register"):
-        bot.acl.register("weather", min_role="guest", mutating=False, help="Weather lookup. Usage: !weather <location>", category="Weather")
-        bot.acl.register("weather warn add", min_role="user", mutating=True, help="Add warning watch. Usage: !weather warn add <location> <type(s)> <duration>", category="Weather")
-        bot.acl.register("weather warn list", min_role="user", mutating=False, help="List warning watches. Usage: !weather warn list", category="Weather")
-        bot.acl.register("weather del", min_role="user", mutating=True, help="Delete a watch. Usage: !weather del <id>", category="Weather")
-        bot.acl.register("weather warn clear", min_role="user", mutating=True, help="Clear watches. Usage: !weather warn clear", category="Weather")
-        bot.acl.register("weather watch", min_role="contributor", mutating=True, help="Proactive watches. Usage: !weather watch <city1,city2,...> <#channel>", category="Weather")
-
     svc = WeatherService(bot.cfg.get("weather", {}) if isinstance(getattr(bot, "cfg", None), dict) else {})
 
     # Register scheduler jobs

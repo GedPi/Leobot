@@ -115,6 +115,8 @@ No external dependencies are required.
 
 ## Role System (ACL)
 
+See **[PERMISSIONS.md](PERMISSIONS.md)** for the full permission model (roles, principals, command vs service permissions, per-channel policies).
+
 Role hierarchy:
 
 ```
