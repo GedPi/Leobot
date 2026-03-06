@@ -588,9 +588,6 @@ def setup(bot):
         bot.register_command("errors", min_role="user", mutating=False,
                              help="Show recent journal errors count. Usage: !errors",
                              category="System")
-        bot.register_command("services", min_role="user", mutating=False,
-                             help="Show watched services state. Usage: !services",
-                             category="System")
         bot.register_command("events", min_role="user", mutating=False,
                              help="Tail sysmon events. Usage: !events [N]",
                              category="System")

@@ -204,6 +204,13 @@ class ACL:
                 help="List command overrides (DB). Usage: !acl servlist",
                 category="System",
             )
+            bot.register_command(
+                "reload",
+                min_role="admin",
+                mutating=True,
+                help="Reload config from file. Usage: !reload",
+                category="System",
+            )
         except Exception:
             pass
 
@@ -427,6 +434,18 @@ class ACL:
         if cmd == "whoami":
             role = await self.effective_role(ev)
             await bot.privmsg(ev.target, f"{ev.nick}: role={role} identity={principal_from_event(ev)}")
+            return True
+
+        if cmd == "reload":
+            role = await self.effective_role(ev)
+            if ROLE_ORDER.get(role, 0) < ROLE_ORDER["admin"]:
+                await bot.privmsg(ev.target, f"{ev.nick}: not allowed (requires admin).")
+                return True
+            ok, err = bot.reload_config()
+            if ok:
+                await bot.privmsg(ev.target, "Config reloaded from file.")
+            else:
+                await bot.privmsg(ev.target, f"Reload failed: {err}")
             return True
 
         if cmd == "acl":

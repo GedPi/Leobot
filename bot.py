@@ -75,6 +75,14 @@ class Bot:
         self.quit_message = "Shutting down"
         self._shutdown_once = False
 
+    # Reloads config from file (default path); returns (True, None) on success or (False, error_message).
+    def reload_config(self, path=None):
+        try:
+            self.cfg = load_config(path)
+            return True, None
+        except ConfigError as e:
+            return False, str(e)
+
     # Registers a command in the bot command table with min_role, help, category and optional
     # service_id/capability for per-channel policy lookup. Normalizes cmd to lowercase and strips "!".
     def register_command(
@@ -429,6 +437,7 @@ class Bot:
         asyncio.create_task(self.shutdown(self.quit_message))
 
     # Stops scheduler, sends QUIT to IRC, closes socket and store; runs only once per bot instance.
+    # Closes IRC first so the read loop in run() unblocks (readline returns); then scheduler and store.
     async def shutdown(self, quit_message: Optional[str] = None) -> None:
         if self._shutdown_once:
             return
@@ -439,17 +448,17 @@ class Bot:
             msg = msg[:220]
 
         try:
-            await self.scheduler.stop()
-        except Exception:
-            pass
-
-        try:
             if self.irc and self.irc.writer:
                 try:
                     await self.irc.send_raw(f"QUIT :{msg}")
                 except Exception:
                     pass
                 await self.irc.close()
+        except Exception:
+            pass
+
+        try:
+            await self.scheduler.stop()
         except Exception:
             pass
 
@@ -470,10 +479,13 @@ async def main() -> None:
     await bot.connect()
 
     loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGINT, lambda: bot.request_exit("Shot in the head by God"))
-    loop.add_signal_handler(signal.SIGTERM, lambda: bot.request_exit("Shot in the head by God"))
-    if hasattr(signal, "SIGUSR1"):
-        loop.add_signal_handler(signal.SIGUSR1, lambda: bot.request_exit("I'll be back, even stronger"))
+    try:
+        loop.add_signal_handler(signal.SIGINT, lambda: bot.request_exit("Shot in the head by God"))
+        loop.add_signal_handler(signal.SIGTERM, lambda: bot.request_exit("Shot in the head by God"))
+        if hasattr(signal, "SIGUSR1"):
+            loop.add_signal_handler(signal.SIGUSR1, lambda: bot.request_exit("I'll be back, even stronger"))
+    except NotImplementedError:
+        log.warning("Signal handlers not available on this platform (e.g. Windows); use Ctrl+Break or close the process to exit.")
 
     backoff = int(cfg.get("reconnect_min_seconds", 2))
     backoff_max = int(cfg.get("reconnect_max_seconds", 60))

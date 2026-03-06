@@ -135,7 +135,10 @@ Core commands:
 ```
 !whoami
 !auth <password>
+!reload          (admin: reload config from file)
 ```
+
+`!help` and `!commands` send their reply as a private message to the user (so the channel is not flooded).
 
 ---
 
@@ -171,12 +174,11 @@ Enablement state is persisted in SQLite.
 
 ### Monitoring
 
-* `!sys`
+* `!sys` (and `!sys services`, `!sys events`, etc.)
 * `!uptime`
 * `!disk`
 * `!updates`
 * `!errors`
-* `!services`
 * `!events`
 
 ### Analytics

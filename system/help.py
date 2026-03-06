@@ -40,6 +40,7 @@ async def _privmsg_split(bot, target: str, s: str, *, maxlen: int = 380) -> None
 
 
 # Core handler for !help and !commands; filters visible commands by effective_role and shows category list or single-command help.
+# All replies are sent as a private message to the user (ev.nick) to avoid flooding the channel.
 class Help:
     async def handle_core(self, bot, ev: Event) -> bool:
         prefix = bot.cfg.get("command_prefix", "!")
@@ -58,6 +59,7 @@ class Help:
             return False
 
         role = await bot.acl.effective_role(ev)
+        reply_to = ev.nick
 
         if cmd == "help" and len(parts) >= 2:
             q_raw = " ".join(parts[1:]).strip()
@@ -67,12 +69,11 @@ class Help:
             if info:
                 await _privmsg_split(
                     bot,
-                    ev.target,
+                    reply_to,
                     f"{q} — category={info['category']} | role>={info['min_role']} | mutating={info['mutating']} | {info['help'] or 'no help text'}",
                 )
                 return True
 
-            # Category lookup
             cats = defaultdict(list)
             for name, info2 in bot.commands.items():
                 min_role = info2["min_role"]
@@ -82,10 +83,10 @@ class Help:
 
             if q in cats:
                 cmds = ", ".join(sorted(cats[q]))
-                await _privmsg_split(bot, ev.target, f"{ev.nick}: {q_raw} commands: {cmds}")
+                await _privmsg_split(bot, reply_to, f"{q_raw} commands: {cmds}")
                 return True
 
-            await bot.privmsg(ev.target, f"{ev.nick}: unknown command/category '{q_raw}'. Try !commands")
+            await bot.privmsg(reply_to, f"Unknown command/category '{q_raw}'. Try !commands")
             return True
 
         cats = defaultdict(list)
@@ -96,12 +97,12 @@ class Help:
             cats[info["category"]].append(name)
 
         if not cats:
-            await bot.privmsg(ev.target, f"{ev.nick}: no commands available")
+            await bot.privmsg(reply_to, "No commands available")
             return True
 
-        await bot.privmsg(ev.target, f"Commands for role={role}: use !help <command> or !help <category>")
+        await bot.privmsg(reply_to, f"Commands for role={role}: use !help <command> or !help <category>")
         for cat in sorted(cats.keys()):
             cmds = ", ".join(sorted(cats[cat]))
-            await _privmsg_split(bot, ev.target, f"{cat}: {cmds}")
+            await _privmsg_split(bot, reply_to, f"{cat}: {cmds}")
 
         return True
