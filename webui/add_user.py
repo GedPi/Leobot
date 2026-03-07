@@ -28,8 +28,13 @@ def main():
     path = ui_config.WEBUI_USERS
     data = {"users": {}}
     if os.path.isfile(path):
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+            if raw:
+                data = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
         data.setdefault("users", {})
 
     pw = password.encode("utf-8")[:72]
