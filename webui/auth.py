@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 
-from passlib.hash import bcrypt
+import bcrypt
 
 
 def load_users(path: str) -> dict[str, str]:
@@ -21,8 +21,13 @@ def verify_password(path: str, username: str, password: str) -> bool:
     users = load_users(path)
     if not username or username not in users:
         return False
-    return bcrypt.verify(password, users[username])
+    pw = password.encode("utf-8")[:72]
+    try:
+        return bcrypt.checkpw(pw, users[username].encode("ascii"))
+    except Exception:
+        return False
 
 
 def hash_password(password: str) -> str:
-    return bcrypt.hash(password)
+    pw = password.encode("utf-8")[:72]
+    return bcrypt.hashpw(pw, bcrypt.gensalt()).decode("ascii")

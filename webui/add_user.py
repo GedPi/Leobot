@@ -8,9 +8,10 @@ import json
 import os
 import sys
 
-from passlib.hash import bcrypt
+import bcrypt
 
 from webui import config as ui_config
+
 
 def main():
     username = (sys.argv[1] or "").strip()
@@ -31,7 +32,8 @@ def main():
             data = json.load(f)
         data.setdefault("users", {})
 
-    data["users"][username] = bcrypt.hash(password)
+    pw = password.encode("utf-8")[:72]
+    data["users"][username] = bcrypt.hashpw(pw, bcrypt.gensalt()).decode("ascii")
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
