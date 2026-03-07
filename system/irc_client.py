@@ -24,20 +24,32 @@ class IRCClient:
         self._line_tasks: Set[asyncio.Task] = set()
         self._max_inflight = int(self.cfg.get("max_inflight_handlers", 200))
 
+    @staticmethod
+    def _truthy(val) -> bool:
+        if val is None:
+            return False
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, (int, float)):
+            return val != 0
+        s = str(val).strip().lower()
+        return s not in ("0", "false", "no", "off", "")
+
     # Opens connection to server:port (TLS if use_tls), sends PASS/NICK/USER from config.
     async def connect(self) -> None:
         server = self.cfg["server"]
         port = int(self.cfg["port"])
-        use_tls = bool(self.cfg.get("use_tls", True))
+        use_tls = self._truthy(self.cfg.get("use_tls", True))
+        verify_tls = self._truthy(self.cfg.get("verify_tls", True))
 
         ssl_ctx = None
         if use_tls:
             ssl_ctx = ssl.create_default_context()
-            if not self.cfg.get("verify_tls", True):
+            if not verify_tls:
                 ssl_ctx.check_hostname = False
                 ssl_ctx.verify_mode = ssl.CERT_NONE
 
-        log.info("Connecting to %s:%s TLS=%s", server, port, use_tls)
+        log.info("Connecting to %s:%s TLS=%s verify_tls=%s", server, port, use_tls, verify_tls)
         self.reader, self.writer = await asyncio.open_connection(server, port, ssl=ssl_ctx)
 
         if self.cfg.get("password"):
