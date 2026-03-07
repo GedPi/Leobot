@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -29,13 +30,19 @@ from system.store import Store
 
 def _load_db_path(cli_path: str | None) -> str:
     if cli_path:
-        return cli_path
+        p = Path(cli_path)
+        return str(p.resolve() if not p.is_absolute() else p)
     config_path = _ROOT / "config" / "config.json"
     if config_path.exists():
         import json
         cfg = json.loads(config_path.read_text(encoding="utf-8"))
-        return str(cfg.get("db_path", "./data/leonidas.db"))
-    return "./data/leonidas.db"
+        raw = cfg.get("db_path", "./data/leonidas.db")
+    else:
+        raw = "./data/leonidas.db"
+    p = Path(raw)
+    if not p.is_absolute():
+        p = (_ROOT / raw).resolve()
+    return str(p)
 
 
 def _is_header(row: list[str]) -> bool:
@@ -83,7 +90,22 @@ def main() -> None:
         sys.exit(1)
 
     db_path = _load_db_path(args.db)
-    asyncio.run(run(args.csv, db_path))
+    try:
+        asyncio.run(run(args.csv, db_path))
+    except sqlite3.OperationalError as e:
+        if "readonly" in str(e).lower():
+            print(
+                f"Error: database is read-only: {e}",
+                file=sys.stderr,
+            )
+            print(
+                f"The database or its directory is not writable by the current user. "
+                f"Either fix permissions on {db_path} (and its directory), run this script as the "
+                "user that owns the database (e.g. the bot user), or pass a writable path with --db.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        raise
 
 
 if __name__ == "__main__":
