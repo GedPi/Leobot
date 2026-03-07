@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import ssl
 from typing import Awaitable, Callable, Optional, Set
 
@@ -25,36 +24,20 @@ class IRCClient:
         self._line_tasks: Set[asyncio.Task] = set()
         self._max_inflight = int(self.cfg.get("max_inflight_handlers", 200))
 
-    @staticmethod
-    def _truthy(val) -> bool:
-        if val is None:
-            return False
-        if isinstance(val, bool):
-            return val
-        if isinstance(val, (int, float)):
-            return val != 0
-        s = str(val).strip().lower()
-        return s not in ("0", "false", "no", "off", "")
-
     # Opens connection to server:port (TLS if use_tls), sends PASS/NICK/USER from config.
     async def connect(self) -> None:
         server = self.cfg["server"]
         port = int(self.cfg["port"])
-        use_tls = self._truthy(self.cfg.get("use_tls", True))
-        verify_tls = self._truthy(self.cfg.get("verify_tls", True))
-        # Env override so you can force disable verification without editing config (e.g. in systemd).
-        env_verify = os.environ.get("LEOBOT_VERIFY_TLS")
-        if env_verify is not None:
-            verify_tls = self._truthy(env_verify)
+        use_tls = bool(self.cfg.get("use_tls", True))
 
         ssl_ctx = None
         if use_tls:
             ssl_ctx = ssl.create_default_context()
-            if not verify_tls:
+            if not self.cfg.get("verify_tls", True):
                 ssl_ctx.check_hostname = False
                 ssl_ctx.verify_mode = ssl.CERT_NONE
 
-        log.info("Connecting to %s:%s TLS=%s verify_tls=%s", server, port, use_tls, verify_tls)
+        log.info("Connecting to %s:%s TLS=%s", server, port, use_tls)
         self.reader, self.writer = await asyncio.open_connection(server, port, ssl=ssl_ctx)
 
         if self.cfg.get("password"):
