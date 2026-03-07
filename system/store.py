@@ -235,6 +235,31 @@ class Store:
             )
         return [(str(r[0]), str(r[1]), str(r[2]), str(r[3])) for r in rows] if rows else []
 
+    async def fact_insert(self, category: str, fact: str) -> None:
+        cat = (category or "").strip()
+        txt = (fact or "").strip()
+        if not cat or not txt:
+            return
+        await self.execute("INSERT INTO facts(category, fact) VALUES(?, ?)", (cat, txt))
+
+    async def fact_get_random(self) -> tuple[str, str] | None:
+        row = await self.fetchone("SELECT category, fact FROM facts ORDER BY RANDOM() LIMIT 1", ())
+        return (str(row[0]).strip(), str(row[1])) if row else None
+
+    async def fact_get_random_by_category(self, category: str) -> tuple[str, str] | None:
+        cat = (category or "").strip().lower()
+        if not cat:
+            return None
+        row = await self.fetchone(
+            "SELECT category, fact FROM facts WHERE LOWER(TRIM(category)) = ? ORDER BY RANDOM() LIMIT 1",
+            (cat,),
+        )
+        return (str(row[0]).strip(), str(row[1])) if row else None
+
+    async def fact_list_categories(self) -> list[str]:
+        rows = await self.fetchall("SELECT DISTINCT category FROM facts ORDER BY category", ())
+        return [str(r[0]).strip() for r in rows] if rows else []
+
     async def news_list_sources(self):
         return await self.fetchall(
             "SELECT id,name,enabled,created_ts,updated_ts FROM news_sources ORDER BY id",

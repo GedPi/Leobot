@@ -1,0 +1,7 @@
+{
+  "users": {
+    "admin": "$2b$12$..."
+  }
+}
+Run: python -m webui.add_user admin  (then enter password) to create users.json with hashed passwords.
+Do not commit users.json; add it to .gitignore.

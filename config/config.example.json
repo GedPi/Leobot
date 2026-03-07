@@ -30,6 +30,7 @@
 
   "services": [
     "services.eightball",
+    "services.fact",
     "services.gemini",
     "services.greet",
     "services.weather",

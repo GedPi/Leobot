@@ -630,6 +630,20 @@ def migrate_v7(conn: sqlite3.Connection) -> None:
     )
 
 
+# Facts service: id, category, fact. Categories are inferred from distinct category values.
+def migrate_v8(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS facts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT NOT NULL,
+            fact TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_facts_category ON facts(category);
+        """
+    )
+
+
 MIGRATIONS = {
     1: migrate_v1,
     2: migrate_v2,
@@ -638,6 +652,7 @@ MIGRATIONS = {
     5: migrate_v5,
     6: migrate_v6,
     7: migrate_v7,
+    8: migrate_v8,
 }
 
 

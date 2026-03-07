@@ -196,9 +196,13 @@ Commands depend on which services are loaded and enabled in the channel.
 
 | Command | Service | Description |
 |---------|---------|-------------|
+| `!fact [category]` | fact | Random fact (any category) or from a specific category, e.g. `!fact science` |
 | `!wiki`, `!wikicheck` | wiki | Wikipedia lookup |
 | `!weather`, `!weather warn add/list/…` | weather | Weather and alerts |
 | `!news`, `!headlines` | news | RSS/news headlines |
+
+Facts are stored in the database. Import from a CSV (`category,fact`) with:  
+`python scripts/import_facts.py path/to/facts.csv [--db path/to/leonidas.db]`
 
 ### Monitoring (sysmon)
 

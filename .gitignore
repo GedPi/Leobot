@@ -5,6 +5,9 @@
 # Local runtime config (DO NOT COMMIT)
 config/config.json
 
+# Web UI auth (DO NOT COMMIT)
+webui/users.json
+
 # Runtime data (SQLite DB + WAL/SHM)
 data/leonidas.db
 data/*.db

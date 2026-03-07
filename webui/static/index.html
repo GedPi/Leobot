@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Leobot Admin</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="login-screen">
+    <div class="login-box">
+      <h1>Leobot</h1>
+      <p class="login-sub">Sign in to manage settings and view logs</p>
+      <form id="login-form">
+        <label>Username <input type="text" id="login-username" autocomplete="username" required></label>
+        <label>Password <input type="password" id="login-password" autocomplete="current-password" required></label>
+        <p id="login-error" class="error"></p>
+        <button type="submit">Sign in</button>
+      </form>
+    </div>
+  </div>
+
+  <div id="app" class="hidden">
+    <header>
+      <h1>Leobot Admin</h1>
+      <span id="user-name"></span>
+      <button id="logout-btn" type="button">Log out</button>
+    </header>
+
+    <nav>
+      <button type="button" data-tab="info">Info</button>
+      <button type="button" data-tab="config">Config</button>
+      <button type="button" data-tab="logs">Logs</button>
+      <button type="button" data-tab="services">Service enablement</button>
+      <button type="button" data-tab="facts">Facts</button>
+      <button type="button" data-tab="settings">Settings</button>
+    </nav>
+
+    <main>
+      <section id="tab-info" class="tab-panel">
+        <h2>Bot paths &amp; lists</h2>
+        <dl id="info-dl"></dl>
+      </section>
+
+      <section id="tab-config" class="tab-panel hidden">
+        <h2>Bot config</h2>
+        <p class="hint">Edit JSON and Save. Required keys: server, port, nick, user, realname, channels, services.</p>
+        <textarea id="config-editor" rows="20" spellcheck="false"></textarea>
+        <p id="config-message" class="message"></p>
+        <button type="button" id="config-save">Save config</button>
+      </section>
+
+      <section id="tab-logs" class="tab-panel hidden">
+        <h2>Log tail</h2>
+        <p class="hint">Last <input type="number" id="logs-tail" value="500" min="1" max="2000"> lines</p>
+        <button type="button" id="logs-refresh">Refresh</button>
+        <pre id="logs-content"></pre>
+      </section>
+
+      <section id="tab-services" class="tab-panel hidden">
+        <h2>Service enablement</h2>
+        <p class="hint">Per-channel on/off. Toggle and Save.</p>
+        <div id="services-list"></div>
+      </section>
+
+      <section id="tab-facts" class="tab-panel hidden">
+        <h2>Facts (DB)</h2>
+        <p id="facts-summary"></p>
+        <ul id="facts-categories"></ul>
+      </section>
+
+      <section id="tab-settings" class="tab-panel hidden">
+        <h2>Key-value settings (DB)</h2>
+        <table id="settings-table">
+          <thead><tr><th>Key</th><th>Value</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
