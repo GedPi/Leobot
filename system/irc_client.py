@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import ssl
 from typing import Awaitable, Callable, Optional, Set
 
@@ -41,6 +42,10 @@ class IRCClient:
         port = int(self.cfg["port"])
         use_tls = self._truthy(self.cfg.get("use_tls", True))
         verify_tls = self._truthy(self.cfg.get("verify_tls", True))
+        # Env override so you can force disable verification without editing config (e.g. in systemd).
+        env_verify = os.environ.get("LEOBOT_VERIFY_TLS")
+        if env_verify is not None:
+            verify_tls = self._truthy(env_verify)
 
         ssl_ctx = None
         if use_tls:
