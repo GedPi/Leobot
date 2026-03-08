@@ -32,6 +32,7 @@
     "services.eightball",
     "services.insult",
     "services.joke",
+    "services.wolfram",
     "services.fact",
     "services.gemini",
     "services.greet",
@@ -44,6 +45,12 @@
     "services.maintenance",
     "services.sysmon"
   ],
+
+  "wolfram": {
+    "appid": "<your-wolfram-appid>",
+    "max_chars": 330,
+    "timeout_seconds": 15
+  },
 
   "news": {
     "default_limit": 5,
