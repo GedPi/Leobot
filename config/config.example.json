@@ -43,7 +43,8 @@
     "services.lastseen",
     "services.stats",
     "services.maintenance",
-    "services.sysmon"
+    "services.sysmon",
+    "services.blizzard"
   ],
 
   "wolfram": {
@@ -59,5 +60,14 @@
     "cooldown_seconds": 120,
     "line_delay_seconds": 1.2,
     "selection_timeout_seconds": 60
+  },
+
+  "blizzard": {
+    "client_id": "<your-blizzard-client-id>",
+    "client_secret": "<your-blizzard-client-secret>",
+    "region": "eu",
+    "locale": "en_US",
+    "cache_ttl_seconds": 300,
+    "cooldown_seconds": 3
   }
 }
