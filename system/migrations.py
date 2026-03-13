@@ -644,6 +644,37 @@ def migrate_v8(conn: sqlite3.Connection) -> None:
     )
 
 
+# Fact auto: per-channel enablement, daily posted counts, settings for min/max per day.
+def migrate_v9(conn: sqlite3.Connection) -> None:
+    now = int(time.time())
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS fact_auto_enablement (
+            channel TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            updated_ts INTEGER NOT NULL,
+            updated_by TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS fact_auto_posted (
+            channel TEXT NOT NULL,
+            day TEXT NOT NULL,
+            count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(channel, day)
+        );
+        CREATE INDEX IF NOT EXISTS idx_fact_auto_posted_channel ON fact_auto_posted(channel);
+        """
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO settings(key, value, updated_ts) VALUES('fact_auto_min_per_day', '6', ?)",
+        (now,),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO settings(key, value, updated_ts) VALUES('fact_auto_max_per_day', '12', ?)",
+        (now,),
+    )
+
+
 MIGRATIONS = {
     1: migrate_v1,
     2: migrate_v2,
@@ -653,6 +684,7 @@ MIGRATIONS = {
     6: migrate_v6,
     7: migrate_v7,
     8: migrate_v8,
+    9: migrate_v9,
 }
 
 

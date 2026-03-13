@@ -197,12 +197,17 @@ Commands depend on which services are loaded and enabled in the channel.
 | Command | Service | Description |
 |---------|---------|-------------|
 | `!fact [category]` | fact | Random fact (any category) or from a specific category, e.g. `!fact science` |
+| `!fact auto on` \| `!fact auto off` | fact | Enable or disable automatic random facts in the channel (contributor). Requires fact service enabled. |
+| `!fact auto` | fact | Show auto status, today's count, and min/max per day |
+| `!fact auto min N` \| `!fact auto max N` | fact | Set min or max facts per day (1–100, contributor) |
 | `!wiki`, `!wikicheck` | wiki | Wikipedia lookup |
 | `!weather`, `!weather warn add/list/…` | weather | Weather and alerts |
 | `!news`, `!headlines` | news | RSS/news headlines |
 
 Facts are stored in the database. Import from a CSV (`category,fact`) with:  
 `python scripts/import_facts.py path/to/facts.csv [--db path/to/leonidas.db]`
+
+**Fact auto**: When enabled per channel, the bot periodically posts facts in the form `Hey {nick} did you know that {fact}`, picking a random recent speaker from the channel (via irc_log) or "everyone" if none. Min and max facts per day (default 6–12) cap posting per channel per calendar day (UTC) to avoid flooding. State persists across restarts.
 
 ### Monitoring (sysmon)
 

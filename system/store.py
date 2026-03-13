@@ -260,6 +260,74 @@ class Store:
         rows = await self.fetchall("SELECT DISTINCT category FROM facts ORDER BY category", ())
         return [str(r[0]).strip() for r in rows] if rows else []
 
+    # ---- Fact auto (random facts with min/max per day) ----
+    async def fact_auto_is_enabled(self, channel: str) -> bool:
+        row = await self.fetchone(
+            "SELECT enabled FROM fact_auto_enablement WHERE channel=?",
+            (channel.strip(),),
+        )
+        return bool(row and row[0]) if row else False
+
+    async def fact_auto_set_enabled(
+        self, channel: str, enabled: bool, *, updated_by: str | None = None
+    ) -> None:
+        ch = channel.strip()
+        now = int(time.time())
+        await self.execute(
+            "INSERT INTO fact_auto_enablement(channel, enabled, updated_ts, updated_by) VALUES(?,?,?,?) "
+            "ON CONFLICT(channel) DO UPDATE SET enabled=excluded.enabled, updated_ts=excluded.updated_ts, updated_by=excluded.updated_by",
+            (ch, 1 if enabled else 0, now, updated_by or None),
+        )
+
+    async def fact_auto_get_posted_count(self, channel: str, day: str) -> int:
+        row = await self.fetchone(
+            "SELECT count FROM fact_auto_posted WHERE channel=? AND day=?",
+            (channel.strip(), day),
+        )
+        return int(row[0]) if row else 0
+
+    async def fact_auto_increment_posted(self, channel: str, day: str) -> None:
+        ch = channel.strip()
+        await self.execute(
+            "INSERT INTO fact_auto_posted(channel, day, count) VALUES(?,?,1) "
+            "ON CONFLICT(channel, day) DO UPDATE SET count=count+1",
+            (ch, day),
+        )
+
+    async def fact_auto_get_min_max(self) -> tuple[int, int]:
+        min_v = await self.get_setting("fact_auto_min_per_day", "6")
+        max_v = await self.get_setting("fact_auto_max_per_day", "12")
+        try:
+            mi, ma = int(min_v), int(max_v)
+            if mi < 1 or ma < mi:
+                mi, ma = 6, 12
+            return mi, ma
+        except (TypeError, ValueError):
+            return 6, 12
+
+    async def fact_auto_list_enabled_channels(self) -> list[str]:
+        rows = await self.fetchall(
+            "SELECT channel FROM fact_auto_enablement WHERE enabled=1", ()
+        )
+        return [str(r[0]).strip() for r in rows] if rows else []
+
+    async def fact_irc_log_recent_speaker(self, channel: str, exclude_nick: str) -> str | None:
+        """Returns a random nick from recent irc_log speakers in channel, or None."""
+        since_ts = int(time.time()) - (7 * 24 * 3600)
+        ex = (exclude_nick or "").strip().lower()
+        row = await self.fetchone(
+            """
+            SELECT actor_nick FROM irc_log
+            WHERE channel=? AND actor_nick IS NOT NULL AND lower(actor_nick) != ?
+              AND ts > ? AND event IN ('PRIVMSG','ACTION')
+            GROUP BY lower(actor_nick)
+            ORDER BY RANDOM()
+            LIMIT 1
+            """,
+            (channel.strip(), ex or "__none__", since_ts),
+        )
+        return str(row[0]).strip() if row else None
+
     async def news_list_sources(self):
         return await self.fetchall(
             "SELECT id,name,enabled,created_ts,updated_ts FROM news_sources ORDER BY id",
