@@ -447,71 +447,69 @@ class BlizzardService:
 
     # -------------------------------------------------------------------------
     # WoW: Realm resolution (shared by realm display and auction)
-    # Uses /data/wow/search/connected-realm per Blizzard API docs.
+    # Per Blizzard docs: https://develop.battle.net/documentation/world-of-warcraft/guides/search
+    # Use Search API: GET /data/wow/search/connected-realm?realms.name.en_US=<name>
+    # https://us.forums.blizzard.com/en/blizzard/t/wow-connected-realm-id/9604
     # -------------------------------------------------------------------------
     async def _resolve_realm(
         self, client, realm: str
     ) -> tuple[dict | None, str | None]:
         """
-        Resolve realm name/slug to (realm_or_connected_realm_data, connected_realm_id).
+        Resolve realm name/slug to (connected_realm_data, connected_realm_id).
+        Uses official Blizzard Search API per developer docs.
         Returns (None, None) if not found.
         """
+        realm_display = _norm_space(realm).strip()
         realm_slug = _realm_slug(realm)
-        realm_slug_lower = realm_slug.lower()
-        params = {"namespace": f"dynamic-{self.region}", "locale": self.locale}
+        if not realm_display and not realm_slug:
+            return None, None
 
-        # 1) Try direct realm lookup by slug (may 404 for some realms)
-        status, data = await client.get_optional(
-            f"/data/wow/realm/{realm_slug}", params
-        )
-        if status == 200 and data:
-            conn = data.get("connected_realm") or {}
-            conn_href = conn.get("href", "") if isinstance(conn, dict) else ""
-            conn_id = conn_href.rstrip("/").split("/")[-1] if conn_href else None
-            if conn_id and conn_id.isdigit():
-                return data, conn_id
-            return data, None
-
-        # 2) Use connected-realm search API (returns all, we filter client-side)
-        # Path: /data/wow/search/connected-realm per Blizzard Game Data API
-        search_params = dict(params)
-        search_params["_pageSize"] = 1000
-        status, search_data = await client.get_optional(
-            "/data/wow/search/connected-realm", search_params
-        )
-        if status != 200 or not search_data:
+        # Search by display name first, then slug (per Blizzard Search API docs)
+        search_terms = list(dict.fromkeys([realm_display, realm_slug]))  # dedupe, preserve order
+        search_terms = [t for t in search_terms if t]
+        for term in search_terms:
+            if not term:
+                continue
+            params = {
+                "namespace": f"dynamic-{self.region}",
+                "locale": self.locale,
+                "realms.name.en_US": term,
+            }
+            status, search_data = await client.get_optional(
+                "/data/wow/search/connected-realm", params
+            )
+            if status == 200 and search_data:
+                break
+        else:
             return None, None
 
         results = search_data.get("results", [])
-        for item in results:
-            key = item.get("key") or {}
-            href = key.get("href", "") if isinstance(key, dict) else ""
-            conn_id = href.rstrip("/").split("/")[-1] if href else None
-            if not conn_id or not conn_id.isdigit():
-                continue
-            # data.realms can be array (multiple realms in connected group) or single object
-            realms_data = item.get("data") or {}
-            realms = realms_data.get("realms")
-            if isinstance(realms, dict):
-                realms = [realms]
-            if not isinstance(realms, list):
-                continue
-            for r in realms:
-                if not isinstance(r, dict):
-                    continue
-                r_slug = (r.get("slug") or "").lower()
-                r_name = _safe_name(r.get("name")).lower()
-                if r_slug == realm_slug_lower or realm_slug_lower in r_slug:
-                    # Fetch full connected realm for status/population
-                    path = f"/data/wow/connected-realm/{conn_id}"
-                    _, conn_data = await client.get_optional(path, params)
-                    return (conn_data, conn_id) if conn_data else (item, conn_id)
-                if realm_slug_lower in r_name or r_name == realm_slug_lower:
-                    path = f"/data/wow/connected-realm/{conn_id}"
-                    _, conn_data = await client.get_optional(path, params)
-                    return (conn_data, conn_id) if conn_data else (item, conn_id)
+        if not results:
+            return None, None
 
-        return None, None
+        # First result: extract connected_realm_id from key.href or data
+        first = results[0]
+        conn_id: str | None = None
+
+        key = first.get("key") if isinstance(first, dict) else None
+        if isinstance(key, dict):
+            href = key.get("href", "")
+            if href:
+                conn_id = href.rstrip("/").split("/")[-1]
+        if not conn_id and isinstance(first, dict):
+            data = first.get("data", {})
+            if isinstance(data, dict):
+                conn_id = str(data.get("id", "")) if data.get("id") is not None else None
+
+        if not conn_id or not conn_id.isdigit():
+            return None, None
+
+        # Fetch full connected realm for status/population
+        fetch_params = {"namespace": f"dynamic-{self.region}", "locale": self.locale}
+        _, conn_data = await client.get_optional(
+            f"/data/wow/connected-realm/{conn_id}", fetch_params
+        )
+        return (conn_data, conn_id) if conn_data else (first, conn_id)
 
     # -------------------------------------------------------------------------
     # WoW: Realm
@@ -544,21 +542,29 @@ class BlizzardService:
                 await self._err(bot, ev, f"Realm '{realm}' not found")
                 return
 
-            # Connected realm has "realms" array; single realm has "name"
+            # Connected realm has "realms" array; status/population/region may be on each realm
             realms_in = data.get("realms", [])
             if realms_in:
                 name = ", ".join(_safe_name(r.get("name")) for r in realms_in[:3])
-                # Status/population may be on first realm when not at top level
-                first_realm = realms_in[0] if isinstance(realms_in[0], dict) else {}
-                pop = _safe_name(data.get("population")) or _safe_name(first_realm.get("population"))
-                status_obj = data.get("status") or first_realm.get("status")
+                pop = _safe_name(data.get("population"))
+                status_obj = data.get("status")
+                region = _safe_name(data.get("region"))
+                for r in realms_in:
+                    if not isinstance(r, dict):
+                        continue
+                    if not pop or pop == "?":
+                        pop = _safe_name(r.get("population"))
+                    if status_obj is None:
+                        status_obj = r.get("status")
+                    if not region or region == "?":
+                        region = _safe_name(r.get("region"))
             else:
                 name = data.get("name", "?")
                 if isinstance(name, dict):
                     name = _safe_name(name)
                 pop = _safe_name(data.get("population"))
                 status_obj = data.get("status")
-            region = _safe_name(data.get("region"))
+                region = _safe_name(data.get("region"))
             # Status: {type: "UP"}, {name: "UP"}, or boolean
             if isinstance(status_obj, dict):
                 stype = status_obj.get("type") or status_obj.get("name")
