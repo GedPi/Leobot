@@ -60,6 +60,30 @@ def _battletag_slug(bt: str) -> str:
     return (bt or "").strip().replace("#", "-")
 
 
+def _safe_get(obj: Any, key: str, default: Any = None) -> Any:
+    """Get key from obj if it's a dict, else return default."""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return default
+
+
+def _safe_name(obj: Any) -> str:
+    """Extract display name from API object (may be dict with 'name' or primitive)."""
+    if isinstance(obj, dict):
+        return str(obj.get("name") or obj.get("name_en_US") or "?")
+    return str(obj) if obj is not None else "?"
+
+
+def _safe_value(obj: Any) -> int | float:
+    """Extract numeric value from API object (may be dict with 'value' or primitive)."""
+    if isinstance(obj, dict):
+        v = obj.get("value")
+        if isinstance(v, (int, float)):
+            return v
+        return 0
+    return int(obj) if isinstance(obj, (int, float)) else 0
+
+
 def _http_get(
     url: str,
     *,
@@ -235,11 +259,12 @@ class BlizzardService:
                 items = data.get("equipped_items", [])
                 lines = []
                 for it in items[:12]:
-                    slot = (it.get("slot", {}) or {}).get("name", "?")
+                    slot = _safe_name(it.get("slot"))
                     name = (it.get("name", "") or "?")
-                    ilvl = it.get("level", {}).get("value", "")
-                    qobj = it.get("quality") or {}
-                    qual = WOW_QUALITY.get(qobj.get("type", qobj), "")
+                    ilvl = _safe_value(it.get("level"))
+                    qobj = it.get("quality")
+                    qt = _safe_get(qobj, "type") if isinstance(qobj, dict) else qobj
+                    qual = WOW_QUALITY.get(qt, "") if qt is not None else ""
                     lines.append(f"{slot}: {name}" + (f" (i{ilvl})" if ilvl else "") + (f" [{qual}]" if qual else ""))
                 msg = f"WoW gear {char}@{realm_slug}: " + " | ".join(lines[:6])
                 if len(lines) > 6:
@@ -250,7 +275,8 @@ class BlizzardService:
             if action == "stats":
                 path = f"/profile/wow/character/{realm_slug}/{char_slug}/statistics"
                 data = await client.get(path, {"namespace": f"profile-{self.region}", "locale": self.locale})
-                cats = data.get("character_statistics", {}).get("categories", [])
+                stats_data = data.get("character_statistics") or {}
+                cats = stats_data.get("categories", []) if isinstance(stats_data, dict) else []
                 parts = []
                 for cat in cats[:3]:
                     subcats = cat.get("sub_categories", [])
@@ -266,8 +292,9 @@ class BlizzardService:
                 path = f"/profile/wow/character/{realm_slug}/{char_slug}/professions"
                 data = await client.get(path, {"namespace": f"profile-{self.region}", "locale": self.locale})
                 profs = []
-                for p in (data.get("professions", {}) or {}).get("primaries", [])[:5]:
-                    profs.append(f"{p.get('profession',{}).get('name','?')} {p.get('skill_tier',0)}")
+                prof_data = data.get("professions") or {}
+                for p in (prof_data.get("primaries", []) if isinstance(prof_data, dict) else [])[:5]:
+                    profs.append(f"{_safe_name(p.get('profession'))} {p.get('skill_tier',0)}")
                 msg = f"WoW profs {char}@{realm_slug}: " + ", ".join(profs) if profs else "No professions"
                 await bot.privmsg(ev.target, msg)
                 return
@@ -276,7 +303,7 @@ class BlizzardService:
                 path = f"/profile/wow/character/{realm_slug}/{char_slug}/reputations"
                 data = await client.get(path, {"namespace": f"profile-{self.region}", "locale": self.locale})
                 reps = data.get("reputations", [])[:6]
-                parts = [f"{r.get('faction',{}).get('name','?')}: {r.get('standing',{}).get('name','?')}" for r in reps]
+                parts = [f"{_safe_name(r.get('faction'))}: {_safe_name(r.get('standing'))}" for r in reps]
                 msg = f"WoW reps {char}@{realm_slug}: " + " | ".join(parts) if parts else "No reputations"
                 await bot.privmsg(ev.target, msg)
                 return
@@ -322,11 +349,11 @@ class BlizzardService:
             path = f"/profile/wow/character/{realm_slug}/{char_slug}"
             data = await client.get(path, {"namespace": f"profile-{self.region}", "locale": self.locale})
             level = data.get("level", 0)
-            cls = (data.get("character_class", {}) or {}).get("name", "?")
-            race = (data.get("race", {}) or {}).get("name", "?")
-            faction = (data.get("faction", {}) or {}).get("name", "?")
+            cls = _safe_name(data.get("character_class"))
+            race = _safe_name(data.get("race"))
+            faction = _safe_name(data.get("faction"))
             ach_pts = data.get("achievement_points", 0)
-            eq_ilvl = (data.get("equipped_item_level", {}) or {}).get("value", 0)
+            eq_ilvl = _safe_value(data.get("equipped_item_level"))
             last_login = data.get("last_login_timestamp")
             last_str = ""
             if last_login:
@@ -363,9 +390,9 @@ class BlizzardService:
                 members = data.get("members", [])[:10]
                 parts = []
                 for m in members:
-                    rank = (m.get("rank", 0))
-                    char = (m.get("character", {}) or {}).get("name", "?")
-                    level = (m.get("character", {}) or {}).get("level", 0)
+                    char_obj = m.get("character")
+                    char = _safe_name(char_obj) if isinstance(char_obj, dict) else "?"
+                    level = char_obj.get("level", 0) if isinstance(char_obj, dict) else 0
                     parts.append(f"{char}(L{level})")
                 msg = f"WoW guild {guild}@{realm_slug} roster (top 10): " + ", ".join(parts) if parts else "No members"
                 await bot.privmsg(ev.target, msg)
@@ -383,8 +410,8 @@ class BlizzardService:
             # Default: guild summary
             path = f"/profile/wow/guild/{realm_slug}/{guild_slug}"
             data = await client.get(path, {"namespace": f"profile-{self.region}", "locale": self.locale})
-            faction = (data.get("faction", {}) or {}).get("name", "?")
-            realm_name = (data.get("realm", {}) or {}).get("name", "?")
+            faction = _safe_name(data.get("faction"))
+            realm_name = _safe_name(data.get("realm"))
             members = data.get("member_count", 0)
             ach_pts = data.get("achievement_points", 0)
             msg = f"WoW guild {guild}@{realm_name}: {faction} | {members} members | {ach_pts} achieve pts"
@@ -426,9 +453,10 @@ class BlizzardService:
             path = f"/data/wow/realm/{realm_slug}"
             data = await client.get(path, {"namespace": f"dynamic-{self.region}", "locale": self.locale})
             name = data.get("name", "?")
-            region = (data.get("region", {}) or {}).get("name", "?")
-            pop = (data.get("population", {}) or {}).get("name", "?")
-            status = "Online" if data.get("status", {}).get("type") == "UP" else "Offline"
+            region = _safe_name(data.get("region"))
+            pop = _safe_name(data.get("population"))
+            status_obj = data.get("status")
+            status = "Online" if (isinstance(status_obj, dict) and status_obj.get("type") == "UP") else "Offline"
             msg = f"WoW realm {name}: {region} | {pop} | {status}"
             await bot.privmsg(ev.target, msg)
 
