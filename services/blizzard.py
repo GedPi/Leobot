@@ -230,6 +230,10 @@ class BlizzardService:
         self.client_secret = (self.cfg.get("client_secret") or "").strip()
         self.region = (self.cfg.get("region") or "eu").lower()
         self.locale = (self.cfg.get("locale") or "en_US").strip()
+        # EU realm names are indexed under en_GB; US under en_US (Blizzard regionality)
+        self._realm_name_locale = (
+            "en_GB" if (self.region == "eu" and self.locale == "en_US") else self.locale
+        ).replace("-", "_")
         self.cache_ttl = int(self.cfg.get("cache_ttl_seconds", 300))
         self.cooldown_s = int(self.cfg.get("cooldown_seconds", 3))
         self._cooldown: dict[tuple[str, str], float] = {}
@@ -448,9 +452,15 @@ class BlizzardService:
     # -------------------------------------------------------------------------
     # WoW: Realm resolution (shared by realm display and auction)
     # Per Blizzard docs: https://develop.battle.net/documentation/world-of-warcraft/guides/search
-    # Use Search API: GET /data/wow/search/connected-realm?realms.name.en_US=<name>
-    # https://us.forums.blizzard.com/en/blizzard/t/wow-connected-realm-id/9604
+    # Use Search API: GET /data/wow/search/connected-realm?realms.name.<locale>=<name>
+    # For EU, realm names are indexed under en_GB (not en_US). Respect region+locale.
     # -------------------------------------------------------------------------
+    def _realm_search_locale(self) -> str:
+        """Locale for realm name search. EU uses en_GB; US uses en_US."""
+        if self.region == "eu" and self.locale == "en_US":
+            return "en_GB"
+        return self.locale
+
     async def _resolve_realm(
         self, client, realm: str, *, debug: bool = False
     ) -> tuple[dict | None, str | None, str | None]:
@@ -463,6 +473,8 @@ class BlizzardService:
         if not realm_display and not realm_slug:
             return None, None, "debug: empty realm input" if debug else None
 
+        search_locale = self._realm_search_locale()
+        name_param = f"realms.name.{search_locale}"
         search_terms = list(dict.fromkeys([realm_display, realm_slug]))
         search_terms = [t for t in search_terms if t]
         debug_parts: list[str] = []
@@ -471,13 +483,13 @@ class BlizzardService:
             params = {
                 "namespace": f"dynamic-{self.region}",
                 "locale": self.locale,
-                "realms.name.en_US": term,
+                name_param: term,
             }
             status, search_data = await client.get_optional(
                 "/data/wow/search/connected-realm", params
             )
             if debug:
-                debug_parts.append(f"search realms.name.en_US={term!r} -> status={status}")
+                debug_parts.append(f"search {name_param}={term!r} -> status={status}")
                 if search_data is not None:
                     top_keys = list(search_data.keys())[:10] if isinstance(search_data, dict) else []
                     debug_parts.append(f"response keys={top_keys}")
