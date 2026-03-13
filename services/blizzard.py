@@ -452,24 +452,22 @@ class BlizzardService:
     # https://us.forums.blizzard.com/en/blizzard/t/wow-connected-realm-id/9604
     # -------------------------------------------------------------------------
     async def _resolve_realm(
-        self, client, realm: str
-    ) -> tuple[dict | None, str | None]:
+        self, client, realm: str, *, debug: bool = False
+    ) -> tuple[dict | None, str | None, str | None]:
         """
         Resolve realm name/slug to (connected_realm_data, connected_realm_id).
-        Uses official Blizzard Search API per developer docs.
-        Returns (None, None) if not found.
+        Returns (None, None, debug_msg) on failure; debug_msg is set when debug=True.
         """
         realm_display = _norm_space(realm).strip()
         realm_slug = _realm_slug(realm)
         if not realm_display and not realm_slug:
-            return None, None
+            return None, None, "debug: empty realm input" if debug else None
 
-        # Search by display name first, then slug (per Blizzard Search API docs)
-        search_terms = list(dict.fromkeys([realm_display, realm_slug]))  # dedupe, preserve order
+        search_terms = list(dict.fromkeys([realm_display, realm_slug]))
         search_terms = [t for t in search_terms if t]
+        debug_parts: list[str] = []
+
         for term in search_terms:
-            if not term:
-                continue
             params = {
                 "namespace": f"dynamic-{self.region}",
                 "locale": self.locale,
@@ -478,16 +476,24 @@ class BlizzardService:
             status, search_data = await client.get_optional(
                 "/data/wow/search/connected-realm", params
             )
+            if debug:
+                debug_parts.append(f"search realms.name.en_US={term!r} -> status={status}")
+                if search_data is not None:
+                    top_keys = list(search_data.keys())[:10] if isinstance(search_data, dict) else []
+                    debug_parts.append(f"response keys={top_keys}")
+                    results = search_data.get("results", []) if isinstance(search_data, dict) else []
+                    debug_parts.append(f"results count={len(results)}")
+                    if results and isinstance(results[0], dict):
+                        debug_parts.append(f"first result keys={list(results[0].keys())[:10]}")
             if status == 200 and search_data:
                 break
         else:
-            return None, None
+            return None, None, (" | ".join(debug_parts) if debug else None)
 
         results = search_data.get("results", [])
         if not results:
-            return None, None
+            return None, None, (" | ".join(debug_parts) + f" | results empty" if debug else None)
 
-        # First result: extract connected_realm_id from key.href or data
         first = results[0]
         conn_id: str | None = None
 
@@ -501,15 +507,23 @@ class BlizzardService:
             if isinstance(data, dict):
                 conn_id = str(data.get("id", "")) if data.get("id") is not None else None
 
-        if not conn_id or not conn_id.isdigit():
-            return None, None
+        if debug:
+            debug_parts.append(f"extracted conn_id={conn_id!r}")
 
-        # Fetch full connected realm for status/population
+        if not conn_id or not conn_id.isdigit():
+            return None, None, (" | ".join(debug_parts) if debug else None)
+
         fetch_params = {"namespace": f"dynamic-{self.region}", "locale": self.locale}
-        _, conn_data = await client.get_optional(
+        status2, conn_data = await client.get_optional(
             f"/data/wow/connected-realm/{conn_id}", fetch_params
         )
-        return (conn_data, conn_id) if conn_data else (first, conn_id)
+        if debug and not conn_data:
+            debug_parts.append(f"connected-realm/{conn_id} -> status={status2}")
+
+        if not conn_data:
+            return None, None, (" | ".join(debug_parts) if debug else None)
+
+        return (conn_data, conn_id, None)
 
     # -------------------------------------------------------------------------
     # WoW: Realm
@@ -537,9 +551,12 @@ class BlizzardService:
                 await self._err(bot, ev, "Usage: !wow realm <realm> | !wow realm list")
                 return
 
-            data, _ = await self._resolve_realm(client, realm)
+            data, conn_id, debug_msg = await self._resolve_realm(client, realm, debug=True)
             if not data:
-                await self._err(bot, ev, f"Realm '{realm}' not found")
+                msg = f"Realm '{realm}' not found"
+                if debug_msg:
+                    msg += f" | {debug_msg[:280]}"
+                await self._err(bot, ev, msg)
                 return
 
             # Connected realm has "realms" array; status/population/region may be on each realm
@@ -687,9 +704,12 @@ class BlizzardService:
             return
 
         try:
-            _, conn_id = await self._resolve_realm(client, realm)
+            _, conn_id, debug_msg = await self._resolve_realm(client, realm, debug=True)
             if not conn_id:
-                await self._err(bot, ev, f"Realm '{realm}' not found or could not resolve connected realm")
+                msg = f"Realm '{realm}' not found or could not resolve connected realm"
+                if debug_msg:
+                    msg += f" | {debug_msg[:280]}"
+                await self._err(bot, ev, msg)
                 return
 
             # Auction API: returns auction houses; each has files with URLs to auction data
