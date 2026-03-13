@@ -8,6 +8,13 @@ WoW: !wow char|guild|realm|item|auction|pvp ...
 D3:  !d3 profile|hero|item|leaderboard ...
 
 Aliases: !wc, !wg, !wr, !wi, !wa, !wpvp (WoW) | !dp, !dh, !di, !dlb (D3)
+
+API Reference (official Blizzard documentation):
+- OAuth: https://develop.battle.net/documentation/guides/using-oauth/client-credentials-flow
+- WoW Profile API: https://develop.battle.net/documentation/api-reference/world-of-warcraft-profile-api
+- WoW Game Data API: https://develop.battle.net/documentation/api-reference/world-of-warcraft-game-data-api
+- Diablo III: https://develop.battle.net/documentation/diablo-3
+- Regionality: https://develop.battle.net/documentation/guides/regionality-and-apis
 """
 
 from __future__ import annotations
@@ -137,9 +144,11 @@ class BlizzardClient:
         self._lock = asyncio.Lock()
 
     def _oauth_url(self) -> str:
-        return f"https://{self.region}.battle.net/oauth/token"
+        # Official: https://oauth.battle.net/token (region-agnostic, per Blizzard docs)
+        return "https://oauth.battle.net/token"
 
     def _api_base(self) -> str:
+        # Per regionality guide: https://{region}.api.blizzard.com
         return f"https://{self.region}.api.blizzard.com"
 
     async def _ensure_token(self) -> str:
@@ -758,9 +767,15 @@ class BlizzardService:
             if args[0].lower() == "ladder" and len(args) >= 2:
                 bracket = args[1].lower()
                 slug = PVP_BRACKETS.get(bracket, bracket)
-                path = f"/data/wow/pvp-season/{self.region}"
+                # PvP season index: https://develop.battle.net/documentation/api-reference/world-of-warcraft-game-data-api
+                path = "/data/wow/pvp-season/index"
                 seasons = await client.get(path, {"namespace": f"dynamic-{self.region}", "locale": self.locale})
-                season_id = seasons.get("current_season", {}).get("id")
+                curr = seasons.get("current_season") or {}
+                season_id = curr.get("id") if isinstance(curr, dict) else None
+                if not season_id and isinstance(curr, dict):
+                    href = (curr.get("key") or {}).get("href", "") if isinstance(curr.get("key"), dict) else curr.get("href", "")
+                    if href:
+                        season_id = href.rstrip("/").split("/")[-1]
                 if not season_id:
                     await self._err(bot, ev, "Could not get current PvP season")
                     return
@@ -781,9 +796,15 @@ class BlizzardService:
                 bracket = args[1].lower()
                 char_name = args[2]
                 slug = PVP_BRACKETS.get(bracket, bracket)
-                path = f"/data/wow/pvp-season/{self.region}"
+                # PvP season index: https://develop.battle.net/documentation/api-reference/world-of-warcraft-game-data-api
+                path = "/data/wow/pvp-season/index"
                 seasons = await client.get(path, {"namespace": f"dynamic-{self.region}", "locale": self.locale})
-                season_id = seasons.get("current_season", {}).get("id")
+                curr = seasons.get("current_season") or {}
+                season_id = curr.get("id") if isinstance(curr, dict) else None
+                if not season_id and isinstance(curr, dict):
+                    href = (curr.get("key") or {}).get("href", "") if isinstance(curr.get("key"), dict) else curr.get("href", "")
+                    if href:
+                        season_id = href.rstrip("/").split("/")[-1]
                 if not season_id:
                     await self._err(bot, ev, "Could not get current PvP season")
                     return
