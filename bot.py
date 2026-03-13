@@ -56,6 +56,9 @@ class Bot:
         self.scheduler = Scheduler()
         self.irc: Optional[IRCClient] = None
 
+        # Per-channel set of currently online nicks (from NAMES + JOIN/PART/QUIT/KICK/NICK)
+        self._channel_users: dict[str, set[str]] = {}
+
         self.commands: dict[str, dict[str, Any]] = {}
 
         self.acl = ACL(self.store, cfg)
@@ -113,6 +116,15 @@ class Bot:
         if not self.irc:
             raise RuntimeError("IRC client not initialized")
         await self.irc.send_raw(line)
+
+    # Returns a list of nicks currently in the channel (from NAMES/JOIN/PART tracking), excluding the bot.
+    def get_channel_users(self, channel: str) -> list[str]:
+        ch = (channel or "").strip()
+        if not ch:
+            return []
+        users = self._channel_users.get(ch, set())
+        bot_nick = (self.cfg.get("nick") or "").strip().lower()
+        return [n for n in users if (n or "").strip().lower() != bot_nick]
 
     # Sends a PRIVMSG to target (channel or nick); requires irc client to be connected.
     async def privmsg(self, target: str, msg: str) -> None:
@@ -225,6 +237,7 @@ class Bot:
         params = pl.params
 
         if cmd == "001":
+            self._channel_users.clear()
             for chan in self.cfg.get("channels", []):
                 await self.send_raw(f"JOIN {chan}")
                 await asyncio.sleep(0.7)
@@ -250,6 +263,17 @@ class Bot:
         nick, user, host = ("", None, None)
         if prefix:
             nick, user, host = parse_prefix(prefix)
+
+        # 353 RPL_NAMREPLY: channel user list (sent on JOIN)
+        if cmd == "353" and len(params) >= 3:
+            channel = next((p for p in params if isinstance(p, str) and p.startswith("#")), None)
+            if channel:
+                nicks_str = params[-1] if params else ""
+                for n in (nicks_str or "").split():
+                    n = (n or "").lstrip("@+%~&")
+                    if n:
+                        self._channel_users.setdefault(channel, set()).add(n)
+            return
 
         if cmd == "PRIVMSG" and len(params) >= 2:
             target = params[0]
@@ -300,6 +324,8 @@ class Bot:
 
         if cmd == "JOIN" and params:
             channel = params[0]
+            if channel.startswith("#") and nick:
+                self._channel_users.setdefault(channel, set()).add(nick)
             ev = Event(
                 nick=nick,
                 user=user,
@@ -317,6 +343,8 @@ class Bot:
 
         if cmd == "PART" and params:
             channel = params[0]
+            if channel.startswith("#") and nick:
+                self._channel_users.get(channel, set()).discard(nick)
             ev = Event(
                 nick=nick,
                 user=user,
@@ -333,6 +361,9 @@ class Bot:
             return
 
         if cmd == "QUIT":
+            if nick:
+                for ch_users in self._channel_users.values():
+                    ch_users.discard(nick)
             ev = Event(
                 nick=nick,
                 user=user,
@@ -350,6 +381,11 @@ class Bot:
 
         if cmd == "NICK" and params:
             new_nick = params[0]
+            if nick and new_nick:
+                for ch_users in self._channel_users.values():
+                    if nick in ch_users:
+                        ch_users.discard(nick)
+                        ch_users.add(new_nick)
             ev = Event(
                 nick=new_nick,
                 user=user,
@@ -370,6 +406,8 @@ class Bot:
         if cmd == "KICK" and len(params) >= 2:
             channel = params[0]
             victim = params[1]
+            if channel.startswith("#") and victim:
+                self._channel_users.get(channel, set()).discard(victim)
             ev = Event(
                 nick=nick,
                 user=user,

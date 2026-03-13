@@ -139,7 +139,6 @@ class FactService:
 
             today = time.strftime("%Y-%m-%d", time.gmtime())
             min_v, max_v = await bot.store.fact_auto_get_min_max()
-            bot_nick = (bot.cfg.get("nick") or "").strip()
 
             candidates = []
             for ch in eligible:
@@ -160,9 +159,8 @@ class FactService:
                 return
 
             _, fact = result
-            nick = await bot.store.fact_irc_log_recent_speaker(channel, bot_nick)
-            if not nick:
-                nick = "everyone"
+            online = getattr(bot, "get_channel_users", lambda _: [])(channel)
+            nick = random.choice(online) if online else "everyone"
 
             await bot.store.fact_auto_increment_posted(channel, today)
             await bot.privmsg(channel, f"Hey {nick} did you know that {fact}")
