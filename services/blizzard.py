@@ -513,7 +513,9 @@ class BlizzardService:
         if isinstance(key, dict):
             href = key.get("href", "")
             if href:
-                conn_id = href.rstrip("/").split("/")[-1]
+                # href may include query params: .../1305?namespace=dynamic-eu
+                path_part = href.split("?")[0].rstrip("/")
+                conn_id = path_part.split("/")[-1]
         if not conn_id and isinstance(first, dict):
             data = first.get("data", {})
             if isinstance(data, dict):
