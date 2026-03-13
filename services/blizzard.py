@@ -437,6 +437,66 @@ class BlizzardService:
             await self._err(bot, ev, f"API error: {e}")
 
     # -------------------------------------------------------------------------
+    # WoW: Realm resolution (shared by realm display and auction)
+    # -------------------------------------------------------------------------
+    async def _resolve_realm(
+        self, client, realm: str
+    ) -> tuple[dict | None, str | None]:
+        """
+        Resolve realm name/slug to (realm_or_connected_realm_data, connected_realm_id).
+        Returns (None, None) if not found.
+        """
+        realm_slug = _realm_slug(realm)
+        params = {"namespace": f"dynamic-{self.region}", "locale": self.locale}
+
+        # Try direct realm lookup
+        status, data = await client.get_optional(
+            f"/data/wow/realm/{realm_slug}", params
+        )
+        if status == 200 and data:
+            conn = data.get("connected_realm") or {}
+            conn_href = conn.get("href", "") if isinstance(conn, dict) else ""
+            conn_id = conn_href.rstrip("/").split("/")[-1] if conn_href else None
+            if conn_id and conn_id.isdigit():
+                return data, conn_id
+            return data, None
+
+        # Search realm index
+        index_data = await client.get("/data/wow/realm/index", params)
+        realms = index_data.get("realms", [])
+        realm_slug_lower = realm_slug.lower()
+        matched = None
+        for r in realms:
+            r_slug = (r.get("slug") or "").lower()
+            r_name = _safe_name(r.get("name")).lower()
+            if r_slug == realm_slug_lower or realm_slug_lower in r_slug:
+                matched = r
+                break
+            if realm_slug_lower in r_name or r_name == realm_slug_lower:
+                matched = r
+                break
+        if not matched:
+            return None, None
+
+        # Get connected_realm href from index entry (may be key.href or href)
+        conn = matched.get("connected_realm") or {}
+        if not isinstance(conn, dict):
+            return None, None
+        conn_key = conn.get("key")
+        conn_href = conn.get("href") or (conn_key.get("href") if isinstance(conn_key, dict) else None)
+        conn_id = conn_href.rstrip("/").split("/")[-1] if conn_href else None
+        if not conn_id or not conn_id.isdigit():
+            return None, None
+
+        # Fetch connected realm for full data
+        if conn_href and "blizzard.com" in conn_href:
+            conn_path = conn_href.split("blizzard.com", 1)[-1].split("?")[0]
+            status, conn_data = await client.get_optional(conn_path, params)
+            if status == 200 and conn_data:
+                return conn_data, conn_id
+        return matched, conn_id
+
+    # -------------------------------------------------------------------------
     # WoW: Realm
     # -------------------------------------------------------------------------
     async def _wow_realm(self, bot, ev, args: list[str]) -> None:
@@ -462,77 +522,34 @@ class BlizzardService:
                 await self._err(bot, ev, "Usage: !wow realm <realm> | !wow realm list")
                 return
 
-            realm_slug = _realm_slug(realm)
-            params = {"namespace": f"dynamic-{self.region}", "locale": self.locale}
+            data, _ = await self._resolve_realm(client, realm)
+            if not data:
+                await self._err(bot, ev, f"Realm '{realm}' not found")
+                return
 
-            # Try direct lookup by slug first
-            status, data = await client.get_optional(
-                f"/data/wow/realm/{realm_slug}", params
-            )
-
-            # If 404, search realm index (API may use realm ID or connected-realm)
-            if status != 200 or not data:
-                index_data = await client.get(
-                    "/data/wow/realm/index", params
-                )
-                realms = index_data.get("realms", [])
-                realm_slug_lower = realm_slug.lower()
-                matched = None
-                for r in realms:
-                    r_slug = (r.get("slug") or "").lower()
-                    r_name = _safe_name(r.get("name")).lower()
-                    if r_slug == realm_slug_lower or realm_slug_lower in r_slug:
-                        matched = r
-                        break
-                    if realm_slug_lower in r_name or r_name == realm_slug_lower:
-                        matched = r
-                        break
-                if not matched:
-                    await self._err(bot, ev, f"Realm '{realm}' not found")
-                    return
-
-                # Try realm by ID (API path may use id not slug)
-                r_id = matched.get("id")
-                key = matched.get("key") or {}
-                key_href = key.get("href", "") if isinstance(key, dict) else ""
-                if r_id is not None:
-                    status, data = await client.get_optional(
-                        f"/data/wow/realm/{r_id}", params
-                    )
-                if (status != 200 or not data) and key_href and "blizzard.com" in key_href:
-                    # Extract path from href (e.g. /data/wow/realm/123)
-                    path_part = key_href.split("blizzard.com", 1)[-1].split("?")[0]
-                    if path_part.startswith("/"):
-                        status, data = await client.get_optional(path_part, params)
-
-                # Fallback: fetch connected realm (has status, population)
-                if (status != 200 or not data):
-                    conn = matched.get("connected_realm") or {}
-                    conn_href = conn.get("href", "") if isinstance(conn, dict) else ""
-                    if conn_href and ".com" in conn_href:
-                        conn_path = conn_href.split(".com", 1)[-1].split("?")[0]
-                        status, data = await client.get_optional(conn_path, params)
-                        if status == 200 and data:
-                            realms_in = data.get("realms", [])
-                            name = ", ".join(_safe_name(r.get("name")) for r in realms_in[:3]) if realms_in else _safe_name(matched.get("name"))
-                            region = _safe_name(data.get("region"))
-                            status_obj = data.get("status")
-                            status_str = "Online" if (isinstance(status_obj, dict) and status_obj.get("type") == "UP") else "Offline"
-                            msg = f"WoW realm {name}: {region} | {status_str}"
-                            await bot.privmsg(ev.target, msg)
-                            return
-
-                if not data:
-                    await self._err(bot, ev, f"Realm '{realm}' not found")
-                    return
-
-            name = data.get("name", "?")
-            if isinstance(name, dict):
-                name = _safe_name(name)
+            # Connected realm has "realms" array; single realm has "name"
+            realms_in = data.get("realms", [])
+            if realms_in:
+                name = ", ".join(_safe_name(r.get("name")) for r in realms_in[:3])
+                # Status/population may be on first realm when not at top level
+                first_realm = realms_in[0] if isinstance(realms_in[0], dict) else {}
+                pop = _safe_name(data.get("population")) or _safe_name(first_realm.get("population"))
+                status_obj = data.get("status") or first_realm.get("status")
+            else:
+                name = data.get("name", "?")
+                if isinstance(name, dict):
+                    name = _safe_name(name)
+                pop = _safe_name(data.get("population"))
+                status_obj = data.get("status")
             region = _safe_name(data.get("region"))
-            pop = _safe_name(data.get("population"))
-            status_obj = data.get("status")
-            status_str = "Online" if (isinstance(status_obj, dict) and status_obj.get("type") == "UP") else "Offline"
+            # Status: {type: "UP"}, {name: "UP"}, or boolean
+            if isinstance(status_obj, dict):
+                stype = status_obj.get("type") or status_obj.get("name")
+            else:
+                stype = status_obj
+            status_str = "Online" if (
+                stype is True or (stype and str(stype).upper() == "UP")
+            ) else "Offline"
             msg = f"WoW realm {name}: {region} | {pop} | {status_str}"
             await bot.privmsg(ev.target, msg)
 
@@ -647,18 +664,9 @@ class BlizzardService:
             return
 
         try:
-            realm_slug = _realm_slug(realm)
-            # Get realm to find connected realm ID
-            path = f"/data/wow/realm/{realm_slug}"
-            realm_data = await client.get(path, {"namespace": f"dynamic-{self.region}", "locale": self.locale})
-            conn_realm = realm_data.get("connected_realm") or {}
-            conn_href = conn_realm.get("href", "")
-            if not conn_href:
-                await self._err(bot, ev, f"Realm '{realm}' not found")
-                return
-            conn_id = conn_href.rstrip("/").split("/")[-1]
-            if not conn_id or not conn_id.isdigit():
-                await self._err(bot, ev, "Could not resolve connected realm")
+            _, conn_id = await self._resolve_realm(client, realm)
+            if not conn_id:
+                await self._err(bot, ev, f"Realm '{realm}' not found or could not resolve connected realm")
                 return
 
             # Auction API: returns auction houses; each has files with URLs to auction data
@@ -722,9 +730,9 @@ class BlizzardService:
                 avg_buy = sum(buyouts) // len(buyouts)
                 gold_min = min_buy / 10000
                 gold_avg = avg_buy / 10000
-                msg = f"WoW auction {realm_slug}: {qty} available | min {gold_min:.1f}g | avg {gold_avg:.1f}g"
+                msg = f"WoW auction {_realm_slug(realm)}: {qty} available | min {gold_min:.1f}g | avg {gold_avg:.1f}g"
             else:
-                msg = f"WoW auction {realm_slug}: {qty} available (no buyout data)"
+                msg = f"WoW auction {_realm_slug(realm)}: {qty} available (no buyout data)"
             await bot.privmsg(ev.target, msg)
 
         except RuntimeError as e:
