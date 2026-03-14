@@ -1113,24 +1113,46 @@ class BlizzardService:
             await self._no_config(bot, ev)
             return
 
+        # D3 API path: /d3/data/season/{id}/leaderboard/{lb_id} (not /data/d3/...)
+        D3_LB_PATH = "/d3/data/season/{season}/leaderboard/{lb_id}"
+        D3_REGIONS = frozenset(("eu", "us", "kr", "tw", "sea"))
+
         try:
             if not args or len(args) < 2:
-                await self._err(bot, ev, "Usage: !d3 leaderboard <season> <class> | !d3 leaderboard rank <season> <class> <rank>. Class: barb, wiz, monk, dh, wd, crusader, necro")
+                await self._err(bot, ev, "Usage: !d3 leaderboard [region] <season> <class> | !d3 leaderboard rank [region] <season> <class> <rank>. Class: barb, wiz, monk, dh, wd, crusader, necro")
                 return
 
             namespace = f"season-{self.region}"
             params = {"namespace": namespace, "locale": self.locale}
 
-            if args[0].lower() == "rank" and len(args) >= 4:
-                season = args[1]
-                cls = args[2].lower()
-                rank = args[3]
+            # Parse: [region] season class (region optional, use config if omitted)
+            if args[0].lower() in D3_REGIONS and len(args) >= 3:
+                region, season, cls = args[0].lower(), args[1], args[2].lower()
+                namespace = f"season-{region}"
+                params = {"namespace": namespace, "locale": self.locale}
+                rank_args_offset = 1
+            else:
+                region = self.region
+                season, cls = args[0], args[1].lower()
+                rank_args_offset = 0
+
+            slug = D3_CLASS_SLUGS.get(cls, cls if "-" in cls else cls)
+            lb_id = f"rift-{slug}" if not slug.startswith("rift-") else slug
+            path = D3_LB_PATH.format(season=season, lb_id=lb_id)
+
+            if args[rank_args_offset].lower() == "rank" and len(args) >= rank_args_offset + 4:
+                season = args[rank_args_offset + 1]
+                cls = args[rank_args_offset + 2].lower()
+                rank = args[rank_args_offset + 3]
+                if rank_args_offset:
+                    namespace = f"season-{args[0].lower()}"
+                    params = {"namespace": namespace, "locale": self.locale}
+                slug = D3_CLASS_SLUGS.get(cls, cls if "-" in cls else cls)
+                lb_id = f"rift-{slug}" if not slug.startswith("rift-") else slug
+                path = D3_LB_PATH.format(season=season, lb_id=lb_id)
                 if not rank.isdigit():
                     await self._err(bot, ev, "Rank must be numeric")
                     return
-                slug = D3_CLASS_SLUGS.get(cls, cls if "-" in cls else f"rift-{cls}")
-                lb_id = slug if slug.startswith("rift-") else f"rift-{slug}"
-                path = f"/data/d3/season/{season}/leaderboard/{lb_id}"
                 data = await client.get(path, params)
                 entries = data.get("row", data.get("rows", []))[:]
                 r = int(rank)
@@ -1143,18 +1165,13 @@ class BlizzardService:
                     await self._err(bot, ev, f"Rank {rank} not found (max {len(entries)})")
                 return
 
-            season = args[0]
-            cls = args[1].lower()
-            slug = D3_CLASS_SLUGS.get(cls, cls if "-" in cls else cls)
-            lb_id = f"rift-{slug}" if not slug.startswith("rift-") else slug
-            path = f"/data/d3/season/{season}/leaderboard/{lb_id}"
             data = await client.get(path, params)
             entries = data.get("row", data.get("rows", []))[:5]
             parts = []
             for i, row in enumerate(entries):
                 name = self._d3_leaderboard_player_name(row)
                 parts.append(f"#{i+1} {name}")
-            msg = f"D3 leaderboard {cls} S{season} ({self.region}): " + " | ".join(parts) if parts else "No entries"
+            msg = f"D3 leaderboard {cls} S{season} ({region}): " + " | ".join(parts) if parts else "No entries"
             await bot.privmsg(ev.target, msg)
 
         except RuntimeError as e:
