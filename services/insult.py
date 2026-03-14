@@ -1,6 +1,6 @@
 """
 Insult service: Evil Insult Generator API.
-Commands: !insulten {nick} (English), !insultel {nick} (Greek).
+Commands: !insult {nick} (English), !insulte {nick} (Greek).
 Requires at least user role (admins, contributors, users); guests are denied.
 """
 from __future__ import annotations
@@ -28,7 +28,7 @@ async def _get_insult(lang: str) -> str | None:
 
 class InsultService:
     """
-    Evil Insult Generator: !insulten {nick} (English), !insultel {nick} (Greek).
+    Evil Insult Generator: !insult {nick} (English), !insulte {nick} (Greek).
     min_role=user so guests cannot use it.
     """
 
@@ -47,7 +47,7 @@ class InsultService:
 
         parts = cmdline.split(maxsplit=1)
         cmd = (parts[0] or "").lower()
-        if cmd not in ("insulten", "insultel"):
+        if cmd not in ("insult", "insulte"):
             return
 
         nick = (parts[1].strip() if len(parts) > 1 else "").strip()
@@ -55,7 +55,7 @@ class InsultService:
             await bot.privmsg(ev.target, f"{ev.nick}: Usage: !{cmd} <nick>")
             return
 
-        lang = "en" if cmd == "insulten" else "el"
+        lang = "en" if cmd == "insult" else "el"
         try:
             insult = await _get_insult(lang)
         except Exception:
@@ -72,18 +72,18 @@ class InsultService:
 def setup(bot):
     if hasattr(bot, "register_command"):
         bot.register_command(
-            "insulten",
+            "insult",
             min_role="user",
             mutating=False,
-            help="Insult someone in English. Usage: !insulten <nick>",
+            help="Insult someone in English. Usage: !insult <nick>",
             category="Fun",
             service_id="insult",
         )
         bot.register_command(
-            "insultel",
+            "insulte",
             min_role="user",
             mutating=False,
-            help="Insult someone in Greek. Usage: !insultel <nick>",
+            help="Insult someone in Greek. Usage: !insulte <nick>",
             category="Fun",
             service_id="insult",
         )

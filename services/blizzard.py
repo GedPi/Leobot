@@ -52,6 +52,17 @@ D3_QUALITY = {
 # PvP bracket slugs
 PVP_BRACKETS = {"2v2": "2v2", "3v3": "3v3", "shuffle": "shuffle", "ratedbg": "rbg"}
 
+# D3 class aliases -> leaderboard slug (API path: rift-{class})
+D3_CLASS_SLUGS = {
+    "barbarian": "barbarian", "barb": "barbarian",
+    "wizard": "wizard", "wiz": "wizard",
+    "monk": "monk",
+    "demon-hunter": "demon-hunter", "dh": "demon-hunter", "demonhunter": "demon-hunter",
+    "witch-doctor": "witch-doctor", "wd": "witch-doctor", "witchdoctor": "witch-doctor",
+    "crusader": "crusader", "sader": "crusader", "crus": "crusader",
+    "necromancer": "necromancer", "necro": "necromancer", "nec": "necromancer",
+}
+
 
 def _norm_space(s: str) -> str:
     return " ".join((s or "").strip().split())
@@ -413,12 +424,20 @@ class BlizzardService:
             if action == "roster":
                 path = f"/profile/wow/guild/{realm_slug}/{guild_slug}/roster"
                 data = await client.get(path, {"namespace": f"profile-{self.region}", "locale": self.locale})
-                members = data.get("members", [])[:10]
+                # API may return members at top level or under guild
+                guild_data = data.get("guild", data)
+                members = (data.get("members") or guild_data.get("members") or [])[:10]
                 parts = []
                 for m in members:
                     char_obj = m.get("character")
-                    char = _safe_name(char_obj) if isinstance(char_obj, dict) else "?"
-                    level = char_obj.get("level", 0) if isinstance(char_obj, dict) else 0
+                    char = "?"
+                    if isinstance(char_obj, dict):
+                        char = _safe_name(char_obj)
+                        if char == "?" and char_obj.get("key", {}).get("href"):
+                            href = char_obj["key"]["href"]
+                            if "/character/" in href:
+                                char = href.split("/character/")[-1].split("/")[-1].split("?")[0] or "?"
+                    level = char_obj.get("level", 0) if isinstance(char_obj, dict) else m.get("level", 0)
                     parts.append(f"{char}(L{level})")
                 msg = f"WoW guild {guild}@{realm_slug} roster (top 10): " + ", ".join(parts) if parts else "No members"
                 await bot.privmsg(ev.target, msg)
@@ -427,8 +446,19 @@ class BlizzardService:
             if action == "achieve":
                 path = f"/profile/wow/guild/{realm_slug}/{guild_slug}/achievements"
                 data = await client.get(path, {"namespace": f"profile-{self.region}", "locale": self.locale})
+                # API returns categories with criteria or achievements array
                 comp = data.get("achievements", [])[:5]
-                parts = [str(c.get("completed_timestamp", "?"))[:10] for c in comp]
+                if not comp and data.get("completed_achievements"):
+                    comp = data.get("completed_achievements", [])[:5]
+                parts = []
+                for c in comp:
+                    ach = c.get("achievement", c) if isinstance(c, dict) else c
+                    name = _safe_name(ach) if isinstance(ach, dict) else str(c.get("completed_timestamp", "?"))[:10]
+                    if name and name != "?":
+                        parts.append(name)
+                    else:
+                        ts = c.get("completed_timestamp")
+                        parts.append(str(ts)[:10] if ts else "?")
                 msg = f"WoW guild {guild}@{realm_slug} recent achieves: " + ", ".join(parts) if parts else "None"
                 await bot.privmsg(ev.target, msg)
                 return
@@ -438,7 +468,7 @@ class BlizzardService:
             data = await client.get(path, {"namespace": f"profile-{self.region}", "locale": self.locale})
             faction = _safe_name(data.get("faction"))
             realm_name = _safe_name(data.get("realm"))
-            members = data.get("member_count", 0)
+            members = data.get("member_count") or data.get("roster", {}).get("member_count", 0) or len(data.get("members", []))
             ach_pts = data.get("achievement_points", 0)
             msg = f"WoW guild {guild}@{realm_name}: {faction} | {members} members | {ach_pts} achieve pts"
             await bot.privmsg(ev.target, msg)
@@ -726,29 +756,31 @@ class BlizzardService:
                 await self._err(bot, ev, msg)
                 return
 
-            # Auction API: returns auction houses; each has files with URLs to auction data
+            # Auction API: returns files with URLs to auction data, or sometimes auctions directly
             path = f"/data/wow/connected-realm/{conn_id}/auctions"
             data = await client.get(path, {"namespace": f"dynamic-{self.region}", "locale": self.locale})
-            files = data.get("files", [])
-            if not files:
-                await self._err(bot, ev, "No auction data available for realm")
-                return
-            file_url = files[0].get("url")
-            if not file_url:
-                await self._err(bot, ev, "Auction data URL not found")
-                return
-            token = await client._ensure_token()
-            status, raw = await _run_sync(
-                _http_get,
-                file_url,
-                headers={"Authorization": f"Bearer {token}", "User-Agent": UA, "Accept": "application/json"},
-                timeout=45,
-            )
-            if status != 200:
-                await self._err(bot, ev, f"Failed to fetch auction data: {status}")
-                return
-            auction_data = json.loads(raw.decode("utf-8", errors="replace"))
-            listings = auction_data.get("auctions", [])
+            listings = data.get("auctions", [])
+            if not listings:
+                files = data.get("files", [])
+                if not files:
+                    await self._err(bot, ev, "No auction data available for realm")
+                    return
+                file_url = files[0].get("url")
+                if not file_url:
+                    await self._err(bot, ev, "Auction data URL not found")
+                    return
+                token = await client._ensure_token()
+                status, raw = await _run_sync(
+                    _http_get,
+                    file_url,
+                    headers={"Authorization": f"Bearer {token}", "User-Agent": UA, "Accept": "application/json"},
+                    timeout=45,
+                )
+                if status != 200:
+                    await self._err(bot, ev, f"Failed to fetch auction data: {status}")
+                    return
+                auction_data = json.loads(raw.decode("utf-8", errors="replace"))
+                listings = auction_data.get("auctions", [])
 
             if args and args[0].lower() == "item" and len(args) >= 2 and args[1].isdigit():
                 item_id = int(args[1])
@@ -1053,6 +1085,25 @@ class BlizzardService:
             log.exception("D3 item")
             await self._err(bot, ev, f"API error: {e}")
 
+    def _d3_leaderboard_player_name(self, row: dict) -> str:
+        """Extract player name/battletag from D3 leaderboard row. API structure varies."""
+        player = row.get("player")
+        if isinstance(player, list) and player:
+            p = player[0]
+        elif isinstance(player, dict):
+            p = player
+        else:
+            return "?"
+        data = p.get("data") if isinstance(p, dict) else None
+        if isinstance(data, list) and data:
+            d = data[0]
+            if isinstance(d, dict):
+                return str(d.get("string") or d.get("id") or d.get("battleTag") or "?")
+            return str(d)[:50]
+        if isinstance(data, dict):
+            return str(data.get("string") or data.get("battleTag") or "?")
+        return "?"
+
     # -------------------------------------------------------------------------
     # D3: Leaderboard
     # -------------------------------------------------------------------------
@@ -1063,47 +1114,47 @@ class BlizzardService:
             return
 
         try:
-            if not args or len(args) < 4:
-                await self._err(bot, ev, "Usage: !d3 leaderboard <region> <season> <class> <mode> | !d3 leaderboard rank <region> <season> <class> <rank>")
+            if not args or len(args) < 2:
+                await self._err(bot, ev, "Usage: !d3 leaderboard <season> <class> | !d3 leaderboard rank <season> <class> <rank>. Class: barb, wiz, monk, dh, wd, crusader, necro")
                 return
 
-            if args[0].lower() == "rank" and len(args) >= 5:
-                region = args[1].lower()
-                season = args[2]
-                cls = args[3].lower()
-                rank = args[4]
+            namespace = f"season-{self.region}"
+            params = {"namespace": namespace, "locale": self.locale}
+
+            if args[0].lower() == "rank" and len(args) >= 4:
+                season = args[1]
+                cls = args[2].lower()
+                rank = args[3]
                 if not rank.isdigit():
                     await self._err(bot, ev, "Rank must be numeric")
                     return
-                lb_id = f"rift-{cls}"
+                slug = D3_CLASS_SLUGS.get(cls, cls if "-" in cls else f"rift-{cls}")
+                lb_id = slug if slug.startswith("rift-") else f"rift-{slug}"
                 path = f"/data/d3/season/{season}/leaderboard/{lb_id}"
-                data = await client.get(path, {"locale": self.locale})
-                entries = data.get("row", [])
+                data = await client.get(path, params)
+                entries = data.get("row", data.get("rows", []))[:]
                 r = int(rank)
                 if 0 < r <= len(entries):
                     row = entries[r - 1]
-                    player = row.get("player", [{}])[0] if row.get("player") else {}
-                    name = (player.get("data", [{}])[0].get("string", "?") if isinstance(player.get("data"), list) else "?")
+                    name = self._d3_leaderboard_player_name(row)
                     msg = f"D3 leaderboard #{r}: {name}"
                     await bot.privmsg(ev.target, msg)
                 else:
-                    await self._err(bot, ev, f"Rank {rank} not found")
+                    await self._err(bot, ev, f"Rank {rank} not found (max {len(entries)})")
                 return
 
-            region = args[0].lower()
-            season = args[1]
-            cls = args[2].lower()
-            mode = args[3].lower() if len(args) > 3 else "solo"
-            lb_id = f"rift-{cls}" if mode == "solo" else f"rift-{mode}-{cls}"
+            season = args[0]
+            cls = args[1].lower()
+            slug = D3_CLASS_SLUGS.get(cls, cls if "-" in cls else cls)
+            lb_id = f"rift-{slug}" if not slug.startswith("rift-") else slug
             path = f"/data/d3/season/{season}/leaderboard/{lb_id}"
-            data = await client.get(path, {"locale": self.locale})
-            entries = data.get("row", [])[:5]
+            data = await client.get(path, params)
+            entries = data.get("row", data.get("rows", []))[:5]
             parts = []
             for i, row in enumerate(entries):
-                player = row.get("player", [{}])[0] if row.get("player") else {}
-                name = (player.get("data", [{}])[0].get("string", "?") if isinstance(player.get("data"), list) else "?")
+                name = self._d3_leaderboard_player_name(row)
                 parts.append(f"#{i+1} {name}")
-            msg = f"D3 leaderboard {cls} {region} S{season}: " + " | ".join(parts) if parts else "No entries"
+            msg = f"D3 leaderboard {cls} S{season} ({self.region}): " + " | ".join(parts) if parts else "No entries"
             await bot.privmsg(ev.target, msg)
 
         except RuntimeError as e:
@@ -1206,7 +1257,11 @@ class BlizzardService:
                 return
 
             if entity == "auction":
-                if len(args) >= 1:
+                if args and args[0].lower() == "item" and len(args) >= 3:
+                    # !wow auction item <realm> <id>
+                    await self._wow_auction(bot, ev, args[1], ["item", args[2]])
+                elif len(args) >= 2:
+                    # !wow auction <realm> <item name...>
                     await self._wow_auction(bot, ev, args[0], args[1:])
                 else:
                     await self._err(bot, ev, "Usage: !wow auction <realm> <item name> | !wow auction item <realm> <id>")
