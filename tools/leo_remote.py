@@ -106,10 +106,26 @@ def handle(req: dict) -> dict:
             finally:
                 conn.close()
 
+        elif action == "db_count":
+            table = req.get("table")
+            if not table:
+                return {"error": "missing table"}
+            conn = sqlite3.connect(str(db_path), timeout=10.0)
+            try:
+                check = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+                if not check:
+                    return {"error": f"unknown table: {table}"}
+                row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+                return {"ok": True, "count": row[0]}
+            except Exception as e:
+                return {"error": str(e)}
+            finally:
+                conn.close()
+
         elif action == "db_select":
             table = req.get("table")
-            limit = int(req.get("limit", 500))
-            limit = max(1, min(5000, limit))
+            limit = int(req.get("limit", 50))
+            limit = max(1, min(500, limit))
             offset = int(req.get("offset", 0))
             conn = sqlite3.connect(str(db_path), timeout=10.0)
             conn.row_factory = sqlite3.Row
