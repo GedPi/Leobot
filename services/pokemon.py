@@ -30,6 +30,18 @@ def _norm(s: str) -> str:
     return (s or "").strip()
 
 
+def _row_val(row, key, default=None):
+    """Get value from sqlite3.Row (no .get()) or dict."""
+    if row is None:
+        return default
+    try:
+        d = dict(row) if hasattr(row, "keys") else row
+        v = d.get(key, default)
+        return default if v is None else v
+    except (KeyError, TypeError, AttributeError):
+        return default
+
+
 # Ball modifier for capture rate (lower effective rate = easier catch)
 BALL_MODIFIERS = {
     "pokeball": 1.0,
@@ -81,7 +93,7 @@ class PokemonService:
             pokemon_count = await bot.store.pokemon_species_count()
             if pokemon_count > 0:
                 team = await bot.store.pokemon_trainer_get_pokemon(ev.nick, ev.channel)
-                names = [r.get("species_name") or "?" for r in team[:5]]
+                names = [_row_val(r, "species_name") or "?" for r in team[:5]]
                 await bot.privmsg(
                     ev.channel,
                     f"Welcome {ev.nick}! You're a new Pokémon trainer! You received: {', '.join(names)}",
@@ -112,17 +124,8 @@ class PokemonService:
         if cmd == "levelup":
             await self._handle_levelup(bot, ev, parts[1:])
             return
-        if cmd == "levelup":
-            await self._handle_levelup(bot, ev, parts[1:])
-            return
-        if cmd == "levelup":
-            await self._handle_levelup(bot, ev, parts[1:])
-            return
         if cmd == "capture":
             await self._handle_capture(bot, ev, parts[1:])
-            return
-        if cmd == "levelup":
-            await self._handle_levelup(bot, ev, parts[1:])
             return
         if cmd == "battle":
             await self._handle_battle(bot, ev, parts[1:])
@@ -181,12 +184,12 @@ class PokemonService:
                     return
                 lines = []
                 for r in team:
-                    name = r.get("nickname") or r.get("species_name") or "?"
-                    lvl = r.get("level") or 5
-                    hp = r.get("current_hp") or 0
-                    mhp = r.get("max_hp") or 1
-                    faint = " [FAINTED]" if r.get("is_fainted") else ""
-                    slot = r.get("slot") or 0
+                    name = _row_val(r, "nickname") or _row_val(r, "species_name") or "?"
+                    lvl = _row_val(r, "level") or 5
+                    hp = _row_val(r, "current_hp") or 0
+                    mhp = _row_val(r, "max_hp") or 1
+                    faint = " [FAINTED]" if _row_val(r, "is_fainted") else ""
+                    slot = _row_val(r, "slot") or 0
                     lines.append(f"  {slot}. {name} Lv.{lvl} HP {hp}/{mhp}{faint}")
                 await bot.privmsg(
                     ev.target,
@@ -197,7 +200,7 @@ class PokemonService:
                 if not items:
                     await bot.privmsg(ev.target, f"{ev.nick}: No items in {channel}.")
                     return
-                lines = [f"  {r.get('name')} x{r.get('quantity')}" for r in items]
+                lines = [f"  {_row_val(r, 'name')} x{_row_val(r, 'quantity')}" for r in items]
                 await bot.privmsg(
                     ev.target,
                     f"{ev.nick}: Items in {channel}:\n" + "\n".join(lines),
@@ -231,7 +234,7 @@ class PokemonService:
             await bot.privmsg(ev.target, f"{ev.nick}: Slot must be 1-6.")
             return
         team = await bot.store.pokemon_trainer_get_pokemon(_lower(ev.nick), channel)
-        poke = next((p for p in team if int(p.get("slot") or 0) == slot), None)
+        poke = next((p for p in team if int(_row_val(p, "slot") or 0) == slot), None)
         if not poke:
             await bot.privmsg(ev.target, f"{ev.nick}: No Pokémon in slot {slot}.")
             return
@@ -251,7 +254,7 @@ class PokemonService:
             await bot.privmsg(ev.target, f"{ev.nick}: Slot must be 1-6.")
             return
         team = await bot.store.pokemon_trainer_get_pokemon(ev.nick, ev.channel)
-        poke = next((p for p in team if int(p.get("slot") or 0) == slot), None)
+        poke = next((p for p in team if int(_row_val(p, "slot") or 0) == slot), None)
         if not poke:
             await bot.privmsg(ev.target, f"{ev.nick}: No Pokémon in slot {slot}.")
             return
@@ -276,7 +279,7 @@ class PokemonService:
             await bot.privmsg(ev.target, f"{ev.nick}: Slot must be 1-6.")
             return
         team = await bot.store.pokemon_trainer_get_pokemon(_lower(ev.nick), channel)
-        poke = next((p for p in team if int(p.get("slot") or 0) == slot), None)
+        poke = next((p for p in team if int(_row_val(p, "slot") or 0) == slot), None)
         if not poke:
             await bot.privmsg(ev.target, f"{ev.nick}: No Pokémon in slot {slot}.")
             return
@@ -323,7 +326,7 @@ class PokemonService:
         created = await bot.store.pokemon_ensure_trainer(ev.nick, ev.channel)
         if created:
             team = await bot.store.pokemon_trainer_get_pokemon(ev.nick, ev.channel)
-            names = [r.get("species_name") or "?" for r in team[:5]]
+            names = [_row_val(r, "species_name") or "?" for r in team[:5]]
             await bot.privmsg(
                 ev.target,
                 f"{ev.nick}: Welcome! You received: {', '.join(names)}. PM me for team/items/heal/revive.",
@@ -337,11 +340,11 @@ class PokemonService:
                 return
             lines = []
             for r in team[:6]:
-                name = r.get("nickname") or r.get("species_name") or "?"
-                lvl = r.get("level") or 5
-                hp = r.get("current_hp") or 0
-                mhp = r.get("max_hp") or 1
-                faint = " [FAINTED]" if r.get("is_fainted") else ""
+                name = _row_val(r, "nickname") or _row_val(r, "species_name") or "?"
+                lvl = _row_val(r, "level") or 5
+                hp = _row_val(r, "current_hp") or 0
+                mhp = _row_val(r, "max_hp") or 1
+                faint = " [FAINTED]" if _row_val(r, "is_fainted") else ""
                 lines.append(f"{name} Lv.{lvl} {hp}/{mhp}{faint}")
             await bot.privmsg(
                 ev.target,
@@ -409,8 +412,8 @@ class PokemonService:
         if not their_team:
             await bot.privmsg(ev.target, f"{ev.nick}: {target_nick} is not a trainer.")
             return
-        my_fainted = sum(1 for p in my_team if p.get("is_fainted"))
-        their_fainted = sum(1 for p in their_team if p.get("is_fainted"))
+        my_fainted = sum(1 for p in my_team if _row_val(p, "is_fainted"))
+        their_fainted = sum(1 for p in their_team if _row_val(p, "is_fainted"))
         my_able = len(my_team) - my_fainted
         their_able = len(their_team) - their_fainted
         if my_able == 0:
@@ -419,8 +422,8 @@ class PokemonService:
         if their_able == 0:
             await bot.privmsg(ev.target, f"{ev.nick}: {target_nick}'s team is all fainted.")
             return
-        my_total = sum(int(p.get("level") or 5) for p in my_team if not p.get("is_fainted"))
-        their_total = sum(int(p.get("level") or 5) for p in their_team if not p.get("is_fainted"))
+        my_total = sum(int(_row_val(p, "level") or 5) for p in my_team if not _row_val(p, "is_fainted"))
+        their_total = sum(int(_row_val(p, "level") or 5) for p in their_team if not _row_val(p, "is_fainted"))
         roll = random.randint(0, my_total + their_total - 1) if (my_total + their_total) > 0 else 0
         if roll < my_total:
             winner, loser = ev.nick, target_nick
@@ -462,9 +465,9 @@ class PokemonService:
                 channel, int(sp["id"]), level=level
             )
             if created:
-                name = sp.get("name") or "?"
-                t1 = sp.get("type1") or "?"
-                t2 = sp.get("type2")
+                name = _row_val(sp, "name") or "?"
+                t1 = _row_val(sp, "type1") or "?"
+                t2 = _row_val(sp, "type2")
                 types = f"{t1}"
                 if t2:
                     types += f"/{t2}"
