@@ -909,8 +909,34 @@ class Store:
             return False
         if starter_species_ids is None:
             species = await self.pokemon_species_get_random(5)
-            starter_species_ids = [int(s["id"]) for s in species]
-        await self.pokemon_trainer_create(nick, channel, starter_species_ids=starter_species_ids)
+            starter_species_ids = [int(s["id"]) for s in species] if species else []
+        nick_l = (nick or "").strip().lower()
+        chan = (channel or "").strip()
+        if not nick_l or not chan:
+            return False
+        now = int(time.time())
+        await self.execute(
+            "INSERT OR IGNORE INTO pokemon_trainers(nick, channel, created_ts) VALUES(?,?,?)",
+            (nick_l, chan, now),
+        )
+        for item_id, qty in [("potion", 5), ("revive", 2), ("pokeball", 10)]:
+            await self.execute(
+                """INSERT INTO pokemon_trainer_items(trainer_nick, channel, item_id, quantity)
+                   VALUES(?,?,?,?) ON CONFLICT(trainer_nick,channel,item_id) DO UPDATE
+                   SET quantity=quantity+excluded.quantity""",
+                (nick_l, chan, item_id, qty),
+            )
+        for slot, sid in enumerate(starter_species_ids[:6], 1):
+            sp = await self.fetchone("SELECT * FROM pokemon_species WHERE id=?", (int(sid),))
+            if not sp:
+                continue
+            hp = max(10, int(sp["hp_base"] or 50) + (int(sp["hp_base"] or 50) * 2) // 10)
+            await self.execute(
+                """INSERT INTO pokemon_trainer_pokemon(
+                   trainer_nick, channel, species_id, level, current_hp, max_hp, slot, created_ts)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (nick_l, chan, int(sid), 5, hp, hp, slot, now),
+            )
         return True
 
     async def pokemon_trainer_add_item(self, nick: str, channel: str, item_id: str, quantity: int = 1) -> None:
