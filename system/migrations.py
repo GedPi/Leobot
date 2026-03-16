@@ -675,6 +675,135 @@ def migrate_v9(conn: sqlite3.Connection) -> None:
     )
 
 
+# Pokemon service: species, moves, trainers, wild spawns, items.
+def migrate_v10(conn: sqlite3.Connection) -> None:
+    now = int(time.time())
+    conn.executescript(
+        """
+        -- Pokemon species (official game data, populated by seed script)
+        CREATE TABLE IF NOT EXISTS pokemon_species (
+            id INTEGER PRIMARY KEY,
+            pokedex_number INTEGER NOT NULL,
+            name TEXT NOT NULL UNIQUE,
+            type1 TEXT NOT NULL,
+            type2 TEXT,
+            hp_base INTEGER NOT NULL DEFAULT 50,
+            atk_base INTEGER NOT NULL DEFAULT 50,
+            def_base INTEGER NOT NULL DEFAULT 50,
+            sp_atk_base INTEGER NOT NULL DEFAULT 50,
+            sp_def_base INTEGER NOT NULL DEFAULT 50,
+            speed_base INTEGER NOT NULL DEFAULT 50,
+            capture_rate INTEGER NOT NULL DEFAULT 255,
+            created_ts INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_pokemon_species_pokedex ON pokemon_species(pokedex_number);
+        CREATE INDEX IF NOT EXISTS idx_pokemon_species_name ON pokemon_species(name);
+
+        -- Moves (official game data)
+        CREATE TABLE IF NOT EXISTS pokemon_moves (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            type TEXT NOT NULL,
+            category TEXT NOT NULL,
+            power INTEGER,
+            accuracy INTEGER,
+            pp INTEGER NOT NULL DEFAULT 40,
+            created_ts INTEGER NOT NULL
+        );
+
+        -- Which species learn which moves (level_learned=0 for tm/egg/etc)
+        CREATE TABLE IF NOT EXISTS pokemon_species_moves (
+            species_id INTEGER NOT NULL REFERENCES pokemon_species(id) ON DELETE CASCADE,
+            move_id INTEGER NOT NULL REFERENCES pokemon_moves(id) ON DELETE CASCADE,
+            level_learned INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY(species_id, move_id)
+        );
+
+        -- Static item definitions
+        CREATE TABLE IF NOT EXISTS pokemon_items (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            item_type TEXT NOT NULL,
+            effect_value INTEGER NOT NULL DEFAULT 0,
+            created_ts INTEGER NOT NULL
+        );
+
+        -- Trainers (nick + channel)
+        CREATE TABLE IF NOT EXISTS pokemon_trainers (
+            nick TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            created_ts INTEGER NOT NULL,
+            PRIMARY KEY(nick, channel)
+        );
+        CREATE INDEX IF NOT EXISTS idx_pokemon_trainers_channel ON pokemon_trainers(channel);
+
+        -- Trainer-owned Pokemon instances
+        CREATE TABLE IF NOT EXISTS pokemon_trainer_pokemon (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trainer_nick TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            species_id INTEGER NOT NULL REFERENCES pokemon_species(id),
+            nickname TEXT,
+            level INTEGER NOT NULL DEFAULT 5,
+            current_hp INTEGER NOT NULL DEFAULT 20,
+            max_hp INTEGER NOT NULL DEFAULT 20,
+            experience INTEGER NOT NULL DEFAULT 0,
+            is_fainted INTEGER NOT NULL DEFAULT 0,
+            slot INTEGER NOT NULL DEFAULT 1,
+            created_ts INTEGER NOT NULL,
+            FOREIGN KEY(trainer_nick, channel) REFERENCES pokemon_trainers(nick, channel) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_pokemon_trainer_pokemon_trainer ON pokemon_trainer_pokemon(trainer_nick, channel);
+
+        -- Trainer item inventory
+        CREATE TABLE IF NOT EXISTS pokemon_trainer_items (
+            trainer_nick TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            item_id TEXT NOT NULL REFERENCES pokemon_items(id),
+            quantity INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(trainer_nick, channel, item_id),
+            FOREIGN KEY(trainer_nick, channel) REFERENCES pokemon_trainers(nick, channel) ON DELETE CASCADE
+        );
+
+        -- Wild spawns (active in channel; captured_by set when caught)
+        CREATE TABLE IF NOT EXISTS pokemon_wild_spawns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel TEXT NOT NULL,
+            species_id INTEGER NOT NULL REFERENCES pokemon_species(id),
+            level INTEGER NOT NULL DEFAULT 5,
+            appeared_ts INTEGER NOT NULL,
+            expires_ts INTEGER NOT NULL,
+            captured_by TEXT,
+            UNIQUE(channel)
+        );
+        CREATE INDEX IF NOT EXISTS idx_pokemon_wild_spawns_channel ON pokemon_wild_spawns(channel);
+        CREATE INDEX IF NOT EXISTS idx_pokemon_wild_spawns_expires ON pokemon_wild_spawns(expires_ts);
+        """
+    )
+
+    # Insert default items
+    default_items = [
+        ("potion", "Potion", "heal", 20, now),
+        ("super_potion", "Super Potion", "heal", 50, now),
+        ("hyper_potion", "Hyper Potion", "heal", 200, now),
+        ("revive", "Revive", "revive", 50, now),
+        ("max_revive", "Max Revive", "revive", 100, now),
+        ("pokeball", "Poké Ball", "ball", 255, now),
+        ("great_ball", "Great Ball", "ball", 200, now),
+        ("ultra_ball", "Ultra Ball", "ball", 150, now),
+    ]
+    for item_id, name, item_type, effect_value, created_ts in default_items:
+        conn.execute(
+            "INSERT OR IGNORE INTO pokemon_items(id, name, item_type, effect_value, created_ts) VALUES(?,?,?,?,?)",
+            (item_id, name, item_type, effect_value, created_ts),
+        )
+
+    conn.execute(
+        "INSERT OR IGNORE INTO settings(key, value, updated_ts) VALUES('pokemon_wild_spawns_per_day', '24', ?)",
+        (now,),
+    )
+
+
 MIGRATIONS = {
     1: migrate_v1,
     2: migrate_v2,
@@ -685,6 +814,7 @@ MIGRATIONS = {
     7: migrate_v7,
     8: migrate_v8,
     9: migrate_v9,
+    10: migrate_v10,
 }
 
 

@@ -44,7 +44,8 @@
     "services.stats",
     "services.maintenance",
     "services.sysmon",
-    "services.blizzard"
+    "services.blizzard",
+    "services.pokemon"
   ],
 
   "wolfram": {
@@ -60,6 +61,12 @@
     "cooldown_seconds": 120,
     "line_delay_seconds": 1.2,
     "selection_timeout_seconds": 60
+  },
+
+  "pokemon": {
+    "wild_spawns_per_day": 24,
+    "spawn_duration_seconds": 600,
+    "cooldown_seconds": 2
   },
 
   "blizzard": {
