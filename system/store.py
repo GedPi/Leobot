@@ -2111,7 +2111,7 @@ class Store:
             if not species:
                 continue
             base_hp = int(species["hp_base"] or 50)
-            max_hp = max(10, base_hp + (int(species["hp_base"] or 0) * (5 - 1) // 50)
+            max_hp = max(10, base_hp + (int(species["hp_base"] or 0) * (5 - 1) // 50))
             await self.execute(
                 """INSERT INTO pokemon_trainer_pokemon(
                     trainer_nick, channel, species_id, level, current_hp, max_hp, experience, slot, created_ts
