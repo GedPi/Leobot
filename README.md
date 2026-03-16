@@ -51,6 +51,10 @@ Leobot/
     types.py             # Event, Role, CommandInfo
   services/              # Feature modules (loaded from config)
     eightball.py
+    insult.py
+    joke.py
+    wolfram.py
+    fact.py
     gemini.py
     greet.py
     weather.py
@@ -59,8 +63,10 @@ Leobot/
     logging.py
     lastseen.py
     stats.py
-    sysmon.py
     maintenance.py       # Placeholder
+    sysmon.py
+    blizzard.py
+    pokemon.py
   tests/                 # Pytest suite (config, ACL, Store)
   PERMISSIONS.md         # Full permission model
   IMPROVEMENTS.md        # Operational improvements and status
@@ -171,67 +177,155 @@ Requires at least **contributor**. Enablement is stored in SQLite.
 
 ## Commands overview
 
-Commands depend on which services are loaded and enabled in the channel.
+Commands depend on which services are loaded and enabled in the channel. Use `!commands` to list commands available to your role.
 
-### Core (always available)
+### System (always available)
 
 | Command | Role | Description |
 |---------|------|-------------|
-| `!help` | guest | Help for a command or category (reply by PM) |
+| `!help [command]` | guest | Help for a command or category (reply by PM) |
 | `!commands` | guest | List commands by category (reply by PM) |
 | `!auth <password>` | guest | Authenticate for higher role until UTC midnight |
 | `!whoami` | guest | Show your effective role and identity |
+| `!service` | contributor | Manage per-channel services |
+| `!service enable <service> [#channel]` | contributor | Enable a service in a channel |
+| `!service disable <service> [#channel]` | contributor | Disable a service in a channel |
+| `!services` | contributor | List services and their on/off state |
+| `!acl` | admin | ACL management |
+| `!acl adduser <nick> <admin\|contributor\|user>` | admin | Add user to DB |
+| `!acl deluser <nick> <group>` | admin | Delete user from DB |
+| `!acl usrlist <admin\|contributor\|user>` | admin | List users in group |
+| `!acl addserv <service> <guest\|user\|contributor\|admin>` | admin | Set command min role override |
+| `!acl delserv <service> <group>` | admin | Delete command override |
+| `!acl servlist` | admin | List command overrides |
 | `!reload` | admin | Reload config from file |
-| `!service`, `!services` | contributor | List or change per-channel service enablement |
-| `!acl adduser/deluser/usrlist/addserv/delserv/servlist` | admin | Manage ACL users and command overrides |
 
 ### Fun
 
-| Command | Service | Description |
-|---------|---------|-------------|
-| `!8ball`, `!eightball` | eightball | Magic 8-ball |
-| `!gemini`, `!g` | gemini | Ask Gemini (if configured) |
+| Command | Service | Role | Description |
+|---------|---------|------|-------------|
+| `!8ball`, `!eightball` | eightball | guest | Magic 8-ball |
+| `!gemini`, `!g` | gemini | user | Ask Gemini |
+| `!insult <nick>` | insult | user | Insult someone (English) |
+| `!insulte <nick>` | insult | user | Insult someone (Greek) |
+| `!joke [category] [lang] [safe]` | joke | user | Random joke from JokeAPI |
 
 ### Information
 
-| Command | Service | Description |
-|---------|---------|-------------|
-| `!fact [category]` | fact | Random fact (any category) or from a specific category, e.g. `!fact science` |
-| `!fact auto on` \| `!fact auto off` | fact | Enable or disable automatic random facts in the channel (contributor). Requires fact service enabled. |
-| `!fact auto` | fact | Show auto status, today's count, and min/max per day |
-| `!fact auto min N` \| `!fact auto max N` | fact | Set min or max facts per day (1–100, contributor) |
-| `!wiki`, `!wikicheck` | wiki | Wikipedia lookup |
-| `!weather`, `!weather warn add/list/…` | weather | Weather and alerts |
-| `!news`, `!headlines` | news | RSS/news headlines |
+| Command | Service | Role | Description |
+|---------|---------|------|-------------|
+| `!fact [category]` | fact | guest | Random fact; omit category for any |
+| `!fact auto on`, `!fact auto off` | fact | contributor | Enable/disable auto facts |
+| `!fact auto` | fact | contributor | Show auto status, today's count |
+| `!fact auto min N`, `!fact auto max N` | fact | contributor | Set min/max facts per day (1–100) |
+| `!wolf <question>` | wolfram | user | Query Wolfram\|Alpha |
+| `!wiki <query>` | wiki | guest | Wikipedia lookup |
+| `!wikicheck <query>` | wiki | guest | Check if Wikipedia title exists |
+| `!wikimon [list]` | wiki | user | List wiki watches |
+| `!wikimon add <title> [15m\|2h\|1d]` | wiki | user | Add wiki watch |
+| `!wikimon del <id>` | wiki | user | Delete wiki watch |
+| `!wikimon clear` | wiki | contributor | Clear all wiki watches |
+| `!wikimon lang <code>` | wiki | contributor | Set default wiki language |
+| `!wikimon interval <id> <15m\|2h\|1d>` | wiki | user | Change watch interval |
 
-Facts are stored in the database. Import from a CSV (`category,fact`) with:  
+Facts are stored in the database. Import from CSV:  
 `python scripts/import_facts.py path/to/facts.csv [--db path/to/leonidas.db]`
 
-**Fact auto**: When enabled per channel, the bot periodically posts facts in the form `Hey {nick} did you know that {fact}`, picking a random recent speaker from the channel (via irc_log) or "everyone" if none. Min and max facts per day (default 6–12) cap posting per channel per calendar day (UTC) to avoid flooding. State persists across restarts.
+### Weather
+
+| Command | Service | Role | Description |
+|---------|---------|------|-------------|
+| `!weather <location>` | weather | guest | Weather lookup |
+| `!weather warn add <location> <type(s)> <duration>` | weather | user | Add warning watch |
+| `!weather warn list` | weather | user | List warning watches |
+| `!weather del <id>` | weather | user | Delete a watch |
+| `!weather warn clear` | weather | user | Clear watches |
+| `!weather watch <city1,city2,...> <#channel>` | weather | contributor | Proactive extreme weather announcements |
+
+### News
+
+| Command | Service | Role | Description |
+|---------|---------|------|-------------|
+| `!news [limit] [category]`, `!headlines` | news | guest | RSS/news headlines |
+| `!news sources` | news | contributor | List configured sources |
+| `!news categories <id>` | news | contributor | List categories for a source |
+| `!news addsource <id> <name>` | news | contributor | Add/update source |
+| `!news delsource <id>` | news | contributor | Delete source |
+| `!news enable <id>`, `!news disable <id>` | news | contributor | Enable/disable source |
+| `!news addcat <id> <category> <url>` | news | contributor | Add/update category |
+| `!news delcat <id> <category>` | news | contributor | Delete category |
 
 ### Monitoring (sysmon)
 
-| Command | Service | Description |
-|---------|---------|-------------|
-| `!sys` | sysmon | Server summary (uptime, load, mem, disk, etc.) |
-| `!uptime`, `!disk`, `!updates`, `!failed`, `!errors` | sysmon | Individual checks |
-| `!sys services` | sysmon | Watched systemd services status |
-| `!events [N]` | sysmon | Recent sysmon events from DB |
+| Command | Service | Role | Description |
+|---------|---------|------|-------------|
+| `!sys [subcmd]` | sysmon | user | Server health summary |
+| `!sys services` | sysmon | user | Watched systemd services status |
+| `!uptime` | sysmon | user | System uptime |
+| `!disk` | sysmon | user | Disk usage |
+| `!updates` | sysmon | user | Pending package updates |
+| `!failed` | sysmon | user | Failed systemd units |
+| `!errors` | sysmon | user | Recent journal errors count |
+| `!events [N]` | sysmon | user | Tail sysmon events |
 
-### Analytics
+### Blizzard (WoW / Diablo III)
 
-| Command | Service | Description |
-|---------|---------|-------------|
-| `!stats` | stats | Channel stats |
-| `!lastseen` | lastseen | When a user was last seen |
+| Command | Service | Role | Description |
+|---------|---------|------|-------------|
+| `!wow char|guild|realm|item|auction|pvp ...` | blizzard | guest | WoW game data |
+| `!wc`, `!wg`, `!wr`, `!wi`, `!wa`, `!wpvp` | blizzard | guest | WoW aliases |
+| `!d3 profile|hero|item|leaderboard ...` | blizzard | guest | Diablo III game data |
+| `!dp`, `!dh`, `!di`, `!dlb` | blizzard | guest | D3 aliases |
 
-### Other
+Requires `blizzard.client_id` and `blizzard.client_secret` in config.
 
-| Command | Service | Description |
-|---------|---------|-------------|
-| `!greet`, `!greet test`, `!greet pools` | greet | Join greetings |
+### Games (Pokémon)
 
-The **logging** service does not expose user commands; it records channel traffic to the database when enabled for a channel.
+| Command | Service | Role | Description |
+|---------|---------|------|-------------|
+| `!pokemon`, `!pkmn` | pokemon | guest | Pokémon trainer: team, help |
+| `!pokemon team` | pokemon | guest | View your party |
+| `!capture [pokeball\|great_ball\|ultra_ball]` | pokemon | guest | Capture wild Pokémon |
+| `!battle @user` | pokemon | guest | Battle another trainer |
+| `!levelup <slot>` | pokemon | guest | Level up a Pokémon |
+| `!pokemon spawns [N]` | pokemon | contributor | Set wild spawns per day |
+
+PM the bot for `!pkmn team #channel`, `!pkmn items #channel`, `!use potion <slot> #channel`, `!use revive <slot> #channel`, `!levelup <slot> #channel`. Run `python scripts/seed_pokemon.py` to populate species from PokeAPI.
+
+### Greet
+
+| Command | Service | Role | Description |
+|---------|---------|------|-------------|
+| `!greet list` | greet | contributor | List greeting targets |
+| `!greet greets <target_id>` | greet | contributor | List greetings in target's pool |
+| `!greet addnick <nick> <greeting...>` | greet | contributor | Add greeting for nick match |
+| `!greet addhost <pattern> <greeting...>` | greet | contributor | Add greeting for host pattern |
+| `!greet addmask <pattern> <greeting...>` | greet | contributor | Add greeting for hostmask pattern |
+| `!greet deltarget <id>` | greet | contributor | Delete a target |
+| `!greet enable <id>`, `!greet disable <id>` | greet | contributor | Enable/disable target |
+| `!greet setpri <id> <priority>` | greet | contributor | Set target priority |
+| `!greet setchan <id> <#channel\|any>` | greet | contributor | Set target channel |
+| `!greet setcd <id> <seconds\|0>` | greet | contributor | Set cooldown |
+| `!greet test` | greet | contributor | Test greet matching for current identity |
+| `!greet pools` | greet | contributor | List greeting pools |
+| `!greet pooladd <name>` | greet | contributor | Add pool |
+| `!greet poolset <id> <name>` | greet | contributor | Rename pool |
+| `!greet poolgreets <pool_id>` | greet | contributor | List greetings in pool |
+| `!greet pooladdgreet <pool_id> <text>` | greet | contributor | Add greeting to pool |
+| `!greet pooldel <id>` | greet | contributor | Delete pool |
+| `!greet delgreet <id>` | greet | contributor | Delete a greeting |
+
+### Utility
+
+| Command | Service | Role | Description |
+|---------|---------|------|-------------|
+| `!stats [me\|nick\|top] [N] [#channel] [today\|24h\|7d\|all]` | stats | user | Channel stats |
+| `!seen <nick>`, `!lastseen <nick>` | lastseen | user | When a user was last seen |
+
+### Services without commands
+
+- **logging** — Records channel traffic to the database when enabled; no user commands.
+- **maintenance** — Placeholder; no user commands.
 
 ---
 
@@ -250,7 +344,7 @@ The **logging** service does not expose user commands; it records channel traffi
 ## Database
 
 - **Path** — Set by `db_path` in config (default `./data/leonidas.db`). The directory is created if needed.
-- **Schema** — Managed by `system/migrations.py` (versioned; applied on first open). Tables include: settings, service_enablement, ACL (sessions, identities, command_perms, policies), messages, irc_log, news, greet, weather, wiki, sysmon, stats, etc.
+- **Schema** — Managed by `system/migrations.py` (versioned; applied on first open). Tables include: settings, service_enablement, ACL (sessions, identities, command_perms, policies), messages, irc_log, news, greet, weather, wiki, sysmon, stats, pokemon (species, moves, trainers, wild spawns), etc.
 - **Backup** — Copy the SQLite file while the bot is stopped, or use SQLite’s backup API if the bot is running.
 
 ---
