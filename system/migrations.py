@@ -804,6 +804,59 @@ def migrate_v10(conn: sqlite3.Connection) -> None:
     )
 
 
+# Lover service: pickup lines, tracked targets, per-channel enablement, daily counts, channel cooldowns.
+def migrate_v11(conn: sqlite3.Connection) -> None:
+    now = int(time.time())
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS lover_lines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            line TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS lover_targets (
+            nick TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_ts INTEGER NOT NULL,
+            updated_ts INTEGER NOT NULL,
+            created_by TEXT,
+            PRIMARY KEY(nick, channel)
+        );
+        CREATE INDEX IF NOT EXISTS idx_lover_targets_channel ON lover_targets(channel);
+
+        CREATE TABLE IF NOT EXISTS lover_enablement (
+            channel TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            updated_ts INTEGER NOT NULL,
+            updated_by TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS lover_daily_counts (
+            nick TEXT NOT NULL,
+            day TEXT NOT NULL,
+            count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(nick, day)
+        );
+        CREATE INDEX IF NOT EXISTS idx_lover_daily_counts_day ON lover_daily_counts(day);
+
+        CREATE TABLE IF NOT EXISTS lover_public_cooldowns (
+            channel TEXT PRIMARY KEY,
+            last_public_ts INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO settings(key, value, updated_ts) VALUES('lover_min_per_user_per_day', '4', ?)",
+        (now,),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO settings(key, value, updated_ts) VALUES('lover_max_per_user_per_day', '8', ?)",
+        (now,),
+    )
+
+
 MIGRATIONS = {
     1: migrate_v1,
     2: migrate_v2,
@@ -815,6 +868,7 @@ MIGRATIONS = {
     8: migrate_v8,
     9: migrate_v9,
     10: migrate_v10,
+    11: migrate_v11,
 }
 
 

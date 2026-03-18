@@ -328,6 +328,172 @@ class Store:
         )
         return str(row[0]).strip() if row else None
 
+    # ---- Lover service (pickup lines + targets + pacing) ----
+    async def lover_line_insert(self, line: str, enabled: bool = True) -> None:
+        txt = (line or "").strip()
+        if not txt:
+            return
+        await self.execute(
+            "INSERT INTO lover_lines(line, enabled) VALUES(?, ?)",
+            (txt, 1 if enabled else 0),
+        )
+
+    async def lover_line_get_random(self) -> str | None:
+        row = await self.fetchone(
+            "SELECT line FROM lover_lines WHERE enabled=1 ORDER BY RANDOM() LIMIT 1",
+            (),
+        )
+        return str(row[0]).strip() if row else None
+
+    async def lover_line_count_enabled(self) -> int:
+        row = await self.fetchone("SELECT COUNT(*) FROM lover_lines WHERE enabled=1", ())
+        return int(row[0]) if row else 0
+
+    async def lover_target_upsert(
+        self,
+        nick: str,
+        channel: str,
+        *,
+        enabled: bool = True,
+        created_by: str | None = None,
+    ) -> None:
+        n = (nick or "").strip()
+        ch = (channel or "").strip()
+        if not n or not ch:
+            return
+        now = int(time.time())
+        await self.execute(
+            "INSERT INTO lover_targets(nick, channel, enabled, created_ts, updated_ts, created_by) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(nick, channel) DO UPDATE SET enabled=excluded.enabled, updated_ts=excluded.updated_ts, created_by=COALESCE(lover_targets.created_by, excluded.created_by)",
+            (n, ch, 1 if enabled else 0, now, now, created_by),
+        )
+
+    async def lover_target_set_enabled(self, nick: str, channel: str, enabled: bool) -> None:
+        n = (nick or "").strip()
+        ch = (channel or "").strip()
+        if not n or not ch:
+            return
+        now = int(time.time())
+        await self.execute(
+            "UPDATE lover_targets SET enabled=?, updated_ts=? WHERE nick=? AND channel=?",
+            (1 if enabled else 0, now, n, ch),
+        )
+
+    async def lover_target_exists(self, nick: str, channel: str) -> bool:
+        row = await self.fetchone(
+            "SELECT 1 FROM lover_targets WHERE nick=? AND channel=? LIMIT 1",
+            ((nick or "").strip(), (channel or "").strip()),
+        )
+        return row is not None
+
+    async def lover_targets_list(self, channel: str | None = None, enabled_only: bool = True) -> list[tuple[str, str]]:
+        if channel:
+            if enabled_only:
+                rows = await self.fetchall(
+                    "SELECT nick, channel FROM lover_targets WHERE channel=? AND enabled=1 ORDER BY channel, nick",
+                    (channel.strip(),),
+                )
+            else:
+                rows = await self.fetchall(
+                    "SELECT nick, channel FROM lover_targets WHERE channel=? ORDER BY channel, nick",
+                    (channel.strip(),),
+                )
+        else:
+            if enabled_only:
+                rows = await self.fetchall(
+                    "SELECT nick, channel FROM lover_targets WHERE enabled=1 ORDER BY channel, nick",
+                    (),
+                )
+            else:
+                rows = await self.fetchall(
+                    "SELECT nick, channel FROM lover_targets ORDER BY channel, nick",
+                    (),
+                )
+        return [(str(r[0]).strip(), str(r[1]).strip()) for r in rows] if rows else []
+
+    async def lover_enablement_is_enabled(self, channel: str) -> bool:
+        row = await self.fetchone(
+            "SELECT enabled FROM lover_enablement WHERE channel=?",
+            ((channel or "").strip(),),
+        )
+        return bool(row and row[0]) if row else False
+
+    async def lover_enablement_set(
+        self, channel: str, enabled: bool, *, updated_by: str | None = None
+    ) -> None:
+        ch = (channel or "").strip()
+        if not ch:
+            return
+        now = int(time.time())
+        await self.execute(
+            "INSERT INTO lover_enablement(channel, enabled, updated_ts, updated_by) VALUES(?,?,?,?) "
+            "ON CONFLICT(channel) DO UPDATE SET enabled=excluded.enabled, updated_ts=excluded.updated_ts, updated_by=excluded.updated_by",
+            (ch, 1 if enabled else 0, now, updated_by),
+        )
+
+    async def lover_enablement_list_enabled_channels(self) -> list[str]:
+        rows = await self.fetchall(
+            "SELECT channel FROM lover_enablement WHERE enabled=1 ORDER BY channel",
+            (),
+        )
+        return [str(r[0]).strip() for r in rows] if rows else []
+
+    async def lover_daily_count_get(self, nick: str, day: str) -> int:
+        row = await self.fetchone(
+            "SELECT count FROM lover_daily_counts WHERE nick=? AND day=?",
+            ((nick or "").strip().lower(), day),
+        )
+        return int(row[0]) if row else 0
+
+    async def lover_daily_count_increment(self, nick: str, day: str) -> None:
+        n = (nick or "").strip().lower()
+        if not n:
+            return
+        await self.execute(
+            "INSERT INTO lover_daily_counts(nick, day, count) VALUES(?,?,1) "
+            "ON CONFLICT(nick, day) DO UPDATE SET count=count+1",
+            (n, day),
+        )
+
+    async def lover_get_min_max(self) -> tuple[int, int]:
+        min_v = await self.get_setting("lover_min_per_user_per_day", "4")
+        max_v = await self.get_setting("lover_max_per_user_per_day", "8")
+        try:
+            mi = int(min_v)
+            ma = int(max_v)
+            if mi < 1 or ma < mi:
+                return 4, 8
+            return mi, ma
+        except (TypeError, ValueError):
+            return 4, 8
+
+    async def lover_set_min_max(self, minimum: int | None = None, maximum: int | None = None) -> None:
+        if minimum is not None:
+            await self.set_setting("lover_min_per_user_per_day", str(int(minimum)))
+        if maximum is not None:
+            await self.set_setting("lover_max_per_user_per_day", str(int(maximum)))
+
+    async def lover_public_cooldown_ready(self, channel: str, cooldown_seconds: int) -> bool:
+        row = await self.fetchone(
+            "SELECT last_public_ts FROM lover_public_cooldowns WHERE channel=?",
+            ((channel or "").strip(),),
+        )
+        if not row:
+            return True
+        last_ts = int(row[0] or 0)
+        return int(time.time()) >= (last_ts + int(cooldown_seconds))
+
+    async def lover_public_cooldown_mark_now(self, channel: str) -> None:
+        ch = (channel or "").strip()
+        if not ch:
+            return
+        now = int(time.time())
+        await self.execute(
+            "INSERT INTO lover_public_cooldowns(channel, last_public_ts) VALUES(?,?) "
+            "ON CONFLICT(channel) DO UPDATE SET last_public_ts=excluded.last_public_ts",
+            (ch, now),
+        )
+
     async def news_list_sources(self):
         return await self.fetchall(
             "SELECT id,name,enabled,created_ts,updated_ts FROM news_sources ORDER BY id",

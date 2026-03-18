@@ -31,6 +31,7 @@
   "services": [
     "services.eightball",
     "services.insult",
+    "services.lover",
     "services.joke",
     "services.wolfram",
     "services.fact",

@@ -86,3 +86,48 @@ async def test_acl_policies(temp_db):
         assert rows[0][1] == "svc" and rows[0][3] == "user"
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_lover_targets_and_daily_counts(temp_db):
+    store = Store(temp_db)
+    try:
+        await store.lover_target_upsert("Alice", "#test", enabled=True, created_by="admin")
+        await store.lover_target_upsert("Bob", "#test", enabled=True, created_by="admin")
+
+        rows = await store.lover_targets_list(channel="#test", enabled_only=True)
+        assert ("Alice", "#test") in rows
+        assert ("Bob", "#test") in rows
+
+        await store.lover_target_set_enabled("Bob", "#test", False)
+        rows_enabled = await store.lover_targets_list(channel="#test", enabled_only=True)
+        assert ("Alice", "#test") in rows_enabled
+        assert ("Bob", "#test") not in rows_enabled
+
+        day = "2026-03-18"
+        assert await store.lover_daily_count_get("Alice", day) == 0
+        await store.lover_daily_count_increment("Alice", day)
+        await store.lover_daily_count_increment("Alice", day)
+        assert await store.lover_daily_count_get("Alice", day) == 2
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_lover_enablement_min_max_and_cooldown(temp_db):
+    store = Store(temp_db)
+    try:
+        await store.lover_enablement_set("#test", True, updated_by="admin")
+        assert await store.lover_enablement_is_enabled("#test") is True
+        enabled = await store.lover_enablement_list_enabled_channels()
+        assert "#test" in enabled
+
+        await store.lover_set_min_max(minimum=3, maximum=7)
+        mi, ma = await store.lover_get_min_max()
+        assert (mi, ma) == (3, 7)
+
+        assert await store.lover_public_cooldown_ready("#test", 1800) is True
+        await store.lover_public_cooldown_mark_now("#test")
+        assert await store.lover_public_cooldown_ready("#test", 1800) is False
+    finally:
+        await store.close()
