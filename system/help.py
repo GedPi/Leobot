@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 
 from system.acl import ROLE_ORDER
+from system.commands import parse_command
 from system.types import Event
 
 
@@ -43,17 +44,12 @@ async def _privmsg_split(bot, target: str, s: str, *, maxlen: int = 380) -> None
 # All replies are sent as a private message to the user (ev.nick) to avoid flooding the channel.
 class Help:
     async def handle_core(self, bot, ev: Event) -> bool:
-        prefix = bot.cfg.get("command_prefix", "!")
-        txt = (ev.text or "").strip()
-        if not txt.startswith(prefix):
+        parsed = parse_command(ev.text, bot.cfg.get("command_prefix", "!"))
+        if not parsed:
             return False
 
-        cmdline = txt[len(prefix) :].strip()
-        if not cmdline:
-            return False
-
-        parts = cmdline.split()
-        cmd = parts[0].lower()
+        cmd = parsed["name"]
+        parts = [cmd] + parsed["args"]
 
         if cmd not in ("help", "commands"):
             return False
