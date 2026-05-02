@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from system.commands import parse_command
+
 import random
 from typing import List
+from system.help import send_command_usage
 
 
 RESPONSES: List[str] = [
@@ -40,24 +43,17 @@ class EightBallService:
     service_id = "eightball"
 
     async def on_privmsg(self, bot, ev) -> None:
-        prefix = bot.cfg.get("command_prefix", "!")
-        text = (ev.text or "").strip()
-
-        if not text.startswith(prefix):
+        parsed = parse_command(ev.text, bot.cfg.get("command_prefix", "!"))
+        if not parsed:
             return
-
-        cmdline = text[len(prefix):].strip()
-        if not cmdline:
-            return
-
-        cmd, *rest = cmdline.split(maxsplit=1)
-        cmd = cmd.lower()
+        cmd = parsed["name"]
+        rest = [" ".join(parsed["args"])] if parsed["args"] else []
         if cmd not in ("8ball", "eightball"):
             return
 
         question = rest[0].strip() if rest else ""
         if not question:
-            await bot.reply(ev, f"{ev.nick}: Usage: !8ball <question>")
+            await send_command_usage(bot, ev, "8ball", "Usage: !8ball <question>")
             return
 
         await bot.reply(ev, f"🎱 {random.choice(RESPONSES)}")

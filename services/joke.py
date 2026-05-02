@@ -9,6 +9,8 @@ Commands: !joke [category] [lang] [safe|1|2]
 """
 from __future__ import annotations
 
+from system.commands import parse_command
+
 import asyncio
 import json
 import urllib.parse
@@ -89,18 +91,11 @@ class JokeService:
     service_id = "joke"
 
     async def on_privmsg(self, bot, ev) -> None:
-        prefix = bot.cfg.get("command_prefix", "!")
-        text = (ev.text or "").strip()
-
-        if not text.startswith(prefix):
+        parsed = parse_command(ev.text, bot.cfg.get("command_prefix", "!"))
+        if not parsed:
             return
-
-        cmdline = text[len(prefix) :].strip()
-        if not cmdline:
-            return
-
-        parts = cmdline.split()
-        cmd = (parts[0] or "").lower()
+        cmd = parsed["name"]
+        parts = [cmd] + parsed["args"]
         if cmd != "joke":
             return
 

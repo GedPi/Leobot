@@ -53,7 +53,7 @@ class Dispatcher:
         except Exception:
             log.exception("Logging tee failed")
 
-    # For on_privmsg runs ACL precheck then core handle_core; for on_notice runs core on_notice; then invokes each service hook for the event, skipping services disabled for ev.channel.
+    # For on_privmsg runs ACL precheck then core handle_core; for on_notice runs core on_notice; then invokes each service hook, using required service_id for channel enablement checks.
     async def dispatch(self, hook: str, ev: Event) -> None:
         if hook == "on_privmsg" and getattr(self.bot, "acl", None) is not None:
             ok = await self.bot.acl.precheck(self.bot, ev)
@@ -100,7 +100,7 @@ class Dispatcher:
             if ev.channel and hook in gated_hooks:
                 sid = getattr(svc, "service_id", None)
                 if not sid:
-                    sid = type(svc).__module__.split(".")[-1]
+                    continue
                 try:
                     if not await self.bot.store.is_service_enabled(ev.channel, sid):
                         continue

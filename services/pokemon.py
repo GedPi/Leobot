@@ -18,6 +18,7 @@ import random
 import time
 
 from system.acl import ROLE_ORDER
+from system.help import send_command_usage
 
 log = logging.getLogger("leobot.pokemon")
 
@@ -220,10 +221,7 @@ class PokemonService:
 
     async def _handle_levelup_pm(self, bot, ev, args: list, channel: str) -> None:
         if not args:
-            await bot.privmsg(
-                ev.target,
-                f"{ev.nick}: Usage: !levelup <slot> #channel  e.g. !levelup 1 #General",
-            )
+            await send_command_usage(bot, ev, "levelup", "Usage: !levelup <slot> #channel")
             return
         try:
             slot = int((args[0] or "").strip())
@@ -243,7 +241,7 @@ class PokemonService:
 
     async def _handle_levelup(self, bot, ev, args: list) -> None:
         if not args:
-            await bot.reply(ev, f"{ev.nick}: Usage: !levelup <slot>")
+            await send_command_usage(bot, ev, "levelup", "Usage: !levelup <slot>")
             return
         try:
             slot = int((args[0] or "").strip())
@@ -263,10 +261,7 @@ class PokemonService:
 
     async def _handle_use_item_pm(self, bot, ev, args: list, channel: str) -> None:
         if len(args) < 3:
-            await bot.privmsg(
-                ev.target,
-                f"{ev.nick}: Usage: !use <item> <slot> #channel  e.g. !use potion 1 #General",
-            )
+            await send_command_usage(bot, ev, "use", "Usage: !use <item> <slot> #channel")
             return
         item_id = (args[0] or "").strip().lower()
         slot_str = (args[1] or "").strip()
@@ -397,7 +392,7 @@ class PokemonService:
                 target_nick = a
                 break
         if not target_nick:
-            await bot.reply(ev, f"{ev.nick}: Usage: !battle @user")
+            await send_command_usage(bot, ev, "battle", "Usage: !battle @user")
             return
         nick_l = _lower(ev.nick)
         target_l = _lower(target_nick)
@@ -512,7 +507,7 @@ def setup(bot):
             "battle",
             min_role="guest",
             mutating=False,
-            help="Battle another trainer: !battle @user",
+            help="Battle another trainer. Usage: !battle @user",
             category="Games",
             service_id="pokemon",
         )
@@ -520,7 +515,15 @@ def setup(bot):
             "levelup",
             min_role="guest",
             mutating=True,
-            help="Level up a Pokémon: !levelup <slot>",
+            help="Level up a Pokémon. Usage: !levelup <slot>",
+            category="Games",
+            service_id="pokemon",
+        )
+        bot.register_command(
+            "use",
+            min_role="guest",
+            mutating=True,
+            help="Use a trainer item (PM). Usage: !use <item> <slot> #channel",
             category="Games",
             service_id="pokemon",
         )

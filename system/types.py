@@ -3,7 +3,7 @@ from __future__ import annotations
 # Shared types: Event (IRC event payload), CommandInfo, Role and CoreHandler for dispatch.
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Protocol, runtime_checkable
 
 
 # Normalized IRC event: nick/user/host, target (reply-to), channel (if applicable), text, raw line, cmd/params and optional extra (old_nick, victim, etc.).
@@ -39,3 +39,18 @@ Role = str
 
 
 CoreHandler = Callable[[Any, Event], "Optional[bool]"]
+
+
+@runtime_checkable
+class Service(Protocol):
+    """Canonical addon contract used by Bot and Dispatcher.
+
+    Required:
+      - service_id: stable lowercase identity key used for enablement/ACL policy lookup.
+
+    Optional hooks:
+      - setup(bot) at module level creates a service instance.
+      - on_privmsg/on_notice/on_join/on_part/on_quit/on_kick/on_nick/on_mode/on_topic async handlers.
+    """
+
+    service_id: str

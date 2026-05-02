@@ -3,27 +3,49 @@ from __future__ import annotations
 # Handles !help and !commands: shows command help or lists commands by category filtered by caller role.
 
 from collections import defaultdict
+import re
 
 from system.acl import ROLE_ORDER
+from system.commands import parse_command
 from system.types import Event
 from system.messaging import send_user_message
+
+
+_USAGE_RE = re.compile(r"(Usage:\s*.+)", re.IGNORECASE)
+
+
+def get_command_help(bot, command_key: str) -> str | None:
+    key = (command_key or "").strip().lower().lstrip("!")
+    if not key:
+        return None
+    info = bot.commands.get(key) if hasattr(bot, "commands") else None
+    if not info:
+        return None
+    return (info.get("help") or "").strip() or None
+
+
+async def send_command_usage(bot, ev: Event, command_key: str, fallback: str | None = None) -> None:
+    help_text = get_command_help(bot, command_key)
+    usage = None
+    if help_text:
+        m = _USAGE_RE.search(help_text)
+        usage = m.group(1).strip() if m else f"Usage: !{(command_key or '').strip().lstrip('!')}"
+    msg = usage or (fallback.strip() if fallback else "").strip()
+    if not msg:
+        return
+    await bot.privmsg(ev.target, f"{ev.nick}: {msg}")
 
 
 # Core handler for !help and !commands; filters visible commands by effective_role and shows category list or single-command help.
 # All replies are sent as a private message to the user (ev.nick) to avoid flooding the channel.
 class Help:
     async def handle_core(self, bot, ev: Event) -> bool:
-        prefix = bot.cfg.get("command_prefix", "!")
-        txt = (ev.text or "").strip()
-        if not txt.startswith(prefix):
+        parsed = parse_command(ev.text, bot.cfg.get("command_prefix", "!"))
+        if not parsed:
             return False
 
-        cmdline = txt[len(prefix) :].strip()
-        if not cmdline:
-            return False
-
-        parts = cmdline.split()
-        cmd = parts[0].lower()
+        cmd = parsed["name"]
+        parts = [cmd] + parsed["args"]
 
         if cmd not in ("help", "commands"):
             return False
