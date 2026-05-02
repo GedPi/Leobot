@@ -28,6 +28,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
+from system.help import send_command_usage
 
 UA = "LeonidasIRCbot/2.0 (https://hairyoctopus.net; admin: Ged)"
 
@@ -1233,7 +1234,7 @@ class BlizzardService:
 
         if cmd == "wow":
             if not rest:
-                await self._err(bot, ev, "Usage: !wow char|guild|realm|item|auction|pvp ...")
+                await send_command_usage(bot, ev, "wow", "Usage: !wow char|guild|realm|item|auction|pvp ...")
                 return
             entity = rest[0].lower()
             args = rest[1:]
@@ -1249,7 +1250,7 @@ class BlizzardService:
                     else:
                         await self._err(bot, ev, f"Usage: !wow char {action} <realm> <character>")
                 else:
-                    await self._err(bot, ev, "Usage: !wow char <realm> <character> [gear|stats|profs|reps|mounts|pets|achieve|pvp]")
+                    await send_command_usage(bot, ev, "wow", "Usage: !wow char <realm> <character> [gear|stats|profs|reps|mounts|pets|achieve|pvp]")
                 return
 
             if entity == "guild":
@@ -1262,7 +1263,7 @@ class BlizzardService:
                     else:
                         await self._err(bot, ev, f"Usage: !wow guild {action} <realm> <guild>")
                 else:
-                    await self._err(bot, ev, "Usage: !wow guild <realm> <guild> [roster|achieve]")
+                    await send_command_usage(bot, ev, "wow", "Usage: !wow guild <realm> <guild> [roster|achieve]")
                 return
 
             if entity == "realm":
@@ -1281,18 +1282,18 @@ class BlizzardService:
                     # !wow auction <realm> <item name...>
                     await self._wow_auction(bot, ev, args[0], args[1:])
                 else:
-                    await self._err(bot, ev, "Usage: !wow auction <realm> <item name> | !wow auction item <realm> <id>")
+                    await send_command_usage(bot, ev, "wow", "Usage: !wow auction <realm> <item name> | !wow auction item <realm> <id>")
                 return
 
             if entity == "pvp":
                 await self._wow_pvp(bot, ev, args)
                 return
 
-            await self._err(bot, ev, "Usage: !wow char|guild|realm|item|auction|pvp ...")
+            await send_command_usage(bot, ev, "wow", "Usage: !wow char|guild|realm|item|auction|pvp ...")
 
         elif cmd == "d3":
             if not rest:
-                await self._err(bot, ev, "Usage: !d3 profile|hero|item|leaderboard ...")
+                await send_command_usage(bot, ev, "d3", "Usage: !d3 profile|hero|item|leaderboard ...")
                 return
             entity = rest[0].lower()
             args = rest[1:]
@@ -1307,7 +1308,7 @@ class BlizzardService:
                     else:
                         await self._err(bot, ev, f"Usage: !d3 profile {action} <battletag>")
                 else:
-                    await self._err(bot, ev, "Usage: !d3 profile <battletag> [seasonal|heroes]")
+                    await send_command_usage(bot, ev, "d3", "Usage: !d3 profile <battletag> [seasonal|heroes]")
                 return
 
             if entity == "hero":
@@ -1318,7 +1319,7 @@ class BlizzardService:
                     else:
                         await self._d3_hero(bot, ev, args[0], args[1])
                 else:
-                    await self._err(bot, ev, "Usage: !d3 hero <battletag> <hero-id> [gear|stats|skills]")
+                    await send_command_usage(bot, ev, "d3", "Usage: !d3 hero <battletag> <hero-id> [gear|stats|skills]")
                 return
 
             if entity == "item":
@@ -1329,7 +1330,7 @@ class BlizzardService:
                 await self._d3_leaderboard(bot, ev, args)
                 return
 
-            await self._err(bot, ev, "Usage: !d3 profile|hero|item|leaderboard ...")
+            await send_command_usage(bot, ev, "d3", "Usage: !d3 profile|hero|item|leaderboard ...")
 
 
 def setup(bot):
@@ -1338,7 +1339,7 @@ def setup(bot):
 
     if hasattr(bot, "register_command"):
         # WoW commands
-        bot.register_command("wow", min_role="guest", mutating=False, help="WoW game data. !wow char|guild|realm|item|auction|pvp ...", category="Blizzard", service_id="blizzard")
+        bot.register_command("wow", min_role="guest", mutating=False, help="WoW game data. Usage: !wow char|guild|realm|item|auction|pvp ...", category="Blizzard", service_id="blizzard")
         bot.register_command("wc", min_role="guest", mutating=False, help="Alias: !wow char", category="Blizzard", service_id="blizzard")
         bot.register_command("wg", min_role="guest", mutating=False, help="Alias: !wow guild", category="Blizzard", service_id="blizzard")
         bot.register_command("wr", min_role="guest", mutating=False, help="Alias: !wow realm", category="Blizzard", service_id="blizzard")
@@ -1346,7 +1347,7 @@ def setup(bot):
         bot.register_command("wa", min_role="guest", mutating=False, help="Alias: !wow auction", category="Blizzard", service_id="blizzard")
         bot.register_command("wpvp", min_role="guest", mutating=False, help="Alias: !wow pvp", category="Blizzard", service_id="blizzard")
         # D3 commands
-        bot.register_command("d3", min_role="guest", mutating=False, help="Diablo III game data. !d3 profile|hero|item|leaderboard ...", category="Blizzard", service_id="blizzard")
+        bot.register_command("d3", min_role="guest", mutating=False, help="Diablo III game data. Usage: !d3 profile|hero|item|leaderboard ...", category="Blizzard", service_id="blizzard")
         bot.register_command("dp", min_role="guest", mutating=False, help="Alias: !d3 profile", category="Blizzard", service_id="blizzard")
         bot.register_command("dh", min_role="guest", mutating=False, help="Alias: !d3 hero", category="Blizzard", service_id="blizzard")
         bot.register_command("di", min_role="guest", mutating=False, help="Alias: !d3 item", category="Blizzard", service_id="blizzard")
