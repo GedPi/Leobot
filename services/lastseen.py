@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from system.commands import parse_command
+
 import time
 
 
@@ -65,16 +67,11 @@ class LastSeenService:
         )
 
     async def on_privmsg(self, bot, ev):
-        prefix = bot.cfg.get("command_prefix", "!")
-        txt = (ev.text or "").strip()
-        if not txt.startswith(prefix):
+        parsed = parse_command(ev.text, bot.cfg.get("command_prefix", "!"))
+        if not parsed:
             return
-
-        parts = txt[len(prefix):].strip().split()
-        if not parts:
-            return
-
-        cmd = parts[0].lower()
+        cmd = parsed["name"]
+        parts = [cmd] + parsed["args"]
         if cmd not in ("seen", "lastseen"):
             return
 

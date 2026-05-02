@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from system.commands import parse_command
+
 import asyncio
 import json
 import logging
@@ -100,17 +102,11 @@ class GeminiService:
             return ""
 
     async def on_privmsg(self, bot, ev) -> None:
-        prefix = bot.cfg.get("command_prefix", "!")
-        text = (ev.text or "").strip()
-        if not text.startswith(prefix):
+        parsed = parse_command(ev.text, bot.cfg.get("command_prefix", "!"))
+        if not parsed:
             return
-
-        cmdline = text[len(prefix):].strip()
-        if not cmdline:
-            return
-
-        cmd, *rest = cmdline.split(maxsplit=1)
-        cmd = cmd.lower()
+        cmd = parsed["name"]
+        rest = [" ".join(parsed["args"])] if parsed["args"] else []
 
         if cmd not in ("gemini", "g"):
             return

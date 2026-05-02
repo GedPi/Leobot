@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # Per-channel service enablement: !service list|enable|disable; registers commands and handles them in handle_core.
 
+from system.commands import parse_command
 from system.types import Event
 
 
@@ -57,17 +58,12 @@ class ServiceCtl:
 
     # Handles !service list (show on/off per channel) and !service enable|disable <service> [#channel]; uses config services as valid set.
     async def handle_core(self, bot, ev: Event) -> bool:
-        prefix = bot.cfg.get("command_prefix", "!")
-        txt = (ev.text or "").strip()
-        if not txt.startswith(prefix):
+        parsed = parse_command(ev.text, bot.cfg.get("command_prefix", "!"))
+        if not parsed:
             return False
 
-        cmdline = txt[len(prefix) :].strip()
-        if not cmdline:
-            return False
-
-        parts = cmdline.split()
-        cmd = parts[0].lower()
+        cmd = parsed["name"]
+        parts = [cmd] + parsed["args"]
         if cmd not in ("service", "services"):
             return False
 
