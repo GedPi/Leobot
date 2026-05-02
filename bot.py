@@ -192,8 +192,8 @@ class Bot:
         assert last is not None
         raise last
 
-    # Loads addons from config "services" list: imports each module, calls setup(bot), assigns a unique
-    # service_id (from attribute or module name) and adds the instance to the dispatcher; skips duplicates and modules without setup().
+    # Loads addons from config "services" list: imports each module, calls setup(bot), and requires an explicit
+    # normalized service_id on the instance. Enforces uniqueness and adds accepted services to the dispatcher.
     def load_services(self) -> None:
         self.dispatcher.services.clear()
         self._services.clear()
@@ -211,9 +211,10 @@ class Bot:
                 continue
             sid = getattr(svc, "service_id", None)
             if not sid or not str(sid).strip():
-                sid = (getattr(mod, "__name__", "") or "").split(".")[-1] or str(name)
-                setattr(svc, "service_id", sid)
+                log.error("Service %s missing required service_id; skipping.", name)
+                continue
             sid = str(sid).strip().lower()
+            setattr(svc, "service_id", sid)
             if sid in seen_ids:
                 log.error("Duplicate service_id %r (service %s); skipping.", sid, name)
                 continue
