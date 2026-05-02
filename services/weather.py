@@ -155,6 +155,7 @@ class _PendingWeatherPick:
 
 
 class WeatherService:
+    service_id = "weather"
     """
     Commands (as agreed):
       !weather <location>
@@ -165,9 +166,8 @@ class WeatherService:
       !weather watch <location(s)> <channel>
     """
 
-    def __init__(self, cfg: dict, *, service_name: str = "weather"):
+    def __init__(self, cfg: dict):
         self.cfg = cfg or {}
-        self.service_name = service_name
 
         self._cooldown: dict[tuple[str, str], float] = {}
         self._mem_cache: dict[tuple, tuple[float, Any]] = {}

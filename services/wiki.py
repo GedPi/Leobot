@@ -93,6 +93,7 @@ class _Revision:
 
 
 class WikiService:
+    service_id = "wiki"
     """
     Wikipedia lookup + DB-backed watchlist monitor.
 
@@ -110,9 +111,8 @@ class WikiService:
       !wikimon interval <id> <15m|2h|1d>
     """
 
-    def __init__(self, cfg: dict, *, service_name: str = "wiki"):
+    def __init__(self, cfg: dict):
         self.cfg = cfg or {}
-        self.service_name = service_name
         self._cooldown: dict[tuple[str, str], float] = {}
         self._mem_cache: dict[tuple, tuple[float, Any]] = {}
 
@@ -259,7 +259,7 @@ class WikiService:
         # Announce into any channel where wiki is enabled.
         rows = await bot.store.fetchall(
             "SELECT channel FROM service_enablement WHERE service=? AND enabled=1 ORDER BY channel",
-            (self.service_name,),
+            (self.service_id,),
         )
         out: list[str] = []
         for r in rows:
@@ -422,7 +422,7 @@ class WikiService:
             return
 
         # wiki is per-channel enablement
-        if ev.channel and not await bot.store.is_service_enabled(ev.channel, self.service_name):
+        if ev.channel and not await bot.store.is_service_enabled(ev.channel, self.service_id):
             return
 
         # mild channel flood control
