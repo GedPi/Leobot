@@ -145,12 +145,12 @@ class PokemonService:
             )
             return
         if not channel.startswith("#"):
-            await bot.privmsg(ev.target, f"{ev.nick}: Channel must start with #")
+            await bot.reply(ev, f"{ev.nick}: Channel must start with #")
             return
 
         # Check if they're a trainer in that channel
         if not await bot.store.is_service_enabled(channel, "pokemon"):
-            await bot.privmsg(ev.target, f"{ev.nick}: Pokémon isn't enabled in {channel}")
+            await bot.reply(ev, f"{ev.nick}: Pokémon isn't enabled in {channel}")
             return
 
         if cmd == "use":
@@ -180,7 +180,7 @@ class PokemonService:
             if sub == "team":
                 team = await bot.store.pokemon_trainer_get_pokemon(nick_l, channel)
                 if not team:
-                    await bot.privmsg(ev.target, f"{ev.nick}: You have no Pokémon in {channel}.")
+                    await bot.reply(ev, f"{ev.nick}: You have no Pokémon in {channel}.")
                     return
                 lines = []
                 for r in team:
@@ -198,7 +198,7 @@ class PokemonService:
             elif sub == "items":
                 items = await bot.store.pokemon_trainer_get_items(nick_l, channel)
                 if not items:
-                    await bot.privmsg(ev.target, f"{ev.nick}: No items in {channel}.")
+                    await bot.reply(ev, f"{ev.nick}: No items in {channel}.")
                     return
                 lines = [f"  {_row_val(r, 'name')} x{_row_val(r, 'quantity')}" for r in items]
                 await bot.privmsg(
@@ -228,38 +228,38 @@ class PokemonService:
         try:
             slot = int((args[0] or "").strip())
         except ValueError:
-            await bot.privmsg(ev.target, f"{ev.nick}: Slot must be 1-6.")
+            await bot.reply(ev, f"{ev.nick}: Slot must be 1-6.")
             return
         if slot < 1 or slot > 6:
-            await bot.privmsg(ev.target, f"{ev.nick}: Slot must be 1-6.")
+            await bot.reply(ev, f"{ev.nick}: Slot must be 1-6.")
             return
         team = await bot.store.pokemon_trainer_get_pokemon(_lower(ev.nick), channel)
         poke = next((p for p in team if int(_row_val(p, "slot") or 0) == slot), None)
         if not poke:
-            await bot.privmsg(ev.target, f"{ev.nick}: No Pokémon in slot {slot}.")
+            await bot.reply(ev, f"{ev.nick}: No Pokémon in slot {slot}.")
             return
         ok, msg = await bot.store.pokemon_level_up(ev.nick, channel, int(poke["id"]))
-        await bot.privmsg(ev.target, f"{ev.nick}: {msg}")
+        await bot.reply(ev, f"{ev.nick}: {msg}")
 
     async def _handle_levelup(self, bot, ev, args: list) -> None:
         if not args:
-            await bot.privmsg(ev.target, f"{ev.nick}: Usage: !levelup <slot>")
+            await bot.reply(ev, f"{ev.nick}: Usage: !levelup <slot>")
             return
         try:
             slot = int((args[0] or "").strip())
         except ValueError:
-            await bot.privmsg(ev.target, f"{ev.nick}: Slot must be 1-6.")
+            await bot.reply(ev, f"{ev.nick}: Slot must be 1-6.")
             return
         if slot < 1 or slot > 6:
-            await bot.privmsg(ev.target, f"{ev.nick}: Slot must be 1-6.")
+            await bot.reply(ev, f"{ev.nick}: Slot must be 1-6.")
             return
         team = await bot.store.pokemon_trainer_get_pokemon(ev.nick, ev.channel)
         poke = next((p for p in team if int(_row_val(p, "slot") or 0) == slot), None)
         if not poke:
-            await bot.privmsg(ev.target, f"{ev.nick}: No Pokémon in slot {slot}.")
+            await bot.reply(ev, f"{ev.nick}: No Pokémon in slot {slot}.")
             return
         ok, msg = await bot.store.pokemon_level_up(ev.nick, ev.channel, int(poke["id"]))
-        await bot.privmsg(ev.target, f"{ev.nick}: {msg}")
+        await bot.reply(ev, f"{ev.nick}: {msg}")
 
     async def _handle_use_item_pm(self, bot, ev, args: list, channel: str) -> None:
         if len(args) < 3:
@@ -273,21 +273,21 @@ class PokemonService:
         try:
             slot = int(slot_str)
         except ValueError:
-            await bot.privmsg(ev.target, f"{ev.nick}: Slot must be a number 1-6.")
+            await bot.reply(ev, f"{ev.nick}: Slot must be a number 1-6.")
             return
         if slot < 1 or slot > 6:
-            await bot.privmsg(ev.target, f"{ev.nick}: Slot must be 1-6.")
+            await bot.reply(ev, f"{ev.nick}: Slot must be 1-6.")
             return
         team = await bot.store.pokemon_trainer_get_pokemon(_lower(ev.nick), channel)
         poke = next((p for p in team if int(_row_val(p, "slot") or 0) == slot), None)
         if not poke:
-            await bot.privmsg(ev.target, f"{ev.nick}: No Pokémon in slot {slot}.")
+            await bot.reply(ev, f"{ev.nick}: No Pokémon in slot {slot}.")
             return
         pokemon_id = int(poke["id"])
         ok, msg = await bot.store.pokemon_trainer_use_item(
             ev.nick, channel, item_id, pokemon_id=pokemon_id
         )
-        await bot.privmsg(ev.target, f"{ev.nick}: {msg}")
+        await bot.reply(ev, f"{ev.nick}: {msg}")
 
     async def _handle_channel_pokemon(self, bot, ev, args: list) -> None:
         sub = (args[0] or "").lower() if args else "help"
@@ -336,7 +336,7 @@ class PokemonService:
         if sub in ("team", "party"):
             team = await bot.store.pokemon_trainer_get_pokemon(ev.nick, ev.channel)
             if not team:
-                await bot.privmsg(ev.target, f"{ev.nick}: You have no Pokémon.")
+                await bot.reply(ev, f"{ev.nick}: You have no Pokémon.")
                 return
             lines = []
             for r in team[:6]:
@@ -356,7 +356,7 @@ class PokemonService:
                 f"{ev.nick}: !pokemon team | !capture [ball] | !battle @user | !levelup <slot> | PM for items/heal/revive. !pokemon spawns [N]",
             )
         else:
-            await bot.privmsg(ev.target, f"{ev.nick}: Unknown. Try !pokemon help")
+            await bot.reply(ev, f"{ev.nick}: Unknown. Try !pokemon help")
 
     async def _handle_capture(self, bot, ev, args: list) -> None:
         if not self._cooldown_ok(ev.target, "capture"):
@@ -379,9 +379,9 @@ class PokemonService:
         )
         if ok:
             await bot.store.pokemon_trainer_deduct_item(ev.nick, ev.channel, ball_id, 1)
-            await bot.privmsg(ev.target, f"{ev.nick}: Gotcha! {msg} was caught!")
+            await bot.reply(ev, f"{ev.nick}: Gotcha! {msg} was caught!")
         else:
-            await bot.privmsg(ev.target, f"{ev.nick}: {msg}")
+            await bot.reply(ev, f"{ev.nick}: {msg}")
 
     async def _handle_battle(self, bot, ev, args: list) -> None:
         """Simple battle: two trainers, winner by highest total level."""
@@ -397,30 +397,30 @@ class PokemonService:
                 target_nick = a
                 break
         if not target_nick:
-            await bot.privmsg(ev.target, f"{ev.nick}: Usage: !battle @user")
+            await bot.reply(ev, f"{ev.nick}: Usage: !battle @user")
             return
         nick_l = _lower(ev.nick)
         target_l = _lower(target_nick)
         if nick_l == target_l:
-            await bot.privmsg(ev.target, f"{ev.nick}: You can't battle yourself!")
+            await bot.reply(ev, f"{ev.nick}: You can't battle yourself!")
             return
         my_team = await bot.store.pokemon_trainer_get_pokemon(ev.nick, ev.channel)
         their_team = await bot.store.pokemon_trainer_get_pokemon(target_nick, ev.channel)
         if not my_team:
-            await bot.privmsg(ev.target, f"{ev.nick}: You have no Pokémon!")
+            await bot.reply(ev, f"{ev.nick}: You have no Pokémon!")
             return
         if not their_team:
-            await bot.privmsg(ev.target, f"{ev.nick}: {target_nick} is not a trainer.")
+            await bot.reply(ev, f"{ev.nick}: {target_nick} is not a trainer.")
             return
         my_fainted = sum(1 for p in my_team if _row_val(p, "is_fainted"))
         their_fainted = sum(1 for p in their_team if _row_val(p, "is_fainted"))
         my_able = len(my_team) - my_fainted
         their_able = len(their_team) - their_fainted
         if my_able == 0:
-            await bot.privmsg(ev.target, f"{ev.nick}: All your Pokémon have fainted! Heal up first.")
+            await bot.reply(ev, f"{ev.nick}: All your Pokémon have fainted! Heal up first.")
             return
         if their_able == 0:
-            await bot.privmsg(ev.target, f"{ev.nick}: {target_nick}'s team is all fainted.")
+            await bot.reply(ev, f"{ev.nick}: {target_nick}'s team is all fainted.")
             return
         my_total = sum(int(_row_val(p, "level") or 5) for p in my_team if not _row_val(p, "is_fainted"))
         their_total = sum(int(_row_val(p, "level") or 5) for p in their_team if not _row_val(p, "is_fainted"))

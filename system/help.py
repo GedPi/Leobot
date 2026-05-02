@@ -6,37 +6,7 @@ from collections import defaultdict
 
 from system.acl import ROLE_ORDER
 from system.types import Event
-
-
-# Splits string into chunks of at most maxlen characters on word boundaries for IRC.
-def _split_message(s: str, *, maxlen: int = 380) -> list[str]:
-    s = (s or "").strip()
-    if not s:
-        return []
-    if len(s) <= maxlen:
-        return [s]
-
-    parts = s.split(" ")
-    out: list[str] = []
-    cur = ""
-    for p in parts:
-        if not cur:
-            cur = p
-            continue
-        if len(cur) + 1 + len(p) > maxlen:
-            out.append(cur)
-            cur = p
-        else:
-            cur += " " + p
-    if cur:
-        out.append(cur)
-    return out
-
-
-# Sends message to target in chunks via _split_message to avoid truncation.
-async def _privmsg_split(bot, target: str, s: str, *, maxlen: int = 380) -> None:
-    for line in _split_message(s, maxlen=maxlen):
-        await bot.privmsg(target, line)
+from system.messaging import send_user_message
 
 
 # Core handler for !help and !commands; filters visible commands by effective_role and shows category list or single-command help.
@@ -67,11 +37,7 @@ class Help:
 
             info = bot.commands.get(q)
             if info:
-                await _privmsg_split(
-                    bot,
-                    reply_to,
-                    f"{q} — category={info['category']} | role>={info['min_role']} | mutating={info['mutating']} | {info['help'] or 'no help text'}",
-                )
+                await send_user_message(bot, ev, f"{q} — category={info['category']} | role>={info['min_role']} | mutating={info['mutating']} | {info['help'] or 'no help text'}", scope="pm", mention=False)
                 return True
 
             cats = defaultdict(list)
@@ -83,10 +49,10 @@ class Help:
 
             if q in cats:
                 cmds = ", ".join(sorted(cats[q]))
-                await _privmsg_split(bot, reply_to, f"{q_raw} commands: {cmds}")
+                await send_user_message(bot, ev, f"{q_raw} commands: {cmds}", scope="pm", mention=False)
                 return True
 
-            await bot.privmsg(reply_to, f"Unknown command/category '{q_raw}'. Try !commands")
+            await send_user_message(bot, ev, f"Unknown command/category '{q_raw}'. Try !commands", scope="pm", mention=False)
             return True
 
         cats = defaultdict(list)
@@ -97,12 +63,12 @@ class Help:
             cats[info["category"]].append(name)
 
         if not cats:
-            await bot.privmsg(reply_to, "No commands available")
+            await send_user_message(bot, ev, "No commands available", scope="pm", mention=False)
             return True
 
-        await bot.privmsg(reply_to, f"Commands for role={role}: use !help <command> or !help <category>")
+        await send_user_message(bot, ev, f"Commands for role={role}: use !help <command> or !help <category>", scope="pm", mention=False)
         for cat in sorted(cats.keys()):
             cmds = ", ".join(sorted(cats[cat]))
-            await _privmsg_split(bot, reply_to, f"{cat}: {cmds}")
+            await send_user_message(bot, ev, f"{cat}: {cmds}", scope="pm", mention=False)
 
         return True

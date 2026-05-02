@@ -107,21 +107,21 @@ class WolframService:
 
         query = (parts[1].strip() if len(parts) > 1 else "").strip()
         if not query:
-            await bot.privmsg(ev.target, f"{ev.nick}: Usage: !Wolf <question>")
+            await bot.reply(ev, f"{ev.nick}: Usage: !Wolf <question>")
             return
 
         if not self.appid:
-            await bot.privmsg(ev.target, f"{ev.nick}: Wolfram|Alpha not configured (missing appid).")
+            await bot.reply(ev, f"{ev.nick}: Wolfram|Alpha not configured (missing appid).")
             return
 
         try:
             data = await _get_wolfram(self.appid, query, self.timeout)
         except Exception:
-            await bot.privmsg(ev.target, f"{ev.nick}: Wolfram|Alpha API error.")
+            await bot.reply(ev, f"{ev.nick}: Wolfram|Alpha API error.")
             return
 
         if not data:
-            await bot.privmsg(ev.target, f"{ev.nick}: Wolfram|Alpha API error.")
+            await bot.reply(ev, f"{ev.nick}: Wolfram|Alpha API error.")
             return
 
         plaintext = _extract_plaintext(data)
@@ -141,7 +141,7 @@ class WolframService:
             return
 
         out = PREFIX + _truncate(plaintext, self.max_chars - len(PREFIX))
-        await bot.privmsg(ev.target, out)
+        await bot.reply(ev, out)
 
 
 def setup(bot):

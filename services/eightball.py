@@ -57,10 +57,10 @@ class EightBallService:
 
         question = rest[0].strip() if rest else ""
         if not question:
-            await bot.privmsg(ev.target, f"{ev.nick}: Usage: !8ball <question>")
+            await bot.reply(ev, f"{ev.nick}: Usage: !8ball <question>")
             return
 
-        await bot.privmsg(ev.target, f"🎱 {random.choice(RESPONSES)}")
+        await bot.reply(ev, f"🎱 {random.choice(RESPONSES)}")
 
 
 def setup(bot):

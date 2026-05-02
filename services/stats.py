@@ -110,7 +110,7 @@ class StatsService:
             return
 
         if not ev.channel:
-            await bot.privmsg(ev.target, f"{ev.nick}: stats are channel-based; run in a channel.")
+            await bot.reply(ev, f"{ev.nick}: stats are channel-based; run in a channel.")
             return
 
         args = parts[1:]
@@ -187,7 +187,7 @@ class StatsService:
         )
 
         if not rows:
-            await bot.privmsg(ev.target, f"{ev.nick}: no data for {channel} ({window.label}).")
+            await bot.reply(ev, f"{ev.nick}: no data for {channel} ({window.label}).")
             return
 
         # Build compact leaderboard
@@ -203,7 +203,7 @@ class StatsService:
                 parts.append(f"{rank}) {nick} {msgs} msgs")
             rank += 1
 
-        await bot.privmsg(ev.target, f"{ev.nick}: top {len(rows)} in {channel} ({window.label}): " + " | ".join(parts))
+        await bot.reply(ev, f"{ev.nick}: top {len(rows)} in {channel} ({window.label}): " + " | ".join(parts))
 
     async def _report_nick(self, bot, ev, nick: str, channel: str, window: Window, now: int) -> None:
         where_time = ""

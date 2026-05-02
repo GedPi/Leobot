@@ -110,19 +110,19 @@ class JokeService:
         try:
             data = await _get_joke(category, lang, joke_type, safe)
         except Exception:
-            await bot.privmsg(ev.target, f"{ev.nick}: Joke API error.")
+            await bot.reply(ev, f"{ev.nick}: Joke API error.")
             return
 
         if not data:
-            await bot.privmsg(ev.target, f"{ev.nick}: No matching joke found.")
+            await bot.reply(ev, f"{ev.nick}: No matching joke found.")
             return
 
         formatted = _format_joke(data)
         if not formatted:
-            await bot.privmsg(ev.target, f"{ev.nick}: No matching joke found.")
+            await bot.reply(ev, f"{ev.nick}: No matching joke found.")
             return
 
-        await bot.privmsg(ev.target, formatted)
+        await bot.reply(ev, formatted)
 
 
 def setup(bot):
