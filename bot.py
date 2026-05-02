@@ -23,6 +23,7 @@ from system.help import Help
 from system.irc_client import IRCClient
 from system.irc_parse import parse_line, parse_prefix
 from system.logging_setup import setup_logging
+from system.messaging import send_user_message
 from system.scheduler import Scheduler
 from system.servicectl import ServiceCtl
 from system.store import Store
@@ -131,6 +132,16 @@ class Bot:
         if not self.irc:
             raise RuntimeError("IRC client not initialized")
         await self.irc.privmsg(target, msg)
+
+
+    async def reply(self, ev: Event, text: str, **kwargs) -> None:
+        kwargs.setdefault("mention", False)
+        await send_user_message(self, ev, text, **kwargs)
+
+    async def reply_pm(self, ev: Event, text: str, **kwargs) -> None:
+        kwargs.setdefault("mention", False)
+        kwargs.setdefault("scope", "pm")
+        await send_user_message(self, ev, text, **kwargs)
 
     # Registers help, commands, auth, whoami and delegates service-control commands to ServiceCtl.
     # Core handlers (Help, ACL) use this registry for permission and help text.

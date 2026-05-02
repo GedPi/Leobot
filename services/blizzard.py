@@ -270,7 +270,7 @@ class BlizzardService:
         return True
 
     async def _err(self, bot, ev, msg: str) -> None:
-        await bot.privmsg(ev.target, f"{ev.nick}: {msg}")
+        await bot.reply(ev, f"{ev.nick}: {msg}")
 
     async def _no_config(self, bot, ev) -> None:
         await self._err(
@@ -307,7 +307,7 @@ class BlizzardService:
                 msg = f"WoW gear {char}@{realm_slug}: " + " | ".join(lines[:6])
                 if len(lines) > 6:
                     msg += " | " + " | ".join(lines[6:12])
-                await bot.privmsg(ev.target, msg[:400])
+                await bot.reply(ev, msg[:400])
                 return
 
             if action == "stats":
@@ -323,7 +323,7 @@ class BlizzardService:
                         for st in stats:
                             parts.append(f"{st.get('name','?')}: {st.get('value',0)}")
                 msg = f"WoW stats {char}@{realm_slug}: " + " | ".join(parts[:8])
-                await bot.privmsg(ev.target, msg)
+                await bot.reply(ev, msg)
                 return
 
             if action == "profs":
@@ -334,7 +334,7 @@ class BlizzardService:
                 for p in (prof_data.get("primaries", []) if isinstance(prof_data, dict) else [])[:5]:
                     profs.append(f"{_safe_name(p.get('profession'))} {p.get('skill_tier',0)}")
                 msg = f"WoW profs {char}@{realm_slug}: " + ", ".join(profs) if profs else "No professions"
-                await bot.privmsg(ev.target, msg)
+                await bot.reply(ev, msg)
                 return
 
             if action == "reps":
@@ -343,7 +343,7 @@ class BlizzardService:
                 reps = data.get("reputations", [])[:6]
                 parts = [f"{_safe_name(r.get('faction'))}: {_safe_name(r.get('standing'))}" for r in reps]
                 msg = f"WoW reps {char}@{realm_slug}: " + " | ".join(parts) if parts else "No reputations"
-                await bot.privmsg(ev.target, msg)
+                await bot.reply(ev, msg)
                 return
 
             if action == "mounts":
@@ -351,7 +351,7 @@ class BlizzardService:
                 data = await client.get(path, {"namespace": f"profile-{self.region}", "locale": self.locale})
                 total = len(data.get("mounts", []))
                 msg = f"WoW mounts {char}@{realm_slug}: {total} mounts collected"
-                await bot.privmsg(ev.target, msg)
+                await bot.reply(ev, msg)
                 return
 
             if action == "pets":
@@ -359,7 +359,7 @@ class BlizzardService:
                 data = await client.get(path, {"namespace": f"profile-{self.region}", "locale": self.locale})
                 total = len(data.get("pets", []))
                 msg = f"WoW pets {char}@{realm_slug}: {total} pets collected"
-                await bot.privmsg(ev.target, msg)
+                await bot.reply(ev, msg)
                 return
 
             if action == "achieve":
@@ -371,7 +371,7 @@ class BlizzardService:
                     for s in (c.get("statistics", []) or [])[:2]:
                         parts.append(f"{s.get('name','?')}: {s.get('quantity',0)}")
                 msg = f"WoW achieve {char}@{realm_slug}: " + " | ".join(parts[:6]) if parts else "No achievements"
-                await bot.privmsg(ev.target, msg)
+                await bot.reply(ev, msg)
                 return
 
             if action == "pvp":
@@ -380,7 +380,7 @@ class BlizzardService:
                 brackets = data.get("honorable_kills", 0)
                 honor = data.get("honor_level", 0)
                 msg = f"WoW PvP {char}@{realm_slug}: Honor {honor}, Honorable kills {brackets}"
-                await bot.privmsg(ev.target, msg)
+                await bot.reply(ev, msg)
                 return
 
             # Default: character summary
@@ -402,7 +402,7 @@ class BlizzardService:
                 except Exception:
                     pass
             msg = f"WoW {char}@{realm_slug}: L{level} {cls} {race} ({faction}) | iLvl {eq_ilvl} | {ach_pts} achieve pts{last_str}"
-            await bot.privmsg(ev.target, msg)
+            await bot.reply(ev, msg)
 
         except RuntimeError as e:
             await self._err(bot, ev, str(e))
@@ -441,7 +441,7 @@ class BlizzardService:
                     level = char_obj.get("level", 0) if isinstance(char_obj, dict) else m.get("level", 0)
                     parts.append(f"{char}(L{level})")
                 msg = f"WoW guild {guild}@{realm_slug} roster (top 10): " + ", ".join(parts) if parts else "No members"
-                await bot.privmsg(ev.target, msg)
+                await bot.reply(ev, msg)
                 return
 
             if action == "achieve":
@@ -461,7 +461,7 @@ class BlizzardService:
                         ts = c.get("completed_timestamp")
                         parts.append(str(ts)[:10] if ts else "?")
                 msg = f"WoW guild {guild}@{realm_slug} recent achieves: " + ", ".join(parts) if parts else "None"
-                await bot.privmsg(ev.target, msg)
+                await bot.reply(ev, msg)
                 return
 
             # Default: guild summary
@@ -472,7 +472,7 @@ class BlizzardService:
             members = data.get("member_count") or data.get("roster", {}).get("member_count", 0) or len(data.get("members", []))
             ach_pts = data.get("achievement_points", 0)
             msg = f"WoW guild {guild}@{realm_name}: {faction} | {members} members | {ach_pts} achieve pts"
-            await bot.privmsg(ev.target, msg)
+            await bot.reply(ev, msg)
 
         except RuntimeError as e:
             await self._err(bot, ev, str(e))
@@ -588,7 +588,7 @@ class BlizzardService:
                 msg = f"WoW realms ({self.region}): " + ", ".join(names)
                 if len(data.get("realms", [])) > 15:
                     msg += f" (+{len(data['realms'])-15} more)"
-                await bot.privmsg(ev.target, msg)
+                await bot.reply(ev, msg)
                 return
 
             realm = _norm_space(" ".join(args)) if args else ""
@@ -636,7 +636,7 @@ class BlizzardService:
                 stype is True or (stype and str(stype).upper() == "UP")
             ) else "Offline"
             msg = f"WoW realm {name}: {region} | {pop} | {status_str}"
-            await bot.privmsg(ev.target, msg)
+            await bot.reply(ev, msg)
 
         except RuntimeError as e:
             await self._err(bot, ev, str(e))
@@ -672,7 +672,7 @@ class BlizzardService:
                 qual = WOW_QUALITY.get(qobj.get("type", qobj), "?")
                 itype = (data.get("item_subclass", {}) or data.get("item_class", {}) or {}).get("name", "?")
                 msg = f"WoW item: {name} | iLvl {ilvl} | {slot} | {qual} | {itype}"
-                await bot.privmsg(ev.target, msg)
+                await bot.reply(ev, msg)
                 return
 
             if args[0].lower() == "search" and len(args) >= 2:
@@ -697,7 +697,7 @@ class BlizzardService:
                     iid = item.get("id", "?")
                     parts.append(f"{name} (id:{iid})")
                 msg = f"WoW item search '{query}': " + " | ".join(parts)
-                await bot.privmsg(ev.target, msg[:400])
+                await bot.reply(ev, msg[:400])
                 return
 
             # By name - search first
@@ -718,7 +718,7 @@ class BlizzardService:
             if len(results) > 1:
                 parts = [f"{r.get('data',r).get('name','?')} (id:{r.get('data',r).get('id','?')})" for r in results[:6]]
                 msg = f"WoW item '{query}' - multiple matches: " + " | ".join(parts)
-                await bot.privmsg(ev.target, msg)
+                await bot.reply(ev, msg)
                 return
             item = results[0].get("data", results[0])
             item_id = item.get("id")
@@ -731,7 +731,7 @@ class BlizzardService:
             qual = WOW_QUALITY.get(qobj.get("type", qobj), "?")
             itype = (data.get("item_subclass", {}) or data.get("item_class", {}) or {}).get("name", "?")
             msg = f"WoW item: {name} | iLvl {ilvl} | {slot} | {qual} | {itype}"
-            await bot.privmsg(ev.target, msg)
+            await bot.reply(ev, msg)
 
         except RuntimeError as e:
             await self._err(bot, ev, str(e))
@@ -823,7 +823,7 @@ class BlizzardService:
                 msg = f"WoW auction {_realm_slug(realm)}: {qty} available | min {gold_min:.1f}g | avg {gold_avg:.1f}g"
             else:
                 msg = f"WoW auction {_realm_slug(realm)}: {qty} available (no buyout data)"
-            await bot.privmsg(ev.target, msg)
+            await bot.reply(ev, msg)
 
         except RuntimeError as e:
             await self._err(bot, ev, str(e))
@@ -870,7 +870,7 @@ class BlizzardService:
                     rank = e.get("rank", 0)
                     parts.append(f"#{rank} {char} ({rating})")
                 msg = f"WoW PvP {slug} ladder: " + " | ".join(parts) if parts else "No entries"
-                await bot.privmsg(ev.target, msg)
+                await bot.reply(ev, msg)
                 return
 
             if args[0].lower() == "rank" and len(args) >= 3:
@@ -897,7 +897,7 @@ class BlizzardService:
                     c = (e.get("character", {}) or {})
                     if (c.get("name") or "").lower() == char_lower:
                         msg = f"WoW PvP {slug}: {char_name} rank #{e.get('rank',0)} rating {e.get('rating',0)}"
-                        await bot.privmsg(ev.target, msg)
+                        await bot.reply(ev, msg)
                         return
                 await self._err(bot, ev, f"{char_name} not found in {slug} ladder")
                 return
@@ -911,7 +911,7 @@ class BlizzardService:
                 honor = data.get("honor_level", 0)
                 kills = data.get("honorable_kills", 0)
                 msg = f"WoW PvP {char_slug}@{realm_slug}: Honor {honor}, Honorable kills {kills}"
-                await bot.privmsg(ev.target, msg)
+                await bot.reply(ev, msg)
             else:
                 await self._err(bot, ev, "Usage: !wow pvp <realm> <char> | !wow pvp ladder <bracket> | !wow pvp rank <bracket> <char>")
 
@@ -945,7 +945,7 @@ class BlizzardService:
                     seasonal = "S" if h.get("seasonal") else ""
                     parts.append(f"{name} {cls} L{lvl} {hardcore}{seasonal}".strip())
                 msg = f"D3 profile {battletag} heroes: " + " | ".join(parts) if parts else "No heroes"
-                await bot.privmsg(ev.target, msg)
+                await bot.reply(ev, msg)
                 return
 
             if action == "seasonal":
@@ -955,7 +955,7 @@ class BlizzardService:
                 seasonal_paragon = data.get("paragonLevelSeason", 0)
                 season = data.get("seasonalProfiles", {})
                 msg = f"D3 profile {battletag} seasonal: paragon {paragon} (seasonal {seasonal_paragon})"
-                await bot.privmsg(ev.target, msg)
+                await bot.reply(ev, msg)
                 return
 
             # Default: profile summary
@@ -966,7 +966,7 @@ class BlizzardService:
             heroes = data.get("heroes", [])
             hc = sum(1 for h in heroes if h.get("hardcore"))
             msg = f"D3 profile {battletag}: paragon {paragon} (seasonal {seasonal_paragon}) | {len(heroes)} heroes ({hc} HC)"
-            await bot.privmsg(ev.target, msg)
+            await bot.reply(ev, msg)
 
         except RuntimeError as e:
             await self._err(bot, ev, str(e))
@@ -997,7 +997,7 @@ class BlizzardService:
                         qual = D3_QUALITY.get(it.get("displayColor", ""), "")
                         parts.append(f"{slot}: {name} [{qual}]")
                 msg = f"D3 hero {hero_id} gear: " + " | ".join(parts) if parts else "No gear"
-                await bot.privmsg(ev.target, msg)
+                await bot.reply(ev, msg)
                 return
 
             if action == "stats":
@@ -1006,7 +1006,7 @@ class BlizzardService:
                 dmg = stats.get("damage", 0)
                 tough = stats.get("toughness", 0)
                 msg = f"D3 hero {hero_id} stats: life {life} | damage {dmg} | toughness {tough}"
-                await bot.privmsg(ev.target, msg)
+                await bot.reply(ev, msg)
                 return
 
             if action == "skills":
@@ -1016,7 +1016,7 @@ class BlizzardService:
                 a_parts = [s.get("skill", {}).get("name", "?") for s in active if s.get("skill")]
                 p_parts = [s.get("skill", {}).get("name", "?") for s in passive if s.get("skill")]
                 msg = f"D3 hero {hero_id} skills: active " + ", ".join(a_parts) + " | passive " + ", ".join(p_parts)
-                await bot.privmsg(ev.target, msg[:400])
+                await bot.reply(ev, msg[:400])
                 return
 
             # Default: hero summary
@@ -1031,7 +1031,7 @@ class BlizzardService:
             tough = stats.get("toughness", 0)
             rec = stats.get("recovery", 0)
             msg = f"D3 hero {name}: {hc}{seasonal}{cls} L{level} P{paragon} | dmg {dmg} tough {tough} rec {rec}"
-            await bot.privmsg(ev.target, msg)
+            await bot.reply(ev, msg)
 
         except RuntimeError as e:
             await self._err(bot, ev, str(e))
@@ -1073,7 +1073,7 @@ class BlizzardService:
                 msg = f"D3 item: {name} | {itype} | {qual}"
                 if effect:
                     msg += f" | {effect}"
-                await bot.privmsg(ev.target, msg[:400])
+                await bot.reply(ev, msg[:400])
                 return
 
             # By name - D3 doesn't have item search, so we'd need to use a different approach
@@ -1161,7 +1161,7 @@ class BlizzardService:
                     row = entries[r - 1]
                     name = self._d3_leaderboard_player_name(row)
                     msg = f"D3 leaderboard #{r}: {name}"
-                    await bot.privmsg(ev.target, msg)
+                    await bot.reply(ev, msg)
                 else:
                     await self._err(bot, ev, f"Rank {rank} not found (max {len(entries)})")
                 return
@@ -1173,7 +1173,7 @@ class BlizzardService:
                 name = self._d3_leaderboard_player_name(row)
                 parts.append(f"#{i+1} {name}")
             msg = f"D3 leaderboard {cls} S{season} ({region}): " + " | ".join(parts) if parts else "No entries"
-            await bot.privmsg(ev.target, msg)
+            await bot.reply(ev, msg)
 
         except RuntimeError as e:
             await self._err(bot, ev, str(e))
@@ -1227,7 +1227,7 @@ class BlizzardService:
             return
 
         if not ev.is_private and not self._cooldown_ok(ev.target, "blizzard"):
-            await bot.privmsg(ev.target, f"{ev.nick}: slow down.")
+            await bot.reply(ev, f"{ev.nick}: slow down.")
             return
 
         rest = parts[1:]

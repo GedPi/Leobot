@@ -76,12 +76,12 @@ class LastSeenService:
             return
 
         if len(parts) < 2:
-            await bot.privmsg(ev.target, f"{ev.nick}: usage: !{cmd} <nick>")
+            await bot.reply(ev, f"{ev.nick}: usage: !{cmd} <nick>")
             return
 
         q = parts[1].strip()
         if not q:
-            await bot.privmsg(ev.target, f"{ev.nick}: usage: !{cmd} <nick>")
+            await bot.reply(ev, f"{ev.nick}: usage: !{cmd} <nick>")
             return
 
         # 1) Direct lookup by actor_nick
@@ -123,7 +123,7 @@ class LastSeenService:
                 )
 
         if not row:
-            await bot.privmsg(ev.target, f"{ev.nick}: no record for {q}")
+            await bot.reply(ev, f"{ev.nick}: no record for {q}")
             return
 
         last_ts = int(row[1])
@@ -180,7 +180,7 @@ class LastSeenService:
                     f"{ev.nick}: {q} is now {display_nick}. I last saw {display_nick} {age} ago; quitting \"{quit_text}\""
                 )
             else:
-                await bot.privmsg(ev.target, f"{ev.nick}: I last saw {display_nick} {age} ago; quitting \"{quit_text}\"")
+                await bot.reply(ev, f"{ev.nick}: I last saw {display_nick} {age} ago; quitting \"{quit_text}\"")
             return
 
         # Default output for non-QUIT events

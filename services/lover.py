@@ -18,11 +18,11 @@ class LoverService:
 
     async def _require_admin_pm(self, bot, ev) -> bool:
         if not ev.is_private:
-            await bot.privmsg(ev.target, f"{ev.nick}: use this command in a private message to me.")
+            await bot.reply(ev, f"{ev.nick}: use this command in a private message to me.")
             return False
         role = await bot.acl.effective_role(ev)
         if ROLE_ORDER.get(role, 0) < ROLE_ORDER.get("admin", 0):
-            await bot.privmsg(ev.target, f"{ev.nick}: requires admin role.")
+            await bot.reply(ev, f"{ev.nick}: requires admin role.")
             return False
         return True
 
@@ -92,22 +92,22 @@ class LoverService:
 
         if cmd in ("love", "unlove"):
             if len(parts) < 3:
-                await bot.privmsg(ev.target, f"{ev.nick}: usage: !{cmd} <nick> <#channel>")
+                await bot.reply(ev, f"{ev.nick}: usage: !{cmd} <nick> <#channel>")
                 return
 
             nick = (parts[1] or "").strip()
             channel = (parts[2] or "").strip()
             if not nick or not channel.startswith("#"):
-                await bot.privmsg(ev.target, f"{ev.nick}: usage: !{cmd} <nick> <#channel>")
+                await bot.reply(ev, f"{ev.nick}: usage: !{cmd} <nick> <#channel>")
                 return
 
             if cmd == "unlove":
                 exists = await bot.store.lover_target_exists(nick, channel)
                 if not exists:
-                    await bot.privmsg(ev.target, f"{ev.nick}: no lover target for {nick} in {channel}.")
+                    await bot.reply(ev, f"{ev.nick}: no lover target for {nick} in {channel}.")
                     return
                 await bot.store.lover_target_set_enabled(nick, channel, False)
-                await bot.privmsg(ev.target, f"{ev.nick}: removed {nick} from lover targets in {channel}.")
+                await bot.reply(ev, f"{ev.nick}: removed {nick} from lover targets in {channel}.")
                 return
 
             await bot.store.lover_target_upsert(
@@ -146,20 +146,20 @@ class LoverService:
 
         if sub in ("on", "off", "status"):
             if len(parts) < 3:
-                await bot.privmsg(ev.target, f"{ev.nick}: usage: !lover {sub} <#channel>")
+                await bot.reply(ev, f"{ev.nick}: usage: !lover {sub} <#channel>")
                 return
             channel = (parts[2] or "").strip()
             if not channel.startswith("#"):
-                await bot.privmsg(ev.target, f"{ev.nick}: usage: !lover {sub} <#channel>")
+                await bot.reply(ev, f"{ev.nick}: usage: !lover {sub} <#channel>")
                 return
 
             if sub == "on":
                 await bot.store.lover_enablement_set(channel, True, updated_by=ev.nick)
-                await bot.privmsg(ev.target, f"{ev.nick}: lover enabled in {channel}.")
+                await bot.reply(ev, f"{ev.nick}: lover enabled in {channel}.")
                 return
             if sub == "off":
                 await bot.store.lover_enablement_set(channel, False, updated_by=ev.nick)
-                await bot.privmsg(ev.target, f"{ev.nick}: lover disabled in {channel}.")
+                await bot.reply(ev, f"{ev.nick}: lover disabled in {channel}.")
                 return
 
             enabled = await bot.store.lover_enablement_is_enabled(channel)
@@ -175,7 +175,7 @@ class LoverService:
 
         if sub == "min":
             if len(parts) < 3:
-                await bot.privmsg(ev.target, f"{ev.nick}: usage: !lover min <1-100>")
+                await bot.reply(ev, f"{ev.nick}: usage: !lover min <1-100>")
                 return
             try:
                 n = int(parts[2])
@@ -186,14 +186,14 @@ class LoverService:
                     await bot.store.lover_set_min_max(minimum=n, maximum=n)
                 else:
                     await bot.store.lover_set_min_max(minimum=n)
-                await bot.privmsg(ev.target, f"{ev.nick}: lover min per user per day set to {n}.")
+                await bot.reply(ev, f"{ev.nick}: lover min per user per day set to {n}.")
             except ValueError:
-                await bot.privmsg(ev.target, f"{ev.nick}: usage: !lover min <1-100>")
+                await bot.reply(ev, f"{ev.nick}: usage: !lover min <1-100>")
             return
 
         if sub == "max":
             if len(parts) < 3:
-                await bot.privmsg(ev.target, f"{ev.nick}: usage: !lover max <1-100>")
+                await bot.reply(ev, f"{ev.nick}: usage: !lover max <1-100>")
                 return
             try:
                 n = int(parts[2])
@@ -204,24 +204,24 @@ class LoverService:
                     await bot.store.lover_set_min_max(minimum=n, maximum=n)
                 else:
                     await bot.store.lover_set_min_max(maximum=n)
-                await bot.privmsg(ev.target, f"{ev.nick}: lover max per user per day set to {n}.")
+                await bot.reply(ev, f"{ev.nick}: lover max per user per day set to {n}.")
             except ValueError:
-                await bot.privmsg(ev.target, f"{ev.nick}: usage: !lover max <1-100>")
+                await bot.reply(ev, f"{ev.nick}: usage: !lover max <1-100>")
             return
 
         if sub == "list":
             channel = (parts[2] or "").strip() if len(parts) >= 3 else ""
             if channel and not channel.startswith("#"):
-                await bot.privmsg(ev.target, f"{ev.nick}: usage: !lover list [#channel]")
+                await bot.reply(ev, f"{ev.nick}: usage: !lover list [#channel]")
                 return
             rows = await bot.store.lover_targets_list(channel=channel or None, enabled_only=True)
             if not rows:
-                await bot.privmsg(ev.target, f"{ev.nick}: no active lover targets.")
+                await bot.reply(ev, f"{ev.nick}: no active lover targets.")
                 return
             items = [f"{nick}@{ch}" for nick, ch in rows[:20]]
             extra = "" if len(rows) <= 20 else f" (+{len(rows) - 20} more)"
             scope = channel if channel else "all channels"
-            await bot.privmsg(ev.target, f"{ev.nick}: lover targets ({scope}): " + ", ".join(items) + extra)
+            await bot.reply(ev, f"{ev.nick}: lover targets ({scope}): " + ", ".join(items) + extra)
             return
 
         await bot.privmsg(

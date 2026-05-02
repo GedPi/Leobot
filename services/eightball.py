@@ -56,7 +56,7 @@ class EightBallService:
             await send_command_usage(bot, ev, "8ball", "Usage: !8ball <question>")
             return
 
-        await bot.privmsg(ev.target, f"🎱 {random.choice(RESPONSES)}")
+        await bot.reply(ev, f"🎱 {random.choice(RESPONSES)}")
 
 
 def setup(bot):
