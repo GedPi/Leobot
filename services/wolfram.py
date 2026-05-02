@@ -10,6 +10,7 @@ import asyncio
 import json
 import urllib.parse
 import urllib.request
+from system.help import send_command_usage
 
 API_BASE = "https://api.wolframalpha.com/v2/query"
 UA = "LeonidasIRCbot/2.0 (https://hairyoctopus.net; admin: Ged)"
@@ -107,7 +108,7 @@ class WolframService:
 
         query = (parts[1].strip() if len(parts) > 1 else "").strip()
         if not query:
-            await bot.privmsg(ev.target, f"{ev.nick}: Usage: !Wolf <question>")
+            await send_command_usage(bot, ev, "wolf", "Usage: !wolf <question>")
             return
 
         if not self.appid:

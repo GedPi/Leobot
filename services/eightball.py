@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 from typing import List
+from system.help import send_command_usage
 
 
 RESPONSES: List[str] = [
@@ -57,7 +58,7 @@ class EightBallService:
 
         question = rest[0].strip() if rest else ""
         if not question:
-            await bot.privmsg(ev.target, f"{ev.nick}: Usage: !8ball <question>")
+            await send_command_usage(bot, ev, "8ball", "Usage: !8ball <question>")
             return
 
         await bot.privmsg(ev.target, f"🎱 {random.choice(RESPONSES)}")

@@ -3,6 +3,7 @@ from __future__ import annotations
 # Handles !help and !commands: shows command help or lists commands by category filtered by caller role.
 
 from collections import defaultdict
+import re
 
 from system.acl import ROLE_ORDER
 from system.types import Event
@@ -37,6 +38,31 @@ def _split_message(s: str, *, maxlen: int = 380) -> list[str]:
 async def _privmsg_split(bot, target: str, s: str, *, maxlen: int = 380) -> None:
     for line in _split_message(s, maxlen=maxlen):
         await bot.privmsg(target, line)
+
+
+_USAGE_RE = re.compile(r"(Usage:\s*.+)", re.IGNORECASE)
+
+
+def get_command_help(bot, command_key: str) -> str | None:
+    key = (command_key or "").strip().lower().lstrip("!")
+    if not key:
+        return None
+    info = bot.commands.get(key) if hasattr(bot, "commands") else None
+    if not info:
+        return None
+    return (info.get("help") or "").strip() or None
+
+
+async def send_command_usage(bot, ev: Event, command_key: str, fallback: str | None = None) -> None:
+    help_text = get_command_help(bot, command_key)
+    usage = None
+    if help_text:
+        m = _USAGE_RE.search(help_text)
+        usage = m.group(1).strip() if m else f"Usage: !{(command_key or '').strip().lstrip('!')}"
+    msg = usage or (fallback.strip() if fallback else "").strip()
+    if not msg:
+        return
+    await bot.privmsg(ev.target, f"{ev.nick}: {msg}")
 
 
 # Core handler for !help and !commands; filters visible commands by effective_role and shows category list or single-command help.
